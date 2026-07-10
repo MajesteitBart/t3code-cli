@@ -1,0 +1,44 @@
+{
+  "name": "t3code-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open a folder as a T3 Code project and start a new handover thread.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MajesteitBart/t3code-cli.git"
+  },
+  "homepage": "https://github.com/MajesteitBart/t3code-cli#readme",
+  "bugs": {
+    "url": "https://github.com/MajesteitBart/t3code-cli/issues"
+  },
+  "type": "module",
+  "bin": {
+    "t3code": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "engines": {
+    "node": "^22.16 || ^23.11 || >=24.10"
+  },
+  "dependencies": {
+    "commander": "^14.0.1",
+    "t3": "0.0.28"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "packageManager": "pnpm@10.28.2"
+}

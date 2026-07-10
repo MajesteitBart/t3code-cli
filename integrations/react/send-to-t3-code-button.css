@@ -1,0 +1,114 @@
+.t3code-send {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  font: 500 14px/1.2 Inter, ui-sans-serif, system-ui, sans-serif;
+  color: #171717;
+}
+
+.t3code-send__group {
+  display: inline-flex;
+  height: 34px;
+  border: 1px solid #deddd8;
+  border-radius: 7px;
+  background: #f8f7f3;
+  box-shadow: 0 1px 1px rgb(0 0 0 / 3%);
+}
+
+.t3code-send button,
+.t3code-send summary {
+  box-sizing: border-box;
+  color: inherit;
+  font: inherit;
+}
+
+.t3code-send__primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 154px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px 0 0 6px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.t3code-send__mark {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: -0.08em;
+}
+
+.t3code-send__details {
+  position: relative;
+}
+
+.t3code-send__trigger {
+  display: grid;
+  width: 31px;
+  height: 32px;
+  place-items: center;
+  border-left: 1px solid #deddd8;
+  border-radius: 0 6px 6px 0;
+  cursor: pointer;
+  list-style: none;
+}
+
+.t3code-send__trigger::-webkit-details-marker {
+  display: none;
+}
+
+.t3code-send__menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  right: 0;
+  display: grid;
+  width: max-content;
+  min-width: 210px;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid #deddd8;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 12%);
+}
+
+.t3code-send__menu button {
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.t3code-send__primary:hover:not(:disabled),
+.t3code-send__trigger:hover,
+.t3code-send__menu button:hover:not(:disabled) {
+  background: #eeede8;
+}
+
+.t3code-send button:focus-visible,
+.t3code-send summary:focus-visible {
+  outline: 2px solid #525252;
+  outline-offset: 2px;
+}
+
+.t3code-send button:disabled,
+.t3code-send [aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.t3code-send__status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

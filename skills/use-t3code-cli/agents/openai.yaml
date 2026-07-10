@@ -1,0 +1,4 @@
+interface:
+  display_name: "T3 Code CLI"
+  short_description: "Create T3 project handover threads from any repo"
+  default_prompt: "Use $use-t3code-cli to hand this repository over to a new T3 Code thread."
