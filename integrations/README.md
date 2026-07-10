@@ -2,6 +2,16 @@
 
 This folder is an optional example, not part of the `t3code` CLI runtime or its required setup. It packages the pattern first built for the Delano viewer: a front-end split button asks a trusted local backend to turn the current task or review context into a fresh T3 Code thread.
 
+![Delano Send to T3 Code handover menu](../assets/handover-button.png)
+
+## Why Delano needed it
+
+Delano is a browser-based project viewer where tasks, workstreams, specifications, and review annotations are already open in the front end. Copying that context by hand into a separate chat was slow and easy to get wrong: the receiving agent also needed the correct repository, source document, intent, and any selected review feedback.
+
+The handover button closes that gap. Delano builds a focused start or review prompt from the current screen, posts it to its trusted local viewer server, and the server invokes `t3code`. The CLI resolves the repository to its T3 project, creates a fresh thread with the selected model and permissions, submits the prompt, and reveals T3 Code. Copy-command actions remain available as a fallback.
+
+The dropdown shown above is Delano's broader agent handover menu. T3 Code is one destination alongside ChatGPT, Codex, Claude Code, and Claude; the integration example in this repository intentionally demonstrates only the T3 Code path.
+
 The copyable example pieces are:
 
 - [`react/SendToT3CodeButton.tsx`](react/SendToT3CodeButton.tsx): dependency-light React split button with current-checkout, worktree, and Plan-mode actions.

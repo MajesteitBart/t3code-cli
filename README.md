@@ -128,7 +128,9 @@ Every command supports human-readable output. `--json` produces `{ "ok": true, "
 
 ## Origin and optional UI example
 
-This CLI was initially developed for the Delano viewer in `E:\Development\delano-1`. Delano's **Send to T3 Code** button lets someone hand a task, workstream, or review from the browser directly to a new thread in the T3 Code chat application. The viewer builds the task-specific prompt, posts it to its trusted local server, and the server invokes this CLI.
+This CLI was initially developed for the Delano viewer in `E:\Development\delano-1`. Delano's **Send to T3 Code** button lets someone hand browser context directly to a new thread in the T3 Code chat application.
+
+![Delano Send to T3 Code handover menu](assets/handover-button.png)
 
 ```mermaid
 flowchart LR
@@ -137,7 +139,7 @@ flowchart LR
   CLI --> Thread[New T3 Code thread]
 ```
 
-The CLI is the product; a front end is not required. [`integrations/`](integrations/README.md) contains an optional, copyable React split button and Node bridge as one example of integrating it into another application. The bridge keeps the repository root on the trusted server, passes CLI options as an argument array, and sends the prompt over stdin.
+The CLI is the product; a front end is not required. See the optional [integration README](integrations/README.md#why-delano-needed-it) for why Delano needed this handover button and how its browser-to-server-to-CLI flow works. That folder also contains a copyable React split button and Node bridge as one example of integrating `t3code` into another application.
 
 ## Desktop navigation
 
