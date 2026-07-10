@@ -128,7 +128,7 @@ Every command supports human-readable output. `--json` produces `{ "ok": true, "
 
 ## Origin and optional UI example
 
-This CLI was initially developed for the Delano viewer in `E:\Development\delano-1`. Delano's **Send to T3 Code** button lets someone hand browser context directly to a new thread in the T3 Code chat application.
+This CLI was initially developed for the [Delano viewer](https://github.com/MajesteitBart/delano). Delano's **Send to T3 Code** button lets someone hand browser context directly to a new thread in the T3 Code chat application.
 
 ![Delano Send to T3 Code handover menu](assets/handover-button.png)
 

@@ -57,7 +57,7 @@ Use `--dry-run --open none` to inspect the proposed project and thread commands 
 
 ## Optional front-end integration
 
-The CLI can be called from a trusted application backend to power a **Send to T3 Code** button. This pattern was initially built for the Delano viewer in `E:\Development\delano-1`. The optional `integrations/` example in this repository includes a React split button and Node bridge; it is not required to install or operate the CLI.
+The CLI can be called from a trusted application backend to power a **Send to T3 Code** button. This pattern was initially built for the [Delano viewer](https://github.com/MajesteitBart/delano). The optional `integrations/` example in this repository includes a React split button and Node bridge; it is not required to install or operate the CLI.
 
 Keep the repository root server-owned, pass CLI options as process arguments, and send the prompt over stdin. A browser should call the protected backend endpoint rather than attempt to launch the local CLI itself.
 

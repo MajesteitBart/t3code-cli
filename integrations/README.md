@@ -70,11 +70,11 @@ Keep the repository root server-owned, validate the request, and protect the rou
 
 ## Delano source
 
-The original implementation remains in `E:\Development\delano-1`:
+The original implementation remains in the [Delano repository](https://github.com/MajesteitBart/delano):
 
-- `.delano/viewer/ui/src/components/molecules/AgentSplitButton.tsx`
-- `.delano/viewer/ui/src/components/molecules/HandoverMenu.tsx`
-- `.delano/viewer/ui/src/lib/domain/handover.ts`
-- `.delano/viewer/server.js` (`launchT3CodeHandover`)
+- [`AgentSplitButton.tsx`](https://github.com/MajesteitBart/delano/blob/main/.delano/viewer/ui/src/components/molecules/AgentSplitButton.tsx)
+- [`HandoverMenu.tsx`](https://github.com/MajesteitBart/delano/blob/main/.delano/viewer/ui/src/components/molecules/HandoverMenu.tsx)
+- [`handover.ts`](https://github.com/MajesteitBart/delano/blob/main/.delano/viewer/ui/src/lib/domain/handover.ts)
+- [`server.js`](https://github.com/MajesteitBart/delano/blob/main/.delano/viewer/server.js) (`launchT3CodeHandover`)
 
 Delano adds annotation bundles, start/review intents, other agent destinations, command-copy fallbacks, and an activity feed. The reusable version here intentionally contains only the T3 Code boundary.
