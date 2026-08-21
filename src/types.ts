@@ -58,6 +58,7 @@ export interface T3Project {
   title: string;
   workspaceRoot: string;
   defaultModelSelection: ModelSelection | null;
+  defaultThreadEnvMode?: EffectiveThreadEnvMode | null;
   deletedAt?: string | null;
   [key: string]: unknown;
 }

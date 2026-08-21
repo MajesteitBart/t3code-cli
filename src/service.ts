@@ -23,8 +23,10 @@ import type {
 } from "./types.js";
 import { pathsEqual, resolveWorkspace } from "./workspace.js";
 
-const DEFAULT_MODEL_SELECTION: ModelSelection = { instanceId: "codex", model: "gpt-5.6-sol" };
+const LEGACY_DEFAULT_MODEL_SELECTION: ModelSelection = { instanceId: "codex", model: "gpt-5.4" };
+const CURRENT_DEFAULT_MODEL_SELECTION: ModelSelection = { instanceId: "codex", model: "gpt-5.6-sol" };
 const MINIMUM_WORKTREE_BOOTSTRAP_VERSION = "0.0.28";
+const MODERN_DEFAULTS_VERSION = "0.0.29";
 
 export interface WorkspaceOptions {
   cwd?: string;
@@ -50,16 +52,70 @@ interface EffectiveT3Settings {
   newWorktreesStartFromOrigin: boolean;
 }
 
-async function readT3Settings(settingsPath: string | null): Promise<EffectiveT3Settings> {
-  if (!settingsPath) return { defaultThreadEnvMode: "local", newWorktreesStartFromOrigin: false };
+interface T3ProjectFileSettings {
+  defaultThreadEnvMode: EffectiveThreadEnvMode | null;
+}
+
+function parseVersion(version: string): readonly [number, number, number] | null {
+  const values = version.match(/^v?(\d+)\.(\d+)\.(\d+)/u)?.slice(1).map(Number);
+  if (!values || values.length !== 3 || values.some((value) => !Number.isInteger(value))) return null;
+  return [values[0]!, values[1]!, values[2]!];
+}
+
+function versionAtLeast(version: string, minimum: string): boolean {
+  const actual = parseVersion(version);
+  const required = parseVersion(minimum);
+  if (!actual || !required) return false;
+  for (let index = 0; index < actual.length; index += 1) {
+    if (actual[index]! > required[index]!) return true;
+    if (actual[index]! < required[index]!) return false;
+  }
+  return true;
+}
+
+function defaultModelSelectionForVersion(version: string): ModelSelection {
+  return versionAtLeast(version, MODERN_DEFAULTS_VERSION)
+    ? CURRENT_DEFAULT_MODEL_SELECTION
+    : LEGACY_DEFAULT_MODEL_SELECTION;
+}
+
+function defaultStartFromOriginForVersion(version: string): boolean {
+  return versionAtLeast(version, MODERN_DEFAULTS_VERSION);
+}
+
+function asEffectiveThreadEnvMode(value: unknown): EffectiveThreadEnvMode | null {
+  return value === "local" || value === "worktree" ? value : null;
+}
+
+async function readT3Settings(
+  settingsPath: string | null,
+  serverVersion: string,
+): Promise<EffectiveT3Settings> {
+  const defaults: EffectiveT3Settings = {
+    defaultThreadEnvMode: "local",
+    newWorktreesStartFromOrigin: defaultStartFromOriginForVersion(serverVersion),
+  };
+  if (!settingsPath) return defaults;
   try {
     const raw = JSON.parse(await readFile(settingsPath, "utf8")) as Record<string, unknown>;
     return {
-      defaultThreadEnvMode: raw.defaultThreadEnvMode === "worktree" ? "worktree" : "local",
-      newWorktreesStartFromOrigin: raw.newWorktreesStartFromOrigin === true,
+      defaultThreadEnvMode: asEffectiveThreadEnvMode(raw.defaultThreadEnvMode) ?? defaults.defaultThreadEnvMode,
+      newWorktreesStartFromOrigin:
+        typeof raw.newWorktreesStartFromOrigin === "boolean"
+          ? raw.newWorktreesStartFromOrigin
+          : defaults.newWorktreesStartFromOrigin,
     };
   } catch {
-    return { defaultThreadEnvMode: "local", newWorktreesStartFromOrigin: false };
+    return defaults;
+  }
+}
+
+async function readT3ProjectFile(workspaceRoot: string): Promise<T3ProjectFileSettings> {
+  try {
+    const raw = JSON.parse(await readFile(path.join(workspaceRoot, "t3.json"), "utf8")) as Record<string, unknown>;
+    return { defaultThreadEnvMode: asEffectiveThreadEnvMode(raw.defaultThreadEnvMode) };
+  } catch {
+    return { defaultThreadEnvMode: null };
   }
 }
 
@@ -90,15 +146,23 @@ function threadTitle(prompt: string): string {
   return title.length <= 80 ? title : `${title.slice(0, 79)}…`;
 }
 
-function effectiveEnvMode(requested: ThreadEnvMode, settings: EffectiveT3Settings): EffectiveThreadEnvMode {
-  return requested === "t3" ? settings.defaultThreadEnvMode : requested;
+function effectiveEnvMode(
+  requested: ThreadEnvMode,
+  project: T3Project,
+  projectFile: T3ProjectFileSettings,
+  settings: EffectiveT3Settings,
+): { mode: EffectiveThreadEnvMode; source: "request" | "project" | "t3.json" | "global" } {
+  if (requested !== "t3") return { mode: requested, source: "request" };
+  const projectMode = asEffectiveThreadEnvMode(project.defaultThreadEnvMode);
+  if (projectMode) return { mode: projectMode, source: "project" };
+  if (projectFile.defaultThreadEnvMode) {
+    return { mode: projectFile.defaultThreadEnvMode, source: "t3.json" };
+  }
+  return { mode: settings.defaultThreadEnvMode, source: "global" };
 }
 
 function supportsWorktreeBootstrap(version: string): boolean {
-  const values = version.match(/^v?(\d+)\.(\d+)\.(\d+)/u)?.slice(1).map(Number);
-  if (!values || values.length !== 3 || values.some((value) => !Number.isInteger(value))) return false;
-  const [major = 0, minor = 0, patch = 0] = values;
-  return major > 0 || minor > 0 || patch >= 28;
+  return versionAtLeast(version, MINIMUM_WORKTREE_BOOTSTRAP_VERSION);
 }
 
 function nonEmptyOption(value: string | undefined, name: string): string | undefined {
@@ -178,7 +242,12 @@ function resolveModelSelection(
   };
 }
 
-function buildProjectCreateCommand(workspaceRoot: string, title: string, createdAt: string) {
+function buildProjectCreateCommand(
+  workspaceRoot: string,
+  title: string,
+  createdAt: string,
+  defaultModelSelection: ModelSelection,
+) {
   const projectId = randomUUID();
   return {
     projectId,
@@ -189,7 +258,7 @@ function buildProjectCreateCommand(workspaceRoot: string, title: string, created
       title,
       workspaceRoot,
       createWorkspaceRootIfMissing: false,
-      defaultModelSelection: DEFAULT_MODEL_SELECTION,
+      defaultModelSelection,
       createdAt,
     },
   } as const;
@@ -201,6 +270,7 @@ async function ensureProjectWithApi(
   workspaceRoot: string,
   policy: ProjectPolicy,
   dryRun: boolean,
+  defaultModelSelection: ModelSelection,
 ): Promise<{ project: T3Project; created: boolean; command: unknown | null; dispatch: unknown | null }> {
   const projects = initialProjects ?? (await projectsFromApi(api));
   const existing = projectForWorkspace(projects, workspaceRoot);
@@ -212,12 +282,17 @@ async function ensureProjectWithApi(
   }
 
   const createdAt = new Date().toISOString();
-  const create = buildProjectCreateCommand(workspaceRoot, projectTitle(workspaceRoot), createdAt);
+  const create = buildProjectCreateCommand(
+    workspaceRoot,
+    projectTitle(workspaceRoot),
+    createdAt,
+    defaultModelSelection,
+  );
   const project: T3Project = {
     id: create.projectId,
     title: projectTitle(workspaceRoot),
     workspaceRoot,
-    defaultModelSelection: DEFAULT_MODEL_SELECTION,
+    defaultModelSelection,
     deletedAt: null,
   };
   const dispatch = dryRun ? null : await api.dispatch(create.command);
@@ -265,6 +340,7 @@ export async function ensureProject(config: CliConfig, options: WorkspaceOptions
       workspace.workspaceRoot,
       options.projectPolicy ?? config.projectPolicy,
       options.dryRun ?? false,
+      defaultModelSelectionForVersion(runtime.serverVersion),
     )),
   }));
 }
@@ -276,27 +352,9 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
   const workspace = await resolveWorkspace(options.cwd ?? process.cwd(), options.workspaceMode ?? config.workspaceMode);
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
   const localProjects = readLocalProjects(runtime);
-  const settings = await readT3Settings(runtime.settingsPath);
-  const envMode = effectiveEnvMode(options.threadEnvMode ?? config.threadEnvMode, settings);
-  if (envMode === "worktree" && !supportsWorktreeBootstrap(runtime.serverVersion)) {
-    throw new CliError(
-      "WORKTREE_HANDOVER_UNSUPPORTED",
-      `New-worktree handovers require T3 ${MINIMUM_WORKTREE_BOOTSTRAP_VERSION} or later.`,
-      {
-        details: {
-          serverVersion: runtime.serverVersion,
-          minimumServerVersion: MINIMUM_WORKTREE_BOOTSTRAP_VERSION,
-        },
-      },
-    );
-  }
-  if (envMode === "worktree" && (!workspace.isGitRepository || workspace.branch === null)) {
-    throw new CliError(
-      "WORKTREE_REQUIRES_BRANCH",
-      "A new worktree requires a Git repository with a current branch. Use --checkout current for this handover.",
-      { details: { isGitRepository: workspace.isGitRepository, currentBranch: workspace.branch } },
-    );
-  }
+  const settings = await readT3Settings(runtime.settingsPath, runtime.serverVersion);
+  const projectFile = await readT3ProjectFile(workspace.workspaceRoot);
+  const installedDefaultModelSelection = defaultModelSelectionForVersion(runtime.serverVersion);
 
   const result = await withT3Api(runtime, config, async (api, invocation) => {
     const projectResult = await ensureProjectWithApi(
@@ -304,18 +362,48 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
       localProjects,
       workspace.workspaceRoot,
       options.projectPolicy ?? config.projectPolicy,
-      options.dryRun ?? false,
+      true,
+      installedDefaultModelSelection,
     );
+    const envModeResolution = effectiveEnvMode(
+      options.threadEnvMode ?? config.threadEnvMode,
+      projectResult.project,
+      projectFile,
+      settings,
+    );
+    const envMode = envModeResolution.mode;
+    if (envMode === "worktree" && !supportsWorktreeBootstrap(runtime.serverVersion)) {
+      throw new CliError(
+        "WORKTREE_HANDOVER_UNSUPPORTED",
+        `New-worktree handovers require T3 ${MINIMUM_WORKTREE_BOOTSTRAP_VERSION} or later.`,
+        {
+          details: {
+            serverVersion: runtime.serverVersion,
+            minimumServerVersion: MINIMUM_WORKTREE_BOOTSTRAP_VERSION,
+          },
+        },
+      );
+    }
+    if (envMode === "worktree" && (!workspace.isGitRepository || workspace.branch === null)) {
+      throw new CliError(
+        "WORKTREE_REQUIRES_BRANCH",
+        "A new worktree requires a Git repository with a current branch. Use --checkout current for this handover.",
+        { details: { isGitRepository: workspace.isGitRepository, currentBranch: workspace.branch } },
+      );
+    }
     const createdAt = new Date().toISOString();
     const threadId = randomUUID();
     const modelSelection = resolveModelSelection(
-      projectResult.project.defaultModelSelection ?? DEFAULT_MODEL_SELECTION,
+      projectResult.project.defaultModelSelection ?? installedDefaultModelSelection,
       config,
       options,
     );
     const title = threadTitle(prompt);
     const runtimeMode = options.runtimeMode ?? config.runtimeMode;
     const interactionMode = options.interactionMode ?? config.interactionMode;
+    const projectDispatch = projectResult.created && !options.dryRun
+      ? await api.dispatch(projectResult.command)
+      : projectResult.dispatch;
     const createThread = {
       type: "thread.create",
       commandId: randomUUID(),
@@ -398,11 +486,18 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
       runtime,
       auth: { source: invocation.source, version: invocation.version },
       workspace,
-      settings: { ...settings, effectiveThreadEnvMode: envMode },
+      settings: {
+        ...settings,
+        projectDefaultThreadEnvMode:
+          asEffectiveThreadEnvMode(projectResult.project.defaultThreadEnvMode),
+        projectFileDefaultThreadEnvMode: projectFile.defaultThreadEnvMode,
+        effectiveThreadEnvMode: envMode,
+        threadEnvModeSource: envModeResolution.source,
+      },
       project: projectResult.project,
       projectCreated: projectResult.created,
       projectCommand: projectResult.command,
-      projectDispatch: projectResult.dispatch,
+      projectDispatch,
       thread: { id: threadId, title, createCommand: createThread, createDispatch, command, dispatch },
     };
   });

@@ -1,8 +1,14 @@
 {
-  "name": "t3code-cli",
+  "name": "@bvdm/t3code-cli",
   "version": "0.1.0",
-  "private": true,
   "description": "Open a folder as a T3 Code project and start a new handover thread.",
+  "license": "MIT",
+  "keywords": [
+    "t3-code",
+    "cli",
+    "handover",
+    "codex"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/MajesteitBart/t3code-cli.git"
@@ -26,7 +32,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "pnpm typecheck && pnpm test && pnpm build"
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "prepublishOnly": "pnpm check"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "engines": {
     "node": "^22.16 || ^23.11 || >=24.10"

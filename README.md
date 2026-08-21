@@ -1,10 +1,24 @@
-# t3code-cli
+# @bvdm/t3code-cli
 
 `t3code` hands the current folder or Git repository to a new thread in [T3 Code](https://github.com/pingdotgg/t3code).
 
 It does not fake a handover by copying text or opening a generic app URL. It connects to the running local T3 server, resolves the workspace against T3 projects, optionally creates the missing project, creates a fresh thread, and starts its first prompt through T3's orchestration API.
 
-## Install locally
+## Install
+
+Requirements: Node.js 22.16+ and T3 Code.
+
+```bash
+npm install --global @bvdm/t3code-cli
+```
+
+Then verify discovery and the active T3 server:
+
+```bash
+t3code --json doctor
+```
+
+## Develop locally
 
 Requirements: Node.js 22.16+ and T3 Code.
 
@@ -15,7 +29,7 @@ pnpm build
 npm link
 ```
 
-Then verify discovery and the active T3 server:
+Then verify the linked command:
 
 ```bash
 t3code --json doctor
@@ -47,8 +61,9 @@ The default behavior is:
 
 - resolve the Git repository root (`workspaceMode: "repo"`);
 - create a missing T3 project (`projectPolicy: "create"`);
-- honor T3's `defaultThreadEnvMode` setting;
-- use Codex with `gpt-5.6-sol`, fast speed, `xhigh` thinking effort, and full access;
+- resolve T3's checkout preference in the same order as the installed app: project setting, checked-in `t3.json`, then the global setting;
+- inherit an existing project's complete model selection, including its provider options;
+- use full access for both the new thread and its first turn;
 - create a fresh thread and start the prompt through T3's orchestration commands;
 - reveal T3 Code after dispatch.
 
@@ -78,6 +93,8 @@ t3code handover \
 | `--mode`, `--interaction-mode` | `build`/`default`, `plan` |
 | `--checkout`, `--env-mode` | `current`/`local`, `worktree`, or T3's configured default via `t3` |
 
+Command flags override the CLI config, which overrides the T3 project's saved model selection. Without either override, the saved selection and its options are passed through unchanged. A newly-created project uses the detected T3 version's default (`gpt-5.4` on 0.0.28 and `gpt-5.6-sol` on 0.0.29 and later).
+
 Speed and thinking effort are stored as model options. T3 applies the option ids supported by the selected provider/model. If `--provider` changes the project's default provider instance, also pass `--model` because provider instance ids can be user-defined and do not imply a model.
 
 ## Settings
@@ -102,14 +119,14 @@ t3code config set thinkingEffort xhigh
 | `threadEnvMode` | `t3`, `local`, `worktree` | `t3` |
 | `runtimeMode` | `approval-required`, `auto-accept-edits`, `full-access` | `full-access` |
 | `interactionMode` | `default`, `plan` | `default` |
-| `provider` | Configured T3 provider instance id | `codex` |
-| `model` | Provider model slug | `gpt-5.6-sol` |
-| `speedMode` | `standard`, `fast` | `fast` |
-| `thinkingEffort` | Model-supported effort value | `xhigh` |
+| `provider` | Configured T3 provider instance id | T3 project selection |
+| `model` | Provider model slug | T3 project selection |
+| `speedMode` | `standard`, `fast` | T3 project selection |
+| `thinkingEffort` | Model-supported effort value | T3 project selection |
 
-`projectPolicy: "existing"` makes a missing project a hard error. `workspaceMode: "folder"` uses the exact current folder instead of walking up to the Git root. `threadEnvMode: "t3"` reads T3's own local/worktree preference.
+`projectPolicy: "existing"` makes a missing project a hard error. `workspaceMode: "folder"` uses the exact current folder instead of walking up to the Git root. `threadEnvMode: "t3"` follows T3's project → `t3.json` → global local/worktree preference. Explicit CLI config values remain overrides.
 
-T3 0.0.28 and later expose an atomic thread bootstrap contract for new worktrees. `--checkout worktree` uses it to create the thread, prepare the worktree from the current branch, run the matching setup script, and start the prompt. A repository without a current branch returns `WORKTREE_REQUIRES_BRANCH` instead of silently falling back to the current checkout.
+T3 0.0.28 and later expose an atomic thread bootstrap contract for new worktrees. `--checkout worktree` uses it to create the thread, prepare the worktree from the current branch, run the matching setup script, and start the prompt. Worktree creation honors the current installation's explicit `newWorktreesStartFromOrigin` value; when that value is absent, it uses the installed version's default (`false` on 0.0.28, `true` on 0.0.29 and later). A repository without a current branch returns `WORKTREE_REQUIRES_BRANCH` instead of silently falling back to the current checkout.
 
 ## Commands
 
@@ -148,3 +165,28 @@ Current stable T3 Code registers `t3code://` but only uses a second launch to re
 ## Security
 
 The CLI uses T3's own `auth session issue` control plane to mint an administrative bearer token, keeps it only in memory, and revokes it in a `finally` block. Tokens are never included in JSON output or logs.
+
+## Publish a release
+
+Pull requests and pushes run `pnpm check` through [GitHub Actions](.github/workflows/ci.yml) on the minimum supported Node 22 and Node 24 versions.
+
+Publishing uses npm trusted publishing from [publish.yml](.github/workflows/publish.yml). Configure the package's **Trusted Publisher** once in the npm package settings:
+
+| Field | Value |
+| --- | --- |
+| Provider | GitHub Actions |
+| Organization or user | `MajesteitBart` |
+| Repository | `t3code-cli` |
+| Workflow filename | `publish.yml` |
+| Environment | Leave empty |
+
+The workflow uses short-lived OIDC credentials, so it does not need an `NPM_TOKEN` repository secret. It also publishes npm provenance automatically.
+
+To release a new version:
+
+```bash
+npm version patch
+git push --follow-tags
+```
+
+Then publish a GitHub Release for the new `v<package-version>` tag. The workflow verifies that the tag matches `package.json`, installs from the frozen lockfile, runs the complete `prepublishOnly` check, and publishes the public scoped package to npm.

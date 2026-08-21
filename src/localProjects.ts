@@ -9,6 +9,7 @@ interface ProjectRow {
   title: string;
   workspace_root: string;
   default_model_selection_json: string | null;
+  default_thread_env_mode: string | null;
   scripts_json: string;
   created_at: string;
   updated_at: string;
@@ -33,6 +34,7 @@ export function readLocalProjects(runtime: T3Runtime): T3Project[] | null {
     const rows = database
       .prepare(
         `SELECT project_id, title, workspace_root, default_model_selection_json,
+                default_thread_env_mode,
                 scripts_json, created_at, updated_at, deleted_at
            FROM projection_projects
           WHERE deleted_at IS NULL
@@ -44,6 +46,10 @@ export function readLocalProjects(runtime: T3Runtime): T3Project[] | null {
       title: row.title,
       workspaceRoot: row.workspace_root,
       defaultModelSelection: parseJson(row.default_model_selection_json, null),
+      defaultThreadEnvMode:
+        row.default_thread_env_mode === "local" || row.default_thread_env_mode === "worktree"
+          ? row.default_thread_env_mode
+          : null,
       scripts: parseJson(row.scripts_json, []),
       createdAt: row.created_at,
       updatedAt: row.updated_at,

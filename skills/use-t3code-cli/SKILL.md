@@ -43,13 +43,15 @@ $handoverPrompt | t3code --json handover --stdin
 
 `--cwd` defaults to the process's current working directory. Select thread controls when needed with `--provider`, `--model`, `--speed`, `--thinking-effort`, `--permission`, `--mode build|plan`, and `--checkout current|worktree`.
 
-The default thread profile is:
+Unless command flags or CLI config explicitly override it, a new thread inherits the T3 project's complete saved model selection, including provider-specific options. For a missing project, the CLI uses the detected T3 version's default model (`gpt-5.4` on 0.0.28 and `gpt-5.6-sol` on 0.0.29 and later).
 
-- provider instance: `codex`
-- model: `gpt-5.6-sol`
-- speed: `fast`
-- thinking effort: `xhigh`
-- permission: full access (`full-access`)
+The permission default is full access (`full-access`). The CLI sends it on the new thread, the first turn, and the atomic worktree bootstrap. An explicit `--permission` or `runtimeMode` CLI setting remains authoritative.
+
+With the default `--checkout t3`, resolve the checkout mode in the same order as T3 Code:
+
+1. the project's `defaultThreadEnvMode` setting;
+2. the checked-in workspace `t3.json` value;
+3. the current installation's global `defaultThreadEnvMode` setting.
 
 Use `--project-policy existing` when creating a project is not authorized. The default is `create`.
 
@@ -69,6 +71,6 @@ On `{ "ok": false }`, report `error.code` and `error.message`. Do not retry writ
 
 ## Current compatibility boundary
 
-T3 0.0.28 and later support new-worktree handovers through the atomic bootstrap contract. `WORKTREE_REQUIRES_BRANCH` means the selected folder is not a Git repository on a branch; retry with `--checkout current` only with explicit user or caller authority.
+T3 0.0.28 and later support new-worktree handovers through the atomic bootstrap contract. Worktree creation follows the current installation's explicit `newWorktreesStartFromOrigin` setting. When it is absent, use the installed version's default: `false` on 0.0.28 and `true` on 0.0.29 and later. `WORKTREE_REQUIRES_BRANCH` means the selected folder is not a Git repository on a branch; retry with `--checkout current` only with explicit user or caller authority.
 
 Use `t3code --json request get <path>` only as a read-only escape hatch.

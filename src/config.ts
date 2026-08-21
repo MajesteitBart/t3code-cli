@@ -21,10 +21,6 @@ export const DEFAULT_CONFIG: CliConfig = {
   threadEnvMode: "t3",
   runtimeMode: "full-access",
   interactionMode: "default",
-  provider: "codex",
-  model: "gpt-5.6-sol",
-  speedMode: "fast",
-  thinkingEffort: "xhigh",
   sessionTtl: "2m",
 };
 

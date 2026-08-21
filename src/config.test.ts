@@ -4,14 +4,12 @@ import { DEFAULT_CONFIG, normalizeConfig, setConfigValue } from "./config.js";
 
 describe("config", () => {
   it("applies documented defaults", () => {
-    expect(normalizeConfig({})).toMatchObject({
-      ...DEFAULT_CONFIG,
-      provider: "codex",
-      model: "gpt-5.6-sol",
-      speedMode: "fast",
-      thinkingEffort: "xhigh",
-      runtimeMode: "full-access",
-    });
+    expect(normalizeConfig({})).toEqual(DEFAULT_CONFIG);
+    expect(DEFAULT_CONFIG).toMatchObject({ runtimeMode: "full-access" });
+    expect(DEFAULT_CONFIG).not.toHaveProperty("provider");
+    expect(DEFAULT_CONFIG).not.toHaveProperty("model");
+    expect(DEFAULT_CONFIG).not.toHaveProperty("speedMode");
+    expect(DEFAULT_CONFIG).not.toHaveProperty("thinkingEffort");
   });
 
   it("validates project and workspace policy", () => {

@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -31,7 +31,11 @@ function json(response: ServerResponse, status: number, value: unknown): void {
 
 async function testHarness(
   initialProjects: T3Project[] = [],
-  options: { failTurn?: boolean; serverVersion?: string } = {},
+  options: {
+    failTurn?: boolean;
+    serverVersion?: string;
+    settings?: Record<string, unknown>;
+  } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "t3code-cli-service-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
@@ -51,7 +55,7 @@ async function testHarness(
     if (request.url === "/.well-known/t3/environment") {
       json(response, 200, {
         environmentId: "environment-1",
-        serverVersion: options.serverVersion ?? "0.0.28",
+        serverVersion: options.serverVersion ?? "0.0.34-nightly.20260818.1124",
       });
       return;
     }
@@ -122,9 +126,27 @@ async function testHarness(
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("missing server address");
 
+  const origin = `http://127.0.0.1:${address.port}`;
+  const stateDir = path.join(root, ".t3", "userdata");
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(
+    path.join(stateDir, "server-runtime.json"),
+    JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      port: address.port,
+      origin,
+      startedAt: new Date().toISOString(),
+    }),
+    "utf8",
+  );
+  if (options.settings) {
+    await writeFile(path.join(stateDir, "settings.json"), JSON.stringify(options.settings), "utf8");
+  }
+
   const config: CliConfig = {
     ...DEFAULT_CONFIG,
-    origin: `http://127.0.0.1:${address.port}`,
+    origin,
     t3Home: path.join(root, ".t3"),
     t3Command: [process.execPath, mockT3],
     openMode: "none",
@@ -170,15 +192,49 @@ describe("createHandoverThread", () => {
       instanceId: "codex",
       model: "gpt-5.6-sol",
     });
-    expect(createThread.modelSelection.options).toEqual(
-      expect.arrayContaining([
-        { id: "serviceTier", value: "fast" },
-        { id: "fastMode", value: true },
-        { id: "reasoningEffort", value: "xhigh" },
-      ]),
-    );
+    expect(createThread.modelSelection.options).toBeUndefined();
     expect(createThread.runtimeMode).toBe("full-access");
+    expect(harness.commands[2]).toMatchObject({ runtimeMode: "full-access" });
     expect(result.opened.kind).toBe("none");
+  });
+
+  it("inherits an existing project's pre-configured model and options", async () => {
+    const harness = await testHarness();
+    harness.projects.push({
+      id: "project-existing",
+      title: "Existing project",
+      workspaceRoot: await realpath(harness.root),
+      defaultModelSelection: {
+        instanceId: "claudeAgent",
+        model: "claude-sonnet-5",
+        options: [{ id: "effort", value: "max" }],
+      },
+      deletedAt: null,
+    });
+
+    await createHandoverThread(harness.config, {
+      cwd: harness.root,
+      prompt: "Handover",
+      openMode: "none",
+    });
+
+    expect(harness.commands.map((command) => command.type)).toEqual([
+      "thread.create",
+      "thread.turn.start",
+    ]);
+    const expectedSelection = {
+      instanceId: "claudeAgent",
+      model: "claude-sonnet-5",
+      options: [{ id: "effort", value: "max" }],
+    };
+    expect(harness.commands[0]).toMatchObject({
+      modelSelection: expectedSelection,
+      runtimeMode: "full-access",
+    });
+    expect(harness.commands[1]).toMatchObject({
+      modelSelection: expectedSelection,
+      runtimeMode: "full-access",
+    });
   });
 
   it("honors existing-only project policy", async () => {
@@ -289,12 +345,132 @@ describe("createHandoverThread", () => {
         prepareWorktree: {
           projectCwd: await realpath(harness.root),
           baseBranch: "main",
-          startFromOrigin: false,
+          startFromOrigin: true,
         },
         runSetupScript: true,
       },
+      runtimeMode: "full-access",
+    });
+    expect(result.thread.command).toMatchObject({
+      bootstrap: { createThread: { runtimeMode: "full-access" } },
     });
     expect(harness.threads).toHaveLength(1);
+  });
+
+  it("honors an explicit worktree-origin setting from the current installation", async () => {
+    const harness = await testHarness([], {
+      settings: { newWorktreesStartFromOrigin: false },
+    });
+
+    const result = await createHandoverThread(harness.config, {
+      cwd: harness.root,
+      prompt: "Handover",
+      threadEnvMode: "worktree",
+      openMode: "none",
+      dryRun: true,
+    });
+
+    expect(result.thread.command).toMatchObject({
+      bootstrap: { prepareWorktree: { startFromOrigin: false } },
+    });
+  });
+
+  it("uses the 0.0.28 worktree-origin and model defaults", async () => {
+    const harness = await testHarness([], { serverVersion: "0.0.28" });
+
+    const result = await createHandoverThread(harness.config, {
+      cwd: harness.root,
+      prompt: "Handover",
+      threadEnvMode: "worktree",
+      openMode: "none",
+      dryRun: true,
+    });
+
+    expect(result.projectCommand).toMatchObject({
+      defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+    });
+    expect(result.thread.command).toMatchObject({
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      bootstrap: { prepareWorktree: { startFromOrigin: false } },
+    });
+  });
+
+  it("prefers a project's checkout setting over t3.json and the global setting", async () => {
+    const harness = await testHarness([], {
+      settings: { defaultThreadEnvMode: "worktree" },
+    });
+    await writeFile(
+      path.join(harness.root, "t3.json"),
+      JSON.stringify({ defaultThreadEnvMode: "worktree" }),
+      "utf8",
+    );
+    harness.projects.push({
+      id: "project-existing",
+      title: "Existing project",
+      workspaceRoot: await realpath(harness.root),
+      defaultModelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+      defaultThreadEnvMode: "local",
+      deletedAt: null,
+    });
+    harness.config.threadEnvMode = "t3";
+
+    const result = await createHandoverThread(harness.config, {
+      cwd: harness.root,
+      prompt: "Handover",
+      dryRun: true,
+      openMode: "none",
+    });
+
+    expect(result.settings).toMatchObject({
+      effectiveThreadEnvMode: "local",
+      threadEnvModeSource: "project",
+    });
+    expect(result.thread.command).not.toHaveProperty("bootstrap");
+  });
+
+  it("prefers t3.json's checkout setting over the global setting", async () => {
+    const harness = await testHarness([], {
+      settings: { defaultThreadEnvMode: "worktree" },
+    });
+    await writeFile(
+      path.join(harness.root, "t3.json"),
+      JSON.stringify({ defaultThreadEnvMode: "local" }),
+      "utf8",
+    );
+    harness.config.threadEnvMode = "t3";
+
+    const result = await createHandoverThread(harness.config, {
+      cwd: harness.root,
+      prompt: "Handover",
+      dryRun: true,
+      openMode: "none",
+    });
+
+    expect(result.settings).toMatchObject({
+      effectiveThreadEnvMode: "local",
+      threadEnvModeSource: "t3.json",
+    });
+    expect(result.thread.command).not.toHaveProperty("bootstrap");
+  });
+
+  it("uses the global checkout setting when the project and t3.json do not set one", async () => {
+    const harness = await testHarness([], {
+      settings: { defaultThreadEnvMode: "worktree" },
+    });
+    harness.config.threadEnvMode = "t3";
+
+    const result = await createHandoverThread(harness.config, {
+      cwd: harness.root,
+      prompt: "Handover",
+      dryRun: true,
+      openMode: "none",
+    });
+
+    expect(result.settings).toMatchObject({
+      effectiveThreadEnvMode: "worktree",
+      threadEnvModeSource: "global",
+    });
+    expect(result.thread.command).toHaveProperty("bootstrap");
   });
 
   it("rejects worktree handovers against older T3 servers", async () => {

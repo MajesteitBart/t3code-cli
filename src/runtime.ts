@@ -66,13 +66,21 @@ async function runtimeCandidates(config: CliConfig): Promise<RuntimeCandidate[]>
     const stateDir = path.join(home, stateDirectoryName);
     const runtimeStatePath = path.join(stateDir, "server-runtime.json");
     const state = await readRuntimeState(runtimeStatePath);
-    if (!state || candidates.some((candidate) => candidate.origin === state.origin)) continue;
-    candidates.push({
+    if (!state) continue;
+    const candidate = {
       origin: state.origin,
       stateDir,
       runtimeStatePath,
       settingsPath: path.join(stateDir, "settings.json"),
-    });
+    };
+    const existingIndex = candidates.findIndex((existing) => existing.origin === state.origin);
+    if (existingIndex >= 0) {
+      // Keep the explicit origin's priority while retaining its matching local
+      // installation paths so settings and projections remain discoverable.
+      candidates[existingIndex] = candidate;
+    } else {
+      candidates.push(candidate);
+    }
   }
   return candidates;
 }
