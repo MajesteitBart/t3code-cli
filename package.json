@@ -1,6 +1,6 @@
 {
   "name": "@bvdm/t3code-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Open a folder as a T3 Code project and start a new handover thread.",
   "license": "MIT",
   "keywords": [
