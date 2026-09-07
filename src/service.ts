@@ -47,6 +47,13 @@ export interface ThreadCreateOptions extends WorkspaceOptions {
   dryRun?: boolean;
 }
 
+export interface ThreadSendOptions {
+  threadId: string;
+  prompt: string;
+  openMode?: OpenMode;
+  dryRun?: boolean;
+}
+
 interface EffectiveT3Settings {
   defaultThreadEnvMode: EffectiveThreadEnvMode;
   newWorktreesStartFromOrigin: boolean;
@@ -505,6 +512,65 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
   const opened = options.dryRun
     ? { mode: options.openMode ?? config.openMode, kind: "none" as const, url: null, exactThread: false }
     : await openThread(options.openMode ?? config.openMode, runtime, result.thread.id);
+  return { ...result, opened, dryRun: options.dryRun ?? false };
+}
+
+export async function sendThreadPrompt(config: CliConfig, options: ThreadSendOptions) {
+  const threadId = options.threadId.trim();
+  if (!threadId) throw new CliError("THREAD_ID_REQUIRED", "A non-empty T3 thread ID is required.");
+  const prompt = options.prompt.trim();
+  if (!prompt) throw new CliError("PROMPT_REQUIRED", "A non-empty prompt is required.");
+
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
+  const result = await withT3Api(runtime, config, async (api, invocation) => {
+    const shell = await api.shellSnapshot().catch(() => null);
+    const snapshot = shell && Array.isArray(shell.threads) ? shell : await api.snapshot();
+    if (!Array.isArray(snapshot.threads)) {
+      throw new CliError("T3_INVALID_SNAPSHOT", "T3 returned a snapshot without threads.");
+    }
+    const thread = snapshot.threads.find((entry) => entry.id === threadId && entry.deletedAt == null);
+    if (!thread) throw new CliError("THREAD_NOT_FOUND", `No T3 Code thread exists with ID ${threadId}.`);
+    if (thread.archivedAt != null) {
+      throw new CliError("THREAD_ARCHIVED", "Unarchive the thread in T3 Code before sending a prompt.", {
+        details: { threadId },
+      });
+    }
+    if (
+      thread.session?.status === "starting" || thread.session?.status === "running" ||
+      thread.session?.activeTurnId != null ||
+      thread.latestTurn?.state === "pending" || thread.latestTurn?.state === "running"
+    ) {
+      throw new CliError("THREAD_BUSY", "The thread has an active or pending turn. Retry when it is idle.", {
+        details: { threadId },
+      });
+    }
+    if (
+      !["approval-required", "auto-accept-edits", "full-access"].includes(thread.runtimeMode ?? "") ||
+      !["default", "plan"].includes(thread.interactionMode ?? "")
+    ) {
+      throw new CliError("T3_INVALID_SNAPSHOT", "T3 returned a thread without valid permission and interaction modes.");
+    }
+    // Omit modelSelection so T3 retains the thread's model and provider options.
+    // Creation defaults must not change an existing conversation's permissions.
+    const command = {
+      type: "thread.turn.start",
+      commandId: randomUUID(),
+      threadId,
+      message: { messageId: randomUUID(), role: "user", text: prompt, attachments: [] },
+      runtimeMode: thread.runtimeMode,
+      interactionMode: thread.interactionMode,
+      createdAt: new Date().toISOString(),
+    };
+    const dispatch = options.dryRun ? null : await api.dispatch(command);
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      thread: { id: threadId, title: thread.title, command, dispatch },
+    };
+  });
+  const opened = options.dryRun
+    ? { mode: options.openMode ?? config.openMode, kind: "none" as const, url: null, exactThread: false }
+    : await openThread(options.openMode ?? config.openMode, runtime, threadId);
   return { ...result, opened, dryRun: options.dryRun ?? false };
 }
 

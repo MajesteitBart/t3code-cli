@@ -97,6 +97,38 @@ Command flags override the CLI config, which overrides the T3 project's saved mo
 
 Speed and thinking effort are stored as model options. T3 applies the option ids supported by the selected provider/model. If `--provider` changes the project's default provider instance, also pass `--model` because provider instance ids can be user-defined and do not imply a model.
 
+## Continue an existing thread
+
+Use the **T3 thread ID** from a previous command's JSON `data.thread.id` or the
+thread's browser URL (not its provider session ID):
+
+```bash
+t3code --json threads send \
+  --thread-id <thread-id> \
+  --prompt "Continue from our previous discussion." \
+  --open none
+
+t3code threads send --thread-id <thread-id> --stdin --open none < follow-up.txt
+t3code threads send --thread-id <thread-id> --prompt-file follow-up.txt --dry-run
+```
+
+`threads send` submits another user message to the existing conversation. It
+retains the thread's workspace, title, model/provider options, permission level,
+and interaction mode. CLI defaults for creating threads do not override these
+settings. Exactly one of `--prompt`, `--prompt-file`, or `--stdin` is required.
+
+The target must exist and be unarchived and idle. Missing, archived, or busy
+threads fail with `THREAD_NOT_FOUND`, `THREAD_ARCHIVED`, or `THREAD_BUSY` before
+dispatch. This command does not queue prompts or interrupt active work. The busy
+check is a snapshot check, not an atomic lock: concurrent senders must serialize
+their requests. Provider session resumption and conversation context are managed
+by T3 and the provider.
+
+`--dry-run` validates the target and prints the proposed command without sending
+it or opening the UI. Success means T3 accepted the dispatch, not that the agent
+finished its turn. A failed or timed-out dispatch never deletes the existing
+thread; check T3 before retrying an ambiguous failure to avoid duplicate prompts.
+
 ## Settings
 
 ```bash
@@ -137,6 +169,7 @@ t3code projects list
 t3code projects resolve --cwd .
 t3code projects ensure --cwd . --project-policy create
 t3code threads create --stdin
+t3code threads send --thread-id <thread-id> --stdin
 t3code handover --stdin
 t3code request get /api/orchestration/snapshot
 ```
