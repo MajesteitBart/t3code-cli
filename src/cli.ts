@@ -257,18 +257,20 @@ addProjectPolicyOption(addWorkspaceOptions(projects.command("ensure")))
 
 const threads = program.command("threads").description("Create and continue T3 Code threads.");
 threads.command("send")
-  .description("Send a prompt to an existing idle T3 thread, preserving its settings.")
+  .description("Send a prompt to an existing T3 thread, preserving its settings.")
   .requiredOption("--thread-id <id>", "Existing T3 thread ID (not the provider session ID).")
   .option("--prompt <text>", "Prompt to send.")
   .option("--prompt-file <path>", "Read the prompt from a UTF-8 file.")
   .option("--stdin", "Read the prompt from stdin.")
+  .addOption(new Option("--if-busy <behavior>", "Reject a busy thread or inject into its active work.").choices(["reject", "inject"]).default("reject"))
   .addOption(new Option("--open <mode>").choices(["auto", "desktop", "browser", "none"]))
   .option("--dry-run", "Validate the target and print the command without dispatching it.")
-  .action((options: ThreadCommandOptions & { threadId: string }) =>
+  .action((options: ThreadCommandOptions & { threadId: string; ifBusy: "reject" | "inject" }) =>
     action(async () => {
       const context = await commandContext();
       const result = await sendThreadPrompt(context.config, {
         threadId: options.threadId,
+        ifBusy: options.ifBusy,
         prompt: await resolvePrompt(options),
         ...(options.open ? { openMode: options.open } : {}),
         ...(options.dryRun ? { dryRun: true } : {}),

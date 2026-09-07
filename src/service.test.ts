@@ -534,6 +534,49 @@ function existingThread(overrides: Partial<T3Thread> = {}): T3Thread {
 }
 
 describe("sendThreadPrompt", () => {
+  it.each([
+    { session: { status: "starting" } },
+    { session: { status: "running", activeTurnId: "active-turn" } },
+    { session: { status: "ready", activeTurnId: "active-turn" } },
+    { latestTurn: { state: "pending" } },
+    { latestTurn: { state: "running" } },
+  ] satisfies Array<Partial<T3Thread>>)("allows explicit injection into busy state %j", async (state) => {
+    const harness = await testHarness();
+    harness.threads.push(existingThread(state));
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Reject this", ifBusy: "reject",
+    })).rejects.toMatchObject({ code: "THREAD_BUSY" });
+    expect(harness.commands).toEqual([]);
+    const preview = await sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Preview injection", ifBusy: "inject", dryRun: true,
+    });
+    expect(preview.thread.dispatch).toBeNull();
+    expect(harness.commands).toEqual([]);
+    await sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Incorporate this update", ifBusy: "inject",
+    });
+    expect(harness.commands).toHaveLength(1);
+    expect(harness.commands[0]).toMatchObject({
+      type: "thread.turn.start", threadId: "existing-thread",
+      runtimeMode: "approval-required", interactionMode: "plan",
+      message: { text: "Incorporate this update" },
+    });
+    expect(harness.commands[0]).not.toHaveProperty("modelSelection");
+    expect(harness.threads).toEqual([existingThread(state)]);
+  });
+
+  it.each([
+    [{ archivedAt: "2026-01-01T00:00:00Z" }, "THREAD_ARCHIVED"],
+    [{ deletedAt: "2026-01-01T00:00:00Z" }, "THREAD_NOT_FOUND"],
+  ] satisfies Array<[Partial<T3Thread>, string]>)("injection still rejects unavailable targets %j", async (state, code) => {
+    const harness = await testHarness();
+    harness.threads.push(existingThread(state));
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Update", ifBusy: "inject",
+    })).rejects.toMatchObject({ code });
+    expect(harness.commands).toEqual([]);
+  });
+
   it("sends only a turn to the exact existing thread and preserves its settings", async () => {
     const harness = await testHarness();
     harness.threads.push(existingThread());

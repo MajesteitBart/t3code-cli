@@ -117,12 +117,25 @@ retains the thread's workspace, title, model/provider options, permission level,
 and interaction mode. CLI defaults for creating threads do not override these
 settings. Exactly one of `--prompt`, `--prompt-file`, or `--stdin` is required.
 
-The target must exist and be unarchived and idle. Missing, archived, or busy
-threads fail with `THREAD_NOT_FOUND`, `THREAD_ARCHIVED`, or `THREAD_BUSY` before
-dispatch. This command does not queue prompts or interrupt active work. The busy
-check is a snapshot check, not an atomic lock: concurrent senders must serialize
-their requests. Provider session resumption and conversation context are managed
-by T3 and the provider.
+The target must exist and be unarchived. Choose how to handle active work:
+
+- `--if-busy reject` (default) returns `THREAD_BUSY` without sending the prompt
+  when the thread has an active or pending turn.
+- `--if-busy inject` dispatches the prompt immediately even when the thread is
+  busy, letting T3 and its provider handle the message during active work.
+
+```bash
+t3code threads send --thread-id <thread-id> --if-busy inject \
+  --prompt "Additional context for the work in progress…" --open none
+```
+
+Neither mode adds a CLI queue or explicitly interrupts the turn. Injection does
+not guarantee identical steering behavior across providers or special turn types;
+T3/provider errors can still occur after dispatch acceptance. Missing or archived
+threads still fail with `THREAD_NOT_FOUND` or `THREAD_ARCHIVED` in either mode.
+The busy check in reject mode is a snapshot check, not an atomic lock: concurrent
+senders must serialize their requests. Provider session resumption and
+conversation context are managed by T3 and the provider.
 
 `--dry-run` validates the target and prints the proposed command without sending
 it or opening the UI. Success means T3 accepted the dispatch, not that the agent

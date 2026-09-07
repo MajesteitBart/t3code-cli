@@ -50,6 +50,7 @@ export interface ThreadCreateOptions extends WorkspaceOptions {
 export interface ThreadSendOptions {
   threadId: string;
   prompt: string;
+  ifBusy?: "reject" | "inject";
   openMode?: OpenMode;
   dryRun?: boolean;
 }
@@ -520,6 +521,10 @@ export async function sendThreadPrompt(config: CliConfig, options: ThreadSendOpt
   if (!threadId) throw new CliError("THREAD_ID_REQUIRED", "A non-empty T3 thread ID is required.");
   const prompt = options.prompt.trim();
   if (!prompt) throw new CliError("PROMPT_REQUIRED", "A non-empty prompt is required.");
+  const ifBusy = options.ifBusy ?? "reject";
+  if (ifBusy !== "reject" && ifBusy !== "inject") {
+    throw new CliError("INVALID_THREAD_OPTION", "ifBusy must be reject or inject.");
+  }
 
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   const result = await withT3Api(runtime, config, async (api, invocation) => {
@@ -535,12 +540,12 @@ export async function sendThreadPrompt(config: CliConfig, options: ThreadSendOpt
         details: { threadId },
       });
     }
-    if (
+    const busy =
       thread.session?.status === "starting" || thread.session?.status === "running" ||
       thread.session?.activeTurnId != null ||
-      thread.latestTurn?.state === "pending" || thread.latestTurn?.state === "running"
-    ) {
-      throw new CliError("THREAD_BUSY", "The thread has an active or pending turn. Retry when it is idle.", {
+      thread.latestTurn?.state === "pending" || thread.latestTurn?.state === "running";
+    if (busy && ifBusy === "reject") {
+      throw new CliError("THREAD_BUSY", "The thread has an active or pending turn. Retry when idle or use --if-busy inject.", {
         details: { threadId },
       });
     }
