@@ -11,6 +11,7 @@ import { runProcess } from "./process.js";
 import {
   inspectThread,
   listThreads,
+  readThread,
   sendThreadMessage,
   settleThread,
   unsettleThread,
@@ -236,6 +237,93 @@ describe("thread discovery and messaging", () => {
     expect(result.thread).not.toHaveProperty("messages");
     expect(result.thread).not.toHaveProperty("activities");
     expect(result.project).toMatchObject({ id: "project-1", title: "Project One" });
+  });
+
+  it("reads every message with full text", async () => {
+    const messages: T3Message[] = Array.from({ length: 8 }, (_, index) => ({
+      id: `message-${index + 1}`,
+      role: index % 2 === 0 ? "user" : "assistant",
+      text: `${index + 1}: ${"A".repeat(2_500)}`,
+      turnId: index % 2 === 0 ? null : `turn-${Math.ceil((index + 1) / 2)}`,
+      streaming: false,
+      createdAt: `2026-09-04T10:0${index}:00.000Z`,
+      updatedAt: `2026-09-04T10:0${index}:00.000Z`,
+    }));
+    const harness = await testHarness([makeThread("target", {
+      messages,
+      activities: [{ large: "internal detail" }],
+    })]);
+
+    const result = await readThread(harness.config, "target");
+
+    expect(result.thread.messageCount).toBe(8);
+    expect(result.thread.messages).toEqual(messages);
+    expect(result.thread.messages[0]?.text).toHaveLength(2_503);
+    expect(result.thread).not.toHaveProperty("activities");
+    expect(result.thread).not.toHaveProperty("recentMessages");
+    expect(result.project).toMatchObject({ id: "project-1", title: "Project One" });
+  });
+
+  it("filters a read to messages assigned to the latest turn", async () => {
+    const messages: T3Message[] = [
+      {
+        id: "prompt-latest",
+        role: "user",
+        text: "Latest prompt",
+        turnId: null,
+        streaming: false,
+        createdAt: "2026-09-04T10:00:00.000Z",
+        updatedAt: "2026-09-04T10:00:00.000Z",
+      },
+      {
+        id: "reply-previous",
+        role: "assistant",
+        text: "Previous reply",
+        turnId: "turn-previous",
+        streaming: false,
+        createdAt: "2026-09-04T10:01:00.000Z",
+        updatedAt: "2026-09-04T10:01:00.000Z",
+      },
+      {
+        id: "reply-latest-1",
+        role: "assistant",
+        text: "A".repeat(2_500),
+        turnId: "turn-latest",
+        streaming: false,
+        createdAt: "2026-09-04T10:02:00.000Z",
+        updatedAt: "2026-09-04T10:02:00.000Z",
+      },
+      {
+        id: "reply-latest-2",
+        role: "assistant",
+        text: "Latest final answer",
+        turnId: "turn-latest",
+        streaming: false,
+        createdAt: "2026-09-04T10:03:00.000Z",
+        updatedAt: "2026-09-04T10:03:00.000Z",
+      },
+    ];
+    const harness = await testHarness([makeThread("target", {
+      latestTurn: {
+        turnId: "turn-latest",
+        state: "completed",
+        requestedAt: "2026-09-04T10:02:00.000Z",
+        startedAt: "2026-09-04T10:02:00.000Z",
+        completedAt: "2026-09-04T10:03:00.000Z",
+        assistantMessageId: "reply-latest-2",
+      },
+      messages,
+    })]);
+
+    const result = await readThread(harness.config, "target", { lastTurn: true });
+
+    expect(result.thread.messageFilter).toEqual({ scope: "last-turn", turnId: "turn-latest" });
+    expect(result.thread.messageCount).toBe(2);
+    expect(result.thread.messages.map((message) => message.id)).toEqual([
+      "reply-latest-1",
+      "reply-latest-2",
+    ]);
+    expect(result.thread.messages[0]?.text).toHaveLength(2_500);
   });
 
   it("sends and verifies a turn on an active thread", async () => {

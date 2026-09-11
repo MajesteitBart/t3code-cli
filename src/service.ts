@@ -183,6 +183,25 @@ function threadInspectionView(thread: T3Thread) {
   };
 }
 
+function threadReadView(thread: T3Thread, lastTurn: boolean) {
+  const turnId = lastTurn ? (thread.latestTurn?.turnId ?? null) : null;
+  const messages = lastTurn
+    ? (thread.messages ?? []).filter((message) => turnId !== null && message.turnId === turnId)
+    : (thread.messages ?? []);
+  const summary = { ...thread };
+  delete summary.messages;
+  delete summary.activities;
+  delete summary.checkpoints;
+  delete summary.proposedPlans;
+  return {
+    ...summary,
+    status: threadStatus(thread),
+    messageCount: messages.length,
+    messages,
+    ...(lastTurn ? { messageFilter: { scope: "last-turn" as const, turnId } } : {}),
+  };
+}
+
 function projectForWorkspace(projects: readonly T3Project[], workspaceRoot: string): T3Project | null {
   return activeProjects(projects).find((project) => pathsEqual(project.workspaceRoot, workspaceRoot)) ?? null;
 }
@@ -478,6 +497,29 @@ export async function inspectThread(config: CliConfig, rawThreadId: string) {
       snapshotSequence: inspected.snapshotSequence,
       project,
       thread: threadInspectionView(inspected.thread),
+    };
+  });
+}
+
+export async function readThread(
+  config: CliConfig,
+  rawThreadId: string,
+  options: { lastTurn?: boolean } = {},
+) {
+  const threadId = requireThreadId(rawThreadId);
+  const lastTurn = options.lastTurn ?? false;
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
+  return await withT3Api(runtime, config, async (api, invocation) => {
+    const read = await new T3ThreadApi(api).read(threadId, { lastTurn });
+    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
+    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
+    const project = projects.find((candidate) => candidate.id === read.thread.projectId) ?? null;
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      snapshotSequence: read.snapshotSequence,
+      project,
+      thread: threadReadView(read.thread, lastTurn),
     };
   });
 }

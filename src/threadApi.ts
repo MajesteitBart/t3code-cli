@@ -180,6 +180,23 @@ export class T3ThreadApi {
 
   async inspect(threadId: string): Promise<{ snapshotSequence: number; thread: T3Thread }> {
     const requestPath = `/api/orchestration/threads/${encodeURIComponent(threadId)}?turnLimit=10`;
+    return await this.readDetail(threadId, requestPath);
+  }
+
+  async read(
+    threadId: string,
+    options: { lastTurn?: boolean } = {},
+  ): Promise<{ snapshotSequence: number; thread: T3Thread }> {
+    const requestPath = `/api/orchestration/threads/${encodeURIComponent(threadId)}${
+      options.lastTurn ? "?turnLimit=1" : ""
+    }`;
+    return await this.readDetail(threadId, requestPath);
+  }
+
+  private async readDetail(
+    threadId: string,
+    requestPath: string,
+  ): Promise<{ snapshotSequence: number; thread: T3Thread }> {
     const detail = await this.api.request("GET", requestPath).catch(() => null);
     const parsedDetail = asThreadDetailSnapshot(detail);
     if (parsedDetail) {

@@ -57,6 +57,20 @@ describe.sequential("CLI parsing", () => {
     });
   });
 
+  it("requires an exact thread id for reads", async () => {
+    const result = await runCli(["--json", "threads", "read"]);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toEqual({
+      ok: false,
+      error: {
+        code: "INVALID_USAGE",
+        message: "required option '--thread <thread-id>' not specified",
+      },
+    });
+  });
+
   it("writes a JSON usage envelope for an invalid choice", async () => {
     const result = await runCli(["--json", "threads", "list", "--status", "archived"]);
 

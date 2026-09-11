@@ -53,6 +53,48 @@ function mockApi(overrides: Partial<T3Api> = {}): T3Api {
 }
 
 describe("T3ThreadApi", () => {
+  it("uses the unwindowed detail endpoint for a complete read", async () => {
+    const paths: string[] = [];
+    const adapter = new T3ThreadApi(mockApi({
+      request: async (_method, requestPath) => {
+        paths.push(requestPath);
+        return { snapshotSequence: 1, thread: thread() } satisfies ThreadDetailSnapshot;
+      },
+    }));
+
+    await adapter.read("thread-1");
+
+    expect(paths).toEqual(["/api/orchestration/threads/thread-1"]);
+  });
+
+  it("uses a one-turn window for a last-turn read", async () => {
+    const paths: string[] = [];
+    const adapter = new T3ThreadApi(mockApi({
+      request: async (_method, requestPath) => {
+        paths.push(requestPath);
+        return { snapshotSequence: 1, thread: thread() } satisfies ThreadDetailSnapshot;
+      },
+    }));
+
+    await adapter.read("thread-1", { lastTurn: true });
+
+    expect(paths).toEqual(["/api/orchestration/threads/thread-1?turnLimit=1"]);
+  });
+
+  it("keeps inspect bounded to recent turns", async () => {
+    const paths: string[] = [];
+    const adapter = new T3ThreadApi(mockApi({
+      request: async (_method, requestPath) => {
+        paths.push(requestPath);
+        return { snapshotSequence: 1, thread: thread() } satisfies ThreadDetailSnapshot;
+      },
+    }));
+
+    await adapter.inspect("thread-1");
+
+    expect(paths).toEqual(["/api/orchestration/threads/thread-1?turnLimit=10"]);
+  });
+
   it("builds the exact existing-thread turn payload without creation fields", () => {
     const adapter = new T3ThreadApi(mockApi());
     const command = adapter.buildTurnStart(thread(), "Review findings");

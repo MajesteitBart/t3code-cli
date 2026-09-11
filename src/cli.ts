@@ -25,6 +25,7 @@ import {
   listProjects,
   listThreads,
   rawGet,
+  readThread,
   resolveProject,
   sendThreadMessage,
   settleThread,
@@ -166,6 +167,11 @@ interface ThreadListCommandOptions extends WorkspaceCommandOptions {
 interface ThreadSendCommandOptions extends PromptOptions {
   thread: string;
   wakeSettled?: boolean;
+}
+
+interface ThreadReadCommandOptions {
+  thread: string;
+  lastTurn?: boolean;
 }
 
 async function readStdin(): Promise<string> {
@@ -354,6 +360,41 @@ threads
           `Session: ${result.thread.session?.status ?? "none"}`,
           `Latest turn: ${latestTurn ? `${latestTurn.state} (${latestTurn.turnId})` : "none"}`,
           `Updated: ${result.thread.updatedAt ?? "unknown"}`,
+        ].join("\n"),
+      );
+    }),
+  );
+
+threads
+  .command("read")
+  .description("Read the complete message history of a thread without truncation.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .option("--last-turn", "Return only messages assigned to the latest turn.")
+  .action((options: ThreadReadCommandOptions) =>
+    action(async () => {
+      const context = await commandContext();
+      const result = await readThread(context.config, options.thread, {
+        lastTurn: options.lastTurn === true,
+      });
+      const transcript = result.thread.messages
+        .map((message) => {
+          const turn = message.turnId === null ? "" : ` turn=${message.turnId}`;
+          return `[${message.role}${turn}]\n${message.text}`;
+        })
+        .join("\n\n");
+      writeSuccess(
+        result,
+        context,
+        [
+          `Thread: ${result.thread.id}`,
+          `Title: ${result.thread.title}`,
+          `Project: ${result.project?.title ?? result.thread.projectId}`,
+          ...(result.thread.messageFilter
+            ? [`Turn: ${result.thread.messageFilter.turnId ?? "none"}`]
+            : []),
+          `Messages: ${result.thread.messageCount}`,
+          "",
+          transcript || "No messages.",
         ].join("\n"),
       );
     }),

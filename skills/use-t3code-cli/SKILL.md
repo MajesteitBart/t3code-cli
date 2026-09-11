@@ -66,6 +66,15 @@ t3code --json threads list --cwd . --status all
 t3code --json threads inspect --thread "$TARGET_THREAD_ID"
 ```
 
+Use `read` when the full conversation is needed. It returns every projected message without truncating its text:
+
+```bash
+t3code --json threads read --thread "$TARGET_THREAD_ID"
+t3code --json threads read --thread "$TARGET_THREAD_ID" --last-turn
+```
+
+Read `data.thread.messages` in chronological order. Each message retains its `turnId`; user messages that are waiting to start a turn can have a null `turnId`. Without a filter, the command requests T3's complete unwindowed thread history. `--last-turn` requests a one-turn window and keeps only messages whose `turnId` equals `data.thread.latestTurn.turnId`. It does not include activities, checkpoints, or proposed plans.
+
 Use `--project <project-id>` instead of `--cwd` when the caller provides an exact project id. Filter with `--status active` or `--status settled` when useful. Do not select a target from its title alone because titles are not unique.
 
 Pass messages over stdin:

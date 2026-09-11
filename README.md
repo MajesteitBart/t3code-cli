@@ -113,6 +113,16 @@ t3code threads list --status settled --project <project-id>
 t3code threads inspect --thread <thread-id>
 ```
 
+`inspect` returns a bounded preview in JSON: the 6 most recent messages, with message text limited to 2,000 characters. Read the complete message history without truncation when you need the conversation itself:
+
+```bash
+t3code threads read --thread <thread-id>
+t3code --json threads read --thread <thread-id>
+t3code --json threads read --thread <thread-id> --last-turn
+```
+
+The JSON result stores the transcript in `data.thread.messages`. Messages remain in chronological order and retain their `turnId`. Without a filter, T3's full-history endpoint returns the whole thread without a turn window. `--last-turn` uses `data.thread.latestTurn.turnId` and keeps only messages assigned to that exact turn. Pending user messages can have a null `turnId`, so this strict filter normally returns the assistant or system messages from the latest turn. Neither mode truncates message text.
+
 Start a new turn on that thread with one of `--prompt`, `--prompt-file`, or `--stdin`:
 
 ```bash
@@ -179,6 +189,7 @@ t3code projects resolve --cwd .
 t3code projects ensure --cwd . --project-policy create
 t3code threads list --status active --cwd .
 t3code threads inspect --thread <thread-id>
+t3code threads read --thread <thread-id>
 t3code threads send --thread <thread-id> --stdin
 t3code threads settle --thread <thread-id>
 t3code threads unsettle --thread <thread-id>
