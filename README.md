@@ -1,6 +1,6 @@
 o# @bvdm/t3code-cli
 
-`t3code` hands the current folder or Git repository to a new thread in [T3 Code](https://github.com/pingdotgg/t3code).
+`t3code` hands the current folder or Git repository to a new thread in [T3 Code](https://github.com/pingdotgg/t3code), and lets automation discover, inspect, and message existing threads.
 
 It does not fake a handover by copying text or opening a generic app URL. It connects to the running local T3 server, resolves the workspace against T3 projects, optionally creates the missing project, creates a fresh thread, and starts its first prompt through T3's orchestration API.
 
@@ -97,6 +97,57 @@ Command flags override the CLI config, which overrides the T3 project's saved mo
 
 Speed and thinking effort are stored as model options. T3 applies the option ids supported by the selected provider/model. If `--provider` changes the project's default provider instance, also pass `--model` because provider instance ids can be user-defined and do not imply a model.
 
+## Existing threads
+
+List threads across projects, or restrict discovery by project id or workspace:
+
+```bash
+t3code threads list
+t3code threads list --status active --cwd .
+t3code threads list --status settled --project <project-id>
+```
+
+`--status` accepts `active`, `settled`, or `all` (the default). Results include the exact thread id, project, title, model, and update time. Inspect the exact target before sending:
+
+```bash
+t3code threads inspect --thread <thread-id>
+```
+
+`inspect` returns a bounded preview in JSON: the 6 most recent messages, with message text limited to 2,000 characters. Read the complete message history without truncation when you need the conversation itself:
+
+```bash
+t3code threads read --thread <thread-id>
+t3code --json threads read --thread <thread-id>
+t3code --json threads read --thread <thread-id> --last-turn
+```
+
+The JSON result stores the transcript in `data.thread.messages`. Messages remain in chronological order and retain their `turnId`. Without a filter, T3's full-history endpoint returns the whole thread without a turn window. `--last-turn` uses `data.thread.latestTurn.turnId` and keeps only messages assigned to that exact turn. Pending user messages can have a null `turnId`, so this strict filter normally returns the assistant or system messages from the latest turn. Neither mode truncates message text.
+
+Start a new turn on that thread with one of `--prompt`, `--prompt-file`, or `--stdin`:
+
+```bash
+printf '%s' "Review findings from the other thread..." \
+  | t3code threads send --thread <thread-id> --stdin
+```
+
+Sending to a settled thread requires confirmation. Non-interactive and JSON callers must explicitly opt in with `--wake-settled`:
+
+```bash
+printf '%s' "New findings that require more work..." \
+  | t3code --json threads send --thread <thread-id> --stdin --wake-settled
+```
+
+The send command does not report success from the HTTP response alone. It waits until the exact message is visible in T3's thread projection. Archived threads are rejected.
+
+Manage settlement explicitly without starting a new turn:
+
+```bash
+t3code threads settle --thread <thread-id>
+t3code threads unsettle --thread <thread-id>
+```
+
+`settle` refuses a thread with a running/starting session or a pending approval or user-input request. `unsettle` marks the thread manually active but does not send a message or start its provider session. Both commands require the server to advertise the `threadSettlement` capability and wait for the requested lifecycle state to appear in T3's projection before succeeding.
+
 ## Settings
 
 ```bash
@@ -136,12 +187,18 @@ t3code config path|show|set
 t3code projects list
 t3code projects resolve --cwd .
 t3code projects ensure --cwd . --project-policy create
+t3code threads list --status active --cwd .
+t3code threads inspect --thread <thread-id>
+t3code threads read --thread <thread-id>
+t3code threads send --thread <thread-id> --stdin
+t3code threads settle --thread <thread-id>
+t3code threads unsettle --thread <thread-id>
 t3code threads create --stdin
 t3code handover --stdin
 t3code request get /api/orchestration/snapshot
 ```
 
-Every command supports human-readable output. `--json` produces `{ "ok": true, "data": ... }` on success and a stable error envelope on failure.
+Every command supports human-readable output. `--json` produces `{ "ok": true, "data": ... }` on success and a stable error envelope on failure. Thread targeting uses exit code `3` for a missing target, `4` for a lifecycle/confirmation refusal, and `5` when dispatch returned but turn acceptance could not be verified.
 
 ## Origin and optional UI example
 

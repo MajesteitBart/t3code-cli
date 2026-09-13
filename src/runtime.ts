@@ -10,6 +10,10 @@ import type { CliConfig, RuntimeState, T3Runtime } from "./types.js";
 interface EnvironmentDescriptor {
   environmentId: string;
   serverVersion: string;
+  capabilities: {
+    threadSettlement?: boolean;
+    [key: string]: unknown;
+  };
 }
 
 export function resolveT3Home(config: CliConfig): string {
@@ -43,7 +47,13 @@ async function fetchDescriptor(origin: string): Promise<EnvironmentDescriptor | 
     if (!response.ok) return null;
     const value = (await response.json()) as Partial<EnvironmentDescriptor>;
     if (typeof value.environmentId !== "string" || typeof value.serverVersion !== "string") return null;
-    return value as EnvironmentDescriptor;
+    const capabilities =
+      value.capabilities !== null &&
+      typeof value.capabilities === "object" &&
+      !Array.isArray(value.capabilities)
+        ? value.capabilities
+        : {};
+    return { environmentId: value.environmentId, serverVersion: value.serverVersion, capabilities };
   } catch {
     return null;
   }

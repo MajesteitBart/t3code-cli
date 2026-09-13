@@ -1,13 +1,15 @@
 {
   "name": "@bvdm/t3code-cli",
   "version": "0.1.2",
-  "description": "Open a folder as a T3 Code project and start a new handover thread.",
+  "description": "Manage T3 Code projects, handover threads, and cross-thread messages.",
   "license": "MIT",
   "keywords": [
     "t3-code",
     "cli",
     "handover",
-    "codex"
+    "codex",
+    "threads",
+    "agents"
   ],
   "repository": {
     "type": "git",

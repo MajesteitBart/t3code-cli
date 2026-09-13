@@ -1,6 +1,6 @@
 ---
 name: use-t3code-cli
-description: Operate the t3code CLI to resolve folders or Git repositories into T3 Code projects, create missing projects according to policy, start new handover threads with prompts, inspect project state, and diagnose the local T3 connection. Use when an agent needs to hand current work to T3 Code or automate T3 project/thread creation from a terminal or application.
+description: Operate the t3code CLI to resolve folders or Git repositories into T3 Code projects, create missing projects according to policy, start new handover threads with prompts, inspect project state, and diagnose the local T3 connection. Use when an agent needs to hand current work to T3 Code or automate T3 project/thread creation from a terminal or application. Also use when an agent needs to discover, inspect, message, settle, or unsettle an existing T3 Code thread.
 ---
 
 # Use T3 Code CLI
@@ -57,6 +57,44 @@ Use `--project-policy existing` when creating a project is not authorized. The d
 
 Use `--dry-run --open none` to inspect the proposed project and thread commands without changing T3 state.
 
+## Work with existing threads
+
+Discover candidate threads in the relevant project, then inspect the exact target id before changing it:
+
+```bash
+t3code --json threads list --cwd . --status all
+t3code --json threads inspect --thread "$TARGET_THREAD_ID"
+```
+
+Use `read` when the full conversation is needed. It returns every projected message without truncating its text:
+
+```bash
+t3code --json threads read --thread "$TARGET_THREAD_ID"
+t3code --json threads read --thread "$TARGET_THREAD_ID" --last-turn
+```
+
+Read `data.thread.messages` in chronological order. Each message retains its `turnId`; user messages that are waiting to start a turn can have a null `turnId`. Without a filter, the command requests T3's complete unwindowed thread history. `--last-turn` requests a one-turn window and keeps only messages whose `turnId` equals `data.thread.latestTurn.turnId`. It does not include activities, checkpoints, or proposed plans.
+
+Use `--project <project-id>` instead of `--cwd` when the caller provides an exact project id. Filter with `--status active` or `--status settled` when useful. Do not select a target from its title alone because titles are not unique.
+
+Pass messages over stdin:
+
+```bash
+printf '%s' "$THREAD_MESSAGE" \
+  | t3code --json threads send --thread "$TARGET_THREAD_ID" --stdin
+```
+
+Sending is an external state change. Keep the target and message within the caller's authorization. A settled thread requires interactive confirmation or `--wake-settled`; JSON and stdin workflows are non-interactive, so use that override only when waking the inspected target is authorized. Archived threads cannot receive a turn.
+
+Manage lifecycle state without sending a message:
+
+```bash
+t3code --json threads settle --thread "$TARGET_THREAD_ID"
+t3code --json threads unsettle --thread "$TARGET_THREAD_ID"
+```
+
+Settle only after the caller authorizes that lifecycle change. T3 refuses settlement while a session is starting/running or the thread has a blocking approval or user-input request. Unsettling marks the thread manually active; it does not start a turn or provider session.
+
 ## Optional front-end integration
 
 The CLI can be called from a trusted application backend to power a **Send to T3 Code** button. This pattern was initially built for the [Delano viewer](https://github.com/MajesteitBart/delano). The optional `integrations/` example in this repository includes a React split button and Node bridge; it is not required to install or operate the CLI.
@@ -67,10 +105,16 @@ Keep the repository root server-owned, pass CLI options as process arguments, an
 
 Read `data.project.id`, `data.thread.id`, `data.projectCreated`, and `data.opened`. A successful current stable desktop reveal can report `opened.exactThread: false`; the thread is still created in the resolved project.
 
+For existing-thread writes, require `data.verification.accepted: true`. Record `data.thread.id` and, for sends, `data.message.messageId` when reporting the result. The CLI verifies the requested projection state rather than treating HTTP submission as success.
+
 On `{ "ok": false }`, report `error.code` and `error.message`. Do not retry write commands blindly. `THREAD_START_FAILED` already attempts to delete the newly-created thread.
+
+`THREAD_TURN_NOT_VERIFIED` or `THREAD_SETTLEMENT_NOT_VERIFIED` means dispatch returned but projection verification timed out. Do not retry automatically because the first operation may still appear later.
 
 ## Current compatibility boundary
 
 T3 0.0.28 and later support new-worktree handovers through the atomic bootstrap contract. Worktree creation follows the current installation's explicit `newWorktreesStartFromOrigin` setting. When it is absent, use the installed version's default: `false` on 0.0.28 and `true` on 0.0.29 and later. `WORKTREE_REQUIRES_BRANCH` means the selected folder is not a Git repository on a branch; retry with `--checkout current` only with explicit user or caller authority.
+
+Thread settlement commands require a T3 server that exposes the `threadSettlement` capability. Existing-thread sends preserve the target's saved model, runtime mode, and interaction mode.
 
 Use `t3code --json request get <path>` only as a read-only escape hatch.

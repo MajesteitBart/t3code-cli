@@ -7,6 +7,7 @@ import { CliError } from "./errors.js";
 import { readLocalProjects } from "./localProjects.js";
 import { openThread } from "./open.js";
 import { discoverRuntime } from "./runtime.js";
+import { T3ThreadApi, type ThreadSettlementState } from "./threadApi.js";
 import type {
   CliConfig,
   EffectiveThreadEnvMode,
@@ -18,6 +19,7 @@ import type {
   RuntimeMode,
   SpeedMode,
   T3Project,
+  T3Thread,
   ThreadEnvMode,
   WorkspaceMode,
 } from "./types.js";
@@ -27,6 +29,8 @@ const LEGACY_DEFAULT_MODEL_SELECTION: ModelSelection = { instanceId: "codex", mo
 const CURRENT_DEFAULT_MODEL_SELECTION: ModelSelection = { instanceId: "codex", model: "gpt-5.6-sol" };
 const MINIMUM_WORKTREE_BOOTSTRAP_VERSION = "0.0.28";
 const MODERN_DEFAULTS_VERSION = "0.0.29";
+const INSPECT_RECENT_MESSAGE_LIMIT = 6;
+const INSPECT_MESSAGE_TEXT_LIMIT = 2_000;
 
 export interface WorkspaceOptions {
   cwd?: string;
@@ -45,6 +49,20 @@ export interface ThreadCreateOptions extends WorkspaceOptions {
   speedMode?: SpeedMode;
   thinkingEffort?: string;
   dryRun?: boolean;
+}
+
+export type ThreadListStatus = "active" | "settled" | "all";
+
+export interface ThreadListOptions extends WorkspaceOptions {
+  project?: string;
+  status?: ThreadListStatus;
+}
+
+export interface ThreadSendOptions {
+  threadId: string;
+  prompt: string;
+  wakeSettled?: boolean;
+  confirmSettled?: (thread: T3Thread, project: T3Project | null) => Promise<boolean>;
 }
 
 interface EffectiveT3Settings {
@@ -121,6 +139,67 @@ async function readT3ProjectFile(workspaceRoot: string): Promise<T3ProjectFileSe
 
 function activeProjects(projects: readonly T3Project[]): T3Project[] {
   return projects.filter((project) => project.deletedAt == null);
+}
+
+function nonArchivedThread(thread: T3Thread): boolean {
+  return thread.archivedAt == null && thread.deletedAt == null;
+}
+
+function threadStatus(thread: T3Thread): Exclude<ThreadListStatus, "all"> {
+  return thread.settledAt == null ? "active" : "settled";
+}
+
+function requireThreadId(value: string): string {
+  const threadId = value.trim();
+  if (!threadId) {
+    throw new CliError("THREAD_ID_REQUIRED", "A non-empty thread id is required.", { exitCode: 2 });
+  }
+  return threadId;
+}
+
+function threadInspectionView(thread: T3Thread) {
+  const messages = thread.messages ?? [];
+  const summary = { ...thread };
+  delete summary.messages;
+  delete summary.activities;
+  delete summary.checkpoints;
+  delete summary.proposedPlans;
+  return {
+    ...summary,
+    status: threadStatus(thread),
+    messageCount: messages.length,
+    recentMessages: messages.slice(-INSPECT_RECENT_MESSAGE_LIMIT).map((message) => ({
+      id: message.id,
+      role: message.role,
+      turnId: message.turnId,
+      text:
+        message.text.length <= INSPECT_MESSAGE_TEXT_LIMIT
+          ? message.text
+          : `${message.text.slice(0, INSPECT_MESSAGE_TEXT_LIMIT - 1)}…`,
+      textTruncated: message.text.length > INSPECT_MESSAGE_TEXT_LIMIT,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+    })),
+  };
+}
+
+function threadReadView(thread: T3Thread, lastTurn: boolean) {
+  const turnId = lastTurn ? (thread.latestTurn?.turnId ?? null) : null;
+  const messages = lastTurn
+    ? (thread.messages ?? []).filter((message) => turnId !== null && message.turnId === turnId)
+    : (thread.messages ?? []);
+  const summary = { ...thread };
+  delete summary.messages;
+  delete summary.activities;
+  delete summary.checkpoints;
+  delete summary.proposedPlans;
+  return {
+    ...summary,
+    status: threadStatus(thread),
+    messageCount: messages.length,
+    messages,
+    ...(lastTurn ? { messageFilter: { scope: "last-turn" as const, turnId } } : {}),
+  };
 }
 
 function projectForWorkspace(projects: readonly T3Project[], workspaceRoot: string): T3Project | null {
@@ -343,6 +422,250 @@ export async function ensureProject(config: CliConfig, options: WorkspaceOptions
       defaultModelSelectionForVersion(runtime.serverVersion),
     )),
   }));
+}
+
+export async function listThreads(config: CliConfig, options: ThreadListOptions = {}) {
+  const requestedProjectId = options.project?.trim();
+  if (options.project !== undefined && !requestedProjectId) {
+    throw new CliError("PROJECT_ID_REQUIRED", "--project requires a non-empty project id.", {
+      exitCode: 2,
+    });
+  }
+  if (requestedProjectId && options.cwd) {
+    throw new CliError("THREAD_FILTER_CONFLICT", "Use either --project or --cwd, not both.", {
+      exitCode: 2,
+    });
+  }
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
+  return await withT3Api(runtime, config, async (api, invocation) => {
+    const catalog = await new T3ThreadApi(api).catalog();
+    const projects = activeProjects(catalog.projects);
+    let project: T3Project | null = null;
+    let workspace = null;
+
+    if (requestedProjectId) {
+      project = projects.find((candidate) => candidate.id === requestedProjectId) ?? null;
+    } else if (options.cwd) {
+      workspace = await resolveWorkspace(options.cwd, options.workspaceMode ?? config.workspaceMode);
+      project = projectForWorkspace(projects, workspace.workspaceRoot);
+    }
+
+    if ((requestedProjectId || options.cwd) && !project) {
+      throw new CliError(
+        "PROJECT_NOT_FOUND",
+        requestedProjectId
+          ? `No active T3 Code project exists with id ${requestedProjectId}.`
+          : `No T3 Code project exists for ${workspace!.workspaceRoot}.`,
+        { exitCode: 3 },
+      );
+    }
+
+    const requestedStatus = options.status ?? "all";
+    const threads = catalog.threads
+      .filter(nonArchivedThread)
+      .filter((thread) => project === null || thread.projectId === project.id)
+      .filter((thread) => requestedStatus === "all" || threadStatus(thread) === requestedStatus)
+      .sort((left, right) => (right.updatedAt ?? "").localeCompare(left.updatedAt ?? ""))
+      .map((thread) => ({ ...thread, status: threadStatus(thread) }));
+
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      snapshotSequence: catalog.snapshotSequence,
+      filter: {
+        status: requestedStatus,
+        projectId: project?.id ?? null,
+        workspaceRoot: workspace?.workspaceRoot ?? null,
+      },
+      projects,
+      threads,
+    };
+  });
+}
+
+export async function inspectThread(config: CliConfig, rawThreadId: string) {
+  const threadId = requireThreadId(rawThreadId);
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
+  return await withT3Api(runtime, config, async (api, invocation) => {
+    const inspected = await new T3ThreadApi(api).inspect(threadId);
+    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
+    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
+    const project = projects.find((candidate) => candidate.id === inspected.thread.projectId) ?? null;
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      snapshotSequence: inspected.snapshotSequence,
+      project,
+      thread: threadInspectionView(inspected.thread),
+    };
+  });
+}
+
+export async function readThread(
+  config: CliConfig,
+  rawThreadId: string,
+  options: { lastTurn?: boolean } = {},
+) {
+  const threadId = requireThreadId(rawThreadId);
+  const lastTurn = options.lastTurn ?? false;
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
+  return await withT3Api(runtime, config, async (api, invocation) => {
+    const read = await new T3ThreadApi(api).read(threadId, { lastTurn });
+    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
+    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
+    const project = projects.find((candidate) => candidate.id === read.thread.projectId) ?? null;
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      snapshotSequence: read.snapshotSequence,
+      project,
+      thread: threadReadView(read.thread, lastTurn),
+    };
+  });
+}
+
+export async function sendThreadMessage(config: CliConfig, options: ThreadSendOptions) {
+  const threadId = requireThreadId(options.threadId);
+  const prompt = options.prompt.trim();
+  if (!prompt) {
+    throw new CliError("PROMPT_REQUIRED", "A non-empty thread message is required.", { exitCode: 2 });
+  }
+
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
+  return await withT3Api(runtime, config, async (api, invocation) => {
+    const adapter = new T3ThreadApi(api);
+    const inspected = await adapter.inspect(threadId);
+    const thread = inspected.thread;
+    if (thread.archivedAt != null) {
+      throw new CliError("THREAD_ARCHIVED", `Thread ${threadId} is archived and cannot receive a new turn.`, {
+        exitCode: 4,
+        details: { threadId, archivedAt: thread.archivedAt },
+      });
+    }
+
+    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
+    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
+    const project = projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    if (threadStatus(thread) === "settled" && !options.wakeSettled) {
+      if (!options.confirmSettled) {
+        throw new CliError(
+          "SETTLED_THREAD_CONFIRMATION_REQUIRED",
+          `Thread ${threadId} is settled. Re-run with --wake-settled to send and wake it.`,
+          { exitCode: 4, details: { threadId, settledAt: thread.settledAt } },
+        );
+      }
+      if (!(await options.confirmSettled(thread, project))) {
+        throw new CliError("SETTLED_THREAD_DECLINED", `Did not send a message to settled thread ${threadId}.`, {
+          exitCode: 4,
+          details: { threadId },
+        });
+      }
+    }
+
+    const command = adapter.buildTurnStart(thread, prompt);
+    const sent = await adapter.dispatchTurn(command);
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      project,
+      thread: {
+        id: thread.id,
+        projectId: thread.projectId,
+        title: thread.title,
+        statusBeforeSend: threadStatus(thread),
+      },
+      message: {
+        messageId: command.message.messageId,
+        textLength: command.message.text.length,
+      },
+      command: {
+        type: command.type,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        runtimeMode: command.runtimeMode,
+        interactionMode: command.interactionMode,
+        createdAt: command.createdAt,
+      },
+      dispatch: sent.dispatch,
+      verification: sent.verification,
+    };
+  });
+}
+
+async function changeThreadSettlement(
+  config: CliConfig,
+  rawThreadId: string,
+  state: ThreadSettlementState,
+) {
+  const threadId = requireThreadId(rawThreadId);
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
+  if (runtime.capabilities.threadSettlement !== true) {
+    throw new CliError(
+      "THREAD_SETTLEMENT_UNSUPPORTED",
+      "This T3 Code server does not advertise thread settlement support.",
+      {
+        exitCode: 4,
+        details: { capability: "threadSettlement", serverVersion: runtime.serverVersion },
+      },
+    );
+  }
+  return await withT3Api(runtime, config, async (api, invocation) => {
+    const adapter = new T3ThreadApi(api);
+    const inspected = await adapter.inspect(threadId);
+    const thread = inspected.thread;
+    if (thread.archivedAt != null) {
+      throw new CliError("THREAD_ARCHIVED", `Thread ${threadId} is archived and cannot change settlement state.`, {
+        exitCode: 4,
+        details: { threadId, archivedAt: thread.archivedAt },
+      });
+    }
+    if (
+      state === "settled" &&
+      (thread.session?.status === "starting" ||
+        thread.session?.status === "running" ||
+        thread.hasPendingApprovals === true ||
+        thread.hasPendingUserInput === true)
+    ) {
+      throw new CliError("THREAD_SETTLE_BLOCKED", `Thread ${threadId} still has active or blocked work.`, {
+        exitCode: 4,
+        details: {
+          threadId,
+          sessionStatus: thread.session?.status ?? null,
+          hasPendingApprovals: thread.hasPendingApprovals ?? false,
+          hasPendingUserInput: thread.hasPendingUserInput ?? false,
+        },
+      });
+    }
+
+    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
+    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
+    const project = projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    const command = adapter.buildSettlement(threadId, state);
+    const changed = await adapter.dispatchSettlement(command, thread.updatedAt);
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      project,
+      thread: {
+        id: thread.id,
+        projectId: thread.projectId,
+        title: thread.title,
+        statusBefore: threadStatus(thread),
+        statusAfter: threadStatus(changed.thread),
+      },
+      command,
+      dispatch: changed.dispatch,
+      verification: changed.verification,
+    };
+  });
+}
+
+export async function settleThread(config: CliConfig, threadId: string) {
+  return await changeThreadSettlement(config, threadId, "settled");
+}
+
+export async function unsettleThread(config: CliConfig, threadId: string) {
+  return await changeThreadSettlement(config, threadId, "active");
 }
 
 export async function createHandoverThread(config: CliConfig, options: ThreadCreateOptions) {
