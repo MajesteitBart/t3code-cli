@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_CONFIG } from "./config.js";
 import { CliError } from "./errors.js";
 import { runProcess } from "./process.js";
-import { createHandoverThread } from "./service.js";
+import { createHandoverThread, sendThreadPrompt } from "./service.js";
 import type { CliConfig, T3Project, T3Thread } from "./types.js";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -35,6 +35,7 @@ async function testHarness(
     failTurn?: boolean;
     serverVersion?: string;
     settings?: Record<string, unknown>;
+    shellUnavailable?: boolean;
   } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "t3code-cli-service-"));
@@ -63,7 +64,11 @@ async function testHarness(
       json(response, 401, { error: "unauthorized" });
       return;
     }
-    if (request.method === "GET" && request.url === "/api/orchestration/shell") {
+    if (request.url === "/api/orchestration/shell" && options.shellUnavailable) {
+      json(response, 404, { error: "not found" });
+      return;
+    }
+    if (request.method === "GET" && ["/api/orchestration/shell", "/api/orchestration/snapshot"].includes(request.url ?? "")) {
       json(response, 200, {
         snapshotSequence: commands.length,
         projects,
@@ -112,7 +117,7 @@ async function testHarness(
       }
       if (command.type === "thread.turn.start" && options.failTurn) {
         const index = threads.findIndex((thread) => thread.id === command.threadId);
-        if (index >= 0) threads.splice(index, 1);
+        if (index >= 0 && command.bootstrap) threads.splice(index, 1);
         json(response, 500, { error: "turn failed" });
         return;
       }
@@ -510,5 +515,147 @@ describe("createHandoverThread", () => {
       "thread.delete",
     ]);
     expect(harness.threads).toHaveLength(0);
+  });
+});
+
+function existingThread(overrides: Partial<T3Thread> = {}): T3Thread {
+  return {
+    id: "existing-thread",
+    projectId: "existing-project",
+    title: "Existing conversation",
+    archivedAt: null,
+    runtimeMode: "approval-required",
+    interactionMode: "plan",
+    modelSelection: { instanceId: "custom-provider", model: "saved-model" },
+    session: { status: "ready", activeTurnId: null },
+    latestTurn: { state: "completed" },
+    ...overrides,
+  };
+}
+
+describe("sendThreadPrompt", () => {
+  it.each([
+    { session: { status: "starting" } },
+    { session: { status: "running", activeTurnId: "active-turn" } },
+    { session: { status: "ready", activeTurnId: "active-turn" } },
+    { latestTurn: { state: "pending" } },
+    { latestTurn: { state: "running" } },
+  ] satisfies Array<Partial<T3Thread>>)("allows explicit injection into busy state %j", async (state) => {
+    const harness = await testHarness();
+    harness.threads.push(existingThread(state));
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Reject this", ifBusy: "reject",
+    })).rejects.toMatchObject({ code: "THREAD_BUSY" });
+    expect(harness.commands).toEqual([]);
+    const preview = await sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Preview injection", ifBusy: "inject", dryRun: true,
+    });
+    expect(preview.thread.dispatch).toBeNull();
+    expect(harness.commands).toEqual([]);
+    await sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Incorporate this update", ifBusy: "inject",
+    });
+    expect(harness.commands).toHaveLength(1);
+    expect(harness.commands[0]).toMatchObject({
+      type: "thread.turn.start", threadId: "existing-thread",
+      runtimeMode: "approval-required", interactionMode: "plan",
+      message: { text: "Incorporate this update" },
+    });
+    expect(harness.commands[0]).not.toHaveProperty("modelSelection");
+    expect(harness.threads).toEqual([existingThread(state)]);
+  });
+
+  it.each([
+    [{ archivedAt: "2026-01-01T00:00:00Z" }, "THREAD_ARCHIVED"],
+    [{ deletedAt: "2026-01-01T00:00:00Z" }, "THREAD_NOT_FOUND"],
+  ] satisfies Array<[Partial<T3Thread>, string]>)("injection still rejects unavailable targets %j", async (state, code) => {
+    const harness = await testHarness();
+    harness.threads.push(existingThread(state));
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Update", ifBusy: "inject",
+    })).rejects.toMatchObject({ code });
+    expect(harness.commands).toEqual([]);
+  });
+
+  it("sends only a turn to the exact existing thread and preserves its settings", async () => {
+    const harness = await testHarness();
+    harness.threads.push(existingThread());
+    const result = await sendThreadPrompt({ ...harness.config, model: "creation-default", runtimeMode: "full-access" }, {
+      threadId: "existing-thread", prompt: "Continue the previous discussion. $HOME `literal`",
+    });
+    expect(harness.commands).toHaveLength(1);
+    expect(harness.commands[0]).toMatchObject({
+      type: "thread.turn.start", threadId: "existing-thread",
+      runtimeMode: "approval-required", interactionMode: "plan",
+      message: { role: "user", text: "Continue the previous discussion. $HOME `literal`", attachments: [] },
+    });
+    for (const key of ["modelSelection", "bootstrap", "titleSeed"]) {
+      expect(harness.commands[0]).not.toHaveProperty(key);
+    }
+    expect(harness.threads).toEqual([existingThread()]);
+    expect(result.thread.id).toBe("existing-thread");
+    expect(result.thread.dispatch).toEqual({ sequence: 1 });
+    expect(result.opened.kind).toBe("none");
+    expect(JSON.stringify(result)).not.toContain("mock-token");
+  });
+
+  it("validates and previews without dispatching, including snapshot fallback", async () => {
+    const harness = await testHarness([], { shellUnavailable: true });
+    harness.threads.push(existingThread({ session: { status: "stopped", activeTurnId: null } }));
+    const result = await sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Preview", dryRun: true, openMode: "browser",
+    });
+    expect(harness.commands).toEqual([]);
+    expect(result.thread.command.message.text).toBe("Preview");
+    expect(result.thread.dispatch).toBeNull();
+    expect(result.opened.kind).toBe("none");
+  });
+
+  it.each([
+    [{ archivedAt: "2026-01-01T00:00:00Z" }, "THREAD_ARCHIVED"],
+    [{ deletedAt: "2026-01-01T00:00:00Z" }, "THREAD_NOT_FOUND"],
+    [{ session: { status: "starting" } }, "THREAD_BUSY"],
+    [{ session: { status: "running" } }, "THREAD_BUSY"],
+    [{ session: { status: "ready", activeTurnId: "active-turn" } }, "THREAD_BUSY"],
+    [{ latestTurn: { state: "pending" } }, "THREAD_BUSY"],
+    [{ latestTurn: { state: "running" } }, "THREAD_BUSY"],
+  ] satisfies Array<[Partial<T3Thread>, string]>)("rejects unavailable thread state %j", async (overrides, code) => {
+    const harness = await testHarness();
+    harness.threads.push(existingThread(overrides));
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Do work",
+    })).rejects.toMatchObject({ code });
+    expect(harness.commands).toEqual([]);
+  });
+
+  it("rejects missing threads and incomplete settings without creating or changing anything", async () => {
+    const harness = await testHarness();
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: "missing", prompt: "Do work",
+    })).rejects.toMatchObject({ code: "THREAD_NOT_FOUND" });
+    const thread = existingThread();
+    delete thread.runtimeMode;
+    harness.threads.push(thread);
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: thread.id, prompt: "Do work",
+    })).rejects.toMatchObject({ code: "T3_INVALID_SNAPSHOT" });
+    expect(harness.commands).toEqual([]);
+  });
+
+  it("does not delete the existing thread when dispatch fails", async () => {
+    const harness = await testHarness([], { failTurn: true });
+    harness.threads.push(existingThread());
+    await expect(sendThreadPrompt(harness.config, {
+      threadId: "existing-thread", prompt: "Do work",
+    })).rejects.toMatchObject({ code: "T3_API_ERROR" });
+    expect(harness.commands.map((command) => command.type)).toEqual(["thread.turn.start"]);
+    expect(harness.threads).toEqual([existingThread()]);
+  });
+
+  it.each([
+    [" ", "hello", "THREAD_ID_REQUIRED"],
+    ["existing-thread", " \n ", "PROMPT_REQUIRED"],
+  ])("rejects invalid input before contacting T3", async (threadId, prompt, code) => {
+    await expect(sendThreadPrompt(DEFAULT_CONFIG, { threadId, prompt })).rejects.toMatchObject({ code });
   });
 });

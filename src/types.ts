@@ -68,6 +68,11 @@ export interface T3Thread {
   projectId: string;
   title: string;
   archivedAt: string | null;
+  deletedAt?: string | null;
+  runtimeMode?: RuntimeMode;
+  interactionMode?: InteractionMode;
+  session?: { status: string; activeTurnId?: string | null } | null;
+  latestTurn?: { state: string } | null;
   [key: string]: unknown;
 }
 
