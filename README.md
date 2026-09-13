@@ -1,4 +1,4 @@
-# @bvdm/t3code-cli
+o# @bvdm/t3code-cli
 
 `t3code` hands the current folder or Git repository to a new thread in [T3 Code](https://github.com/pingdotgg/t3code).
 
@@ -74,7 +74,7 @@ Select the new thread's T3 controls on the handover command:
 ```bash
 t3code handover \
   --provider codex \
-  --model gpt-5.6-sol \
+  --model gpt-6-astra \
   --speed fast \
   --thinking-effort xhigh \
   --permission full-access \
