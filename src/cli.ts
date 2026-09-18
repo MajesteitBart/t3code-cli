@@ -299,4 +299,5 @@ program
   );
 
 await program.parseAsync(process.argv);
-process.exit(process.exitCode ?? 0);
+// Let pending stdout/stderr writes drain, especially when large JSON is piped.
+// HTTP requests own and close their sockets rather than relying on forced exit.
