@@ -7,6 +7,22 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
 const exec = promisify(execFile);
+// Node 22/24 warn on the CLI's existing node:sqlite import. Remove only that
+// known runtime diagnostic; unexpected stderr must still fail the assertions.
+function withoutSqliteWarning(stderr) {
+  return stderr.replace(/^\(node:\d+\) ExperimentalWarning: SQLite is an experimental feature and might change at any time\r?\n\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\r?\n/m, "");
+}
+
+test("stderr normalization removes only the known SQLite runtime warning", () => {
+  const warning = "(node:123) ExperimentalWarning: SQLite is an experimental feature and might change at any time\n(Use `node --trace-warnings ...` to show where the warning was created)\n";
+  const envelope = '{"ok":false}\n';
+  expect(withoutSqliteWarning(warning + envelope)).toBe(envelope);
+  expect(withoutSqliteWarning(warning.replaceAll("\n", "\r\n") + envelope)).toBe(envelope);
+  expect(withoutSqliteWarning(envelope)).toBe(envelope);
+  expect(withoutSqliteWarning("Unexpected diagnostic\n" + warning + envelope)).toBe("Unexpected diagnostic\n" + envelope);
+  expect(withoutSqliteWarning(warning.replace("SQLite", "Something else"))).toBe(warning.replace("SQLite", "Something else"));
+});
+
 let directory;
 let build;
 beforeAll(async () => {
@@ -67,16 +83,17 @@ for (const mode of ["large", "truncated", "http-error"]) {
           error => ({ stdout: error.stdout, stderr: error.stderr, code: error.code }),
         );
       expect(authorized).toBe(true);
+      const stderr = withoutSqliteWarning(result.stderr);
       if (mode === "large") {
         expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
+        expect(stderr).toBe("");
         const envelope = JSON.parse(result.stdout);
         expect(envelope.ok).toBe(true);
         expect(envelope.data.response).toEqual(data);
       } else {
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
-        expect(JSON.parse(result.stderr)).toMatchObject({ ok: false, error: {
+        expect(JSON.parse(stderr)).toMatchObject({ ok: false, error: {
           code: mode === "truncated" ? "T3_REQUEST_FAILED" : "T3_API_ERROR",
         } });
       }
