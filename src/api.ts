@@ -1,4 +1,5 @@
 import { CliError } from "./errors.js";
+import { readResponseText, withHttpResponse } from "./http.js";
 import { resolveT3Invocation, runProcess, type T3Invocation } from "./process.js";
 import { resolveT3Home } from "./runtime.js";
 import type { CliConfig, OrchestrationSnapshot, T3Runtime } from "./types.js";
@@ -169,19 +170,24 @@ export class T3Api {
     if (url.origin !== new URL(this.runtime.origin).origin) {
       throw new CliError("INVALID_REQUEST_PATH", "Request path must stay on the T3 server origin.");
     }
-    // No `connection: close`: Node 26's fetch asserts when T3 closes the socket mid-body on large snapshots.
-    const response = await fetch(url, {
-      method,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        ...(payload === undefined ? {} : { "content-type": "application/json" }),
+    const { status, responseText } = await withHttpResponse(
+      url,
+      {
+        method,
+        headers: {
+          authorization: `Bearer ${this.token}`,
+          ...(payload === undefined ? {} : { "content-type": "application/json" }),
+        },
+        signal: AbortSignal.timeout(30_000),
       },
-      ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
-      signal: AbortSignal.timeout(30_000),
-    }).catch((cause) => {
+      payload === undefined ? undefined : JSON.stringify(payload),
+      async (response) => ({
+        status: response.statusCode ?? 0,
+        responseText: await readResponseText(response),
+      }),
+    ).catch((cause) => {
       throw new CliError("T3_REQUEST_FAILED", `T3 request failed: ${method} ${url.pathname}`, { cause });
     });
-    const responseText = await response.text();
     let body: unknown = null;
     if (responseText.length > 0) {
       try {
@@ -190,9 +196,9 @@ export class T3Api {
         body = responseText;
       }
     }
-    if (!response.ok) {
-      throw new CliError("T3_API_ERROR", `T3 returned HTTP ${response.status} for ${method} ${url.pathname}.`, {
-        details: { status: response.status, body },
+    if (status < 200 || status >= 300) {
+      throw new CliError("T3_API_ERROR", `T3 returned HTTP ${status} for ${method} ${url.pathname}.`, {
+        details: { status, body },
       });
     }
     return body;
