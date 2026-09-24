@@ -59,7 +59,7 @@ PowerShell:
 
 The default behavior is:
 
-- resolve the Git repository root (`workspaceMode: "repo"`);
+- resolve the Git repository root (`workspaceMode: "repo"`); a linked worktree, such as one T3 created for another thread, resolves to the main checkout's project, and a `current` checkout handover keeps the new thread in that worktree;
 - create a missing T3 project (`projectPolicy: "create"`);
 - resolve T3's checkout preference in the same order as the installed app: project setting, checked-in `t3.json`, then the global setting;
 - inherit an existing project's complete model selection, including its provider options;
@@ -126,7 +126,7 @@ t3code config set thinkingEffort xhigh
 
 `projectPolicy: "existing"` makes a missing project a hard error. `workspaceMode: "folder"` uses the exact current folder instead of walking up to the Git root. `threadEnvMode: "t3"` follows T3's project → `t3.json` → global local/worktree preference. Explicit CLI config values remain overrides.
 
-T3 0.0.28 and later expose an atomic thread bootstrap contract for new worktrees. `--checkout worktree` uses it to create the thread, prepare the worktree from the current branch, run the matching setup script, and start the prompt. Worktree creation honors the current installation's explicit `newWorktreesStartFromOrigin` value; when that value is absent, it uses the installed version's default (`false` on 0.0.28, `true` on 0.0.29 and later). A repository without a current branch returns `WORKTREE_REQUIRES_BRANCH` instead of silently falling back to the current checkout.
+T3 0.0.28 and later expose an atomic thread bootstrap contract for new worktrees. `--checkout worktree` uses it to create the thread, prepare the worktree from the current branch, run the matching setup script, and start the prompt. T3 only runs that bootstrap for WebSocket RPC clients: its HTTP dispatch route ignores it and rejects the turn because the thread does not exist yet. The CLI therefore sends this one command over T3's `/ws` endpoint, authenticated with a short-lived WebSocket ticket. Like T3's own UI, it asks for a temporary `t3code/<hex>` branch, which T3 renames once the thread has a title. Worktree creation honors the current installation's explicit `newWorktreesStartFromOrigin` value; when that value is absent, it uses the installed version's default (`false` on 0.0.28, `true` on 0.0.29 and later). A repository without a current branch returns `WORKTREE_REQUIRES_BRANCH` instead of silently falling back to the current checkout.
 
 ## Commands
 
@@ -138,10 +138,12 @@ t3code projects resolve --cwd .
 t3code projects ensure --cwd . --project-policy create
 t3code threads create --stdin
 t3code handover --stdin
-t3code request get /api/orchestration/snapshot
+t3code request get api/orchestration/shell
 ```
 
-Every command supports human-readable output. `--json` produces `{ "ok": true, "data": ... }` on success and a stable error envelope on failure.
+Every command supports human-readable output. `--json` produces `{ "ok": true, "data": ... }` on success and a stable error envelope on failure. When a failure wraps an upstream CLI error, such as T3's reason for rejecting a worktree bootstrap, `error.cause` carries that error's code, message, and details.
+
+The leading slash of a `request get` path is optional. Git Bash rewrites arguments that start with a slash into Windows paths (`/api/...` becomes `C:/Program Files/Git/api/...`), so write `api/...` there or set `MSYS_NO_PATHCONV=1`.
 
 ## Origin and optional UI example
 
@@ -164,7 +166,7 @@ Current stable T3 Code registers `t3code://` but only uses a second launch to re
 
 ## Security
 
-The CLI uses T3's own `auth session issue` control plane to mint an administrative bearer token, keeps it only in memory, and revokes it in a `finally` block. Tokens are never included in JSON output or logs.
+The CLI uses T3's own `auth session issue` control plane to mint an administrative bearer token, keeps it only in memory, and revokes it in a `finally` block. A worktree handover also exchanges that token for a short-lived WebSocket ticket. Tokens and tickets are never included in JSON output or logs.
 
 ## Publish a release
 

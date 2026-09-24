@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { WebSocketServer } from "ws";
 
 import { DEFAULT_CONFIG } from "./config.js";
 import { CliError } from "./errors.js";
 import { runProcess } from "./process.js";
-import { createHandoverThread } from "./service.js";
+import { createHandoverThread, normalizeRequestPath, resolveProject } from "./service.js";
 import type { CliConfig, T3Project, T3Thread } from "./types.js";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -29,10 +30,22 @@ function json(response: ServerResponse, status: number, value: unknown): void {
   response.end(JSON.stringify(value));
 }
 
+async function addLinkedWorktree(repoRoot: string, branch: string): Promise<string> {
+  await runProcess("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "Initial"], {
+    cwd: repoRoot,
+  });
+  const parent = await mkdtemp(path.join(os.tmpdir(), "t3code-cli-worktree-"));
+  cleanup.push(() => rm(parent, { recursive: true, force: true }));
+  const worktree = path.join(parent, "linked");
+  await runProcess("git", ["worktree", "add", "-b", branch, worktree], { cwd: repoRoot });
+  return worktree;
+}
+
 async function testHarness(
   initialProjects: T3Project[] = [],
   options: {
     failTurn?: boolean;
+    failBootstrap?: string;
     serverVersion?: string;
     settings?: Record<string, unknown>;
   } = {},
@@ -51,6 +64,8 @@ async function testHarness(
   const projects = [...initialProjects];
   const threads: T3Thread[] = [];
   const commands: Array<Record<string, unknown>> = [];
+  const rpcCommands: Array<Record<string, unknown>> = [];
+  const wsTicket = "mock-ws-ticket";
   const server = createServer(async (request, response) => {
     if (request.url === "/.well-known/t3/environment") {
       json(response, 200, {
@@ -70,6 +85,10 @@ async function testHarness(
         threads,
         updatedAt: new Date().toISOString(),
       });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/auth/websocket-ticket") {
+      json(response, 200, { ticket: wsTicket, expiresAt: new Date(Date.now() + 60_000).toISOString() });
       return;
     }
     if (request.method === "POST" && request.url === "/api/orchestration/dispatch") {
@@ -92,19 +111,10 @@ async function testHarness(
           archivedAt: null,
         });
       }
-      if (command.type === "thread.turn.start") {
-        const bootstrap = command.bootstrap as
-          | { createThread?: Record<string, unknown> }
-          | undefined;
-        const createThread = bootstrap?.createThread;
-        if (createThread) {
-          threads.push({
-            id: command.threadId as string,
-            projectId: createThread.projectId as string,
-            title: createThread.title as string,
-            archivedAt: null,
-          });
-        }
+      // Like T3, the HTTP route ignores `bootstrap`, so a turn for a thread that does not exist fails.
+      if (command.type === "thread.turn.start" && !threads.some((thread) => thread.id === command.threadId)) {
+        json(response, 500, { error: `Thread '${String(command.threadId)}' does not exist for command 'thread.turn.start'.` });
+        return;
       }
       if (command.type === "thread.delete") {
         const index = threads.findIndex((thread) => thread.id === command.threadId);
@@ -121,8 +131,70 @@ async function testHarness(
     }
     json(response, 404, { error: "not found" });
   });
+  const sockets = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (request, socket, head) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname !== "/ws" || url.searchParams.get("wsTicket") !== wsTicket) {
+      socket.end("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      return;
+    }
+    sockets.handleUpgrade(request, socket, head, (client) => {
+      client.on("message", (data) => {
+        const message = JSON.parse(String(data)) as {
+          _tag: string;
+          id: string;
+          tag: string;
+          payload: Record<string, unknown>;
+        };
+        if (message._tag !== "Request" || message.tag !== "orchestration.dispatchCommand") return;
+        const command = message.payload;
+        rpcCommands.push(command);
+        const bootstrap = command.bootstrap as { createThread?: Record<string, unknown> } | undefined;
+        if (options.failBootstrap) {
+          client.send(
+            JSON.stringify({
+              _tag: "Exit",
+              requestId: message.id,
+              exit: {
+                _tag: "Failure",
+                cause: [
+                  {
+                    _tag: "Fail",
+                    error: {
+                      _tag: "OrchestrationDispatchCommandError",
+                      message: options.failBootstrap,
+                      bootstrapThreadDisposition: "not-created",
+                    },
+                  },
+                ],
+              },
+            }),
+          );
+          return;
+        }
+        if (bootstrap?.createThread) {
+          threads.push({
+            id: command.threadId as string,
+            projectId: bootstrap.createThread.projectId as string,
+            title: bootstrap.createThread.title as string,
+            archivedAt: null,
+          });
+        }
+        client.send(
+          JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: { sequence: 1 } } }),
+        );
+      });
+    });
+  });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))));
+  cleanup.push(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        for (const client of sockets.clients) client.terminate();
+        sockets.close();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("missing server address");
 
@@ -152,7 +224,7 @@ async function testHarness(
     openMode: "none",
     threadEnvMode: "local",
   };
-  return { root, config, projects, threads, commands };
+  return { root, config, projects, threads, commands, rpcCommands };
 }
 
 describe("createHandoverThread", () => {
@@ -329,11 +401,11 @@ describe("createHandoverThread", () => {
       openMode: "none",
     });
 
-    expect(harness.commands.map((command) => command.type)).toEqual([
-      "project.create",
-      "thread.turn.start",
-    ]);
+    expect(harness.commands.map((command) => command.type)).toEqual(["project.create"]);
+    expect(harness.rpcCommands.map((command) => command.type)).toEqual(["thread.turn.start"]);
+    expect(harness.rpcCommands[0]).toEqual(result.thread.command);
     expect(result.thread.createDispatch).toBeNull();
+    expect(result.thread.dispatch).toEqual({ sequence: 1 });
     expect(result.thread.command).toMatchObject({
       type: "thread.turn.start",
       bootstrap: {
@@ -346,15 +418,43 @@ describe("createHandoverThread", () => {
           projectCwd: await realpath(harness.root),
           baseBranch: "main",
           startFromOrigin: true,
+          requireWorktree: true,
         },
         runSetupScript: true,
       },
       runtimeMode: "full-access",
     });
+    const prepareWorktree = (result.thread.command as { bootstrap: { prepareWorktree: { branch: string } } })
+      .bootstrap.prepareWorktree;
+    expect(prepareWorktree.branch).toMatch(/^t3code\/[0-9a-f]{8}$/u);
     expect(result.thread.command).toMatchObject({
       bootstrap: { createThread: { runtimeMode: "full-access" } },
     });
     expect(harness.threads).toHaveLength(1);
+  });
+
+  it("reports T3's reason when a worktree bootstrap fails", async () => {
+    const harness = await testHarness([], {
+      failBootstrap: "A separate worktree requires a Git repository and a base branch with a commit.",
+    });
+
+    const failure = await createHandoverThread(harness.config, {
+      cwd: harness.root,
+      prompt: "Handover",
+      threadEnvMode: "worktree",
+      openMode: "none",
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: "THREAD_START_FAILED",
+      details: { cleanup: "not-created" },
+      cause: {
+        code: "T3_RPC_FAILED",
+        message: "A separate worktree requires a Git repository and a base branch with a commit.",
+        details: { errorTag: "OrchestrationDispatchCommandError", bootstrapThreadDisposition: "not-created" },
+      },
+    });
+    expect(harness.threads).toHaveLength(0);
   });
 
   it("honors an explicit worktree-origin setting from the current installation", async () => {
@@ -490,6 +590,83 @@ describe("createHandoverThread", () => {
     expect(harness.commands).toHaveLength(0);
   });
 
+  it("hands over into a linked worktree of an existing project", async () => {
+    const harness = await testHarness();
+    const worktree = await addLinkedWorktree(harness.root, "feature/linked");
+    harness.projects.push({
+      id: "project-main",
+      title: "Main checkout",
+      workspaceRoot: await realpath(harness.root),
+      defaultModelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+      deletedAt: null,
+    });
+
+    const resolved = await resolveProject(harness.config, { cwd: worktree });
+    const result = await createHandoverThread(harness.config, {
+      cwd: worktree,
+      prompt: "Handover",
+      projectPolicy: "existing",
+      openMode: "none",
+    });
+
+    expect(resolved.project?.id).toBe("project-main");
+    expect(resolved.workspace).toMatchObject({
+      workspaceRoot: await realpath(worktree),
+      mainWorktreeRoot: await realpath(harness.root),
+    });
+    expect(result.project.id).toBe("project-main");
+    expect(harness.commands.map((command) => command.type)).toEqual(["thread.create", "thread.turn.start"]);
+    expect(harness.commands[0]).toMatchObject({
+      projectId: "project-main",
+      branch: "feature/linked",
+      worktreePath: await realpath(worktree),
+    });
+  });
+
+  it("prepares new worktrees from the project checkout when started in a linked worktree", async () => {
+    const harness = await testHarness();
+    const worktree = await addLinkedWorktree(harness.root, "feature/linked");
+    harness.projects.push({
+      id: "project-main",
+      title: "Main checkout",
+      workspaceRoot: await realpath(harness.root),
+      defaultModelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+      deletedAt: null,
+    });
+
+    const result = await createHandoverThread(harness.config, {
+      cwd: worktree,
+      prompt: "Handover",
+      threadEnvMode: "worktree",
+      openMode: "none",
+      dryRun: true,
+    });
+
+    expect(result.thread.command).toMatchObject({
+      bootstrap: {
+        createThread: { projectId: "project-main", worktreePath: null },
+        prepareWorktree: { projectCwd: await realpath(harness.root), baseBranch: "feature/linked" },
+      },
+    });
+  });
+
+  it("names the main checkout when a linked worktree has no project", async () => {
+    const harness = await testHarness();
+    const worktree = await addLinkedWorktree(harness.root, "feature/linked");
+
+    await expect(
+      createHandoverThread(harness.config, {
+        cwd: worktree,
+        prompt: "Handover",
+        projectPolicy: "existing",
+        openMode: "none",
+      }),
+    ).rejects.toMatchObject({
+      code: "PROJECT_NOT_FOUND",
+      details: { workspaceRoot: await realpath(harness.root), linkedWorktree: await realpath(worktree) },
+    });
+  });
+
   it("deletes a newly-created thread when its first turn fails", async () => {
     const harness = await testHarness([], { failTurn: true });
 
@@ -510,5 +687,22 @@ describe("createHandoverThread", () => {
       "thread.delete",
     ]);
     expect(harness.threads).toHaveLength(0);
+  });
+});
+
+describe("normalizeRequestPath", () => {
+  it("accepts paths with or without a leading slash", () => {
+    expect(normalizeRequestPath("/api/orchestration/shell")).toBe("/api/orchestration/shell");
+    expect(normalizeRequestPath("api/orchestration/shell")).toBe("/api/orchestration/shell");
+  });
+
+  it("explains Git Bash path conversion", () => {
+    expect(() => normalizeRequestPath("C:/Program Files/Git/api/orchestration/shell")).toThrow(/MSYS_NO_PATHCONV/u);
+  });
+
+  it("rejects paths that would leave the T3 origin", () => {
+    for (const requestPath of ["//example.com/api", "/\\example.com/api", "\\\\example.com/api"]) {
+      expect(() => normalizeRequestPath(requestPath)).toThrow(CliError);
+    }
   });
 });

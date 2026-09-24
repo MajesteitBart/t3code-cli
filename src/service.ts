@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -20,6 +20,7 @@ import type {
   T3Project,
   ThreadEnvMode,
   WorkspaceMode,
+  WorkspaceResolution,
 } from "./types.js";
 import { pathsEqual, resolveWorkspace } from "./workspace.js";
 
@@ -123,8 +124,25 @@ function activeProjects(projects: readonly T3Project[]): T3Project[] {
   return projects.filter((project) => project.deletedAt == null);
 }
 
-function projectForWorkspace(projects: readonly T3Project[], workspaceRoot: string): T3Project | null {
-  return activeProjects(projects).find((project) => pathsEqual(project.workspaceRoot, workspaceRoot)) ?? null;
+function projectAt(projects: readonly T3Project[], root: string): T3Project | null {
+  return activeProjects(projects).find((project) => pathsEqual(project.workspaceRoot, root)) ?? null;
+}
+
+/** An exact project wins; a linked worktree otherwise belongs to its main checkout's project. */
+function projectForWorkspace(projects: readonly T3Project[], workspace: WorkspaceResolution): T3Project | null {
+  return (
+    projectAt(projects, workspace.workspaceRoot) ??
+    (workspace.mainWorktreeRoot ? projectAt(projects, workspace.mainWorktreeRoot) : null)
+  );
+}
+
+function projectRootFor(workspace: WorkspaceResolution): string {
+  return workspace.mainWorktreeRoot ?? workspace.workspaceRoot;
+}
+
+/** Matches the temporary branch T3's UI uses; T3 renames it after the thread gets a title. */
+function temporaryWorktreeBranch(): string {
+  return `t3code/${randomBytes(4).toString("hex")}`;
 }
 
 async function projectsFromApi(api: T3Api): Promise<T3Project[]> {
@@ -267,17 +285,22 @@ function buildProjectCreateCommand(
 async function ensureProjectWithApi(
   api: T3Api,
   initialProjects: readonly T3Project[] | null,
-  workspaceRoot: string,
+  workspace: WorkspaceResolution,
   policy: ProjectPolicy,
   dryRun: boolean,
   defaultModelSelection: ModelSelection,
 ): Promise<{ project: T3Project; created: boolean; command: unknown | null; dispatch: unknown | null }> {
   const projects = initialProjects ?? (await projectsFromApi(api));
-  const existing = projectForWorkspace(projects, workspaceRoot);
+  const existing = projectForWorkspace(projects, workspace);
   if (existing) return { project: existing, created: false, command: null, dispatch: null };
+  const workspaceRoot = projectRootFor(workspace);
   if (policy === "existing") {
     throw new CliError("PROJECT_NOT_FOUND", `No T3 Code project exists for ${workspaceRoot}.`, {
-      details: { workspaceRoot, projectPolicy: policy },
+      details: {
+        workspaceRoot,
+        ...(workspace.mainWorktreeRoot ? { linkedWorktree: workspace.workspaceRoot } : {}),
+        projectPolicy: policy,
+      },
     });
   }
 
@@ -319,11 +342,11 @@ export async function resolveProject(config: CliConfig, options: WorkspaceOption
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   const localProjects = readLocalProjects(runtime);
   if (localProjects) {
-    return { runtime, workspace, project: projectForWorkspace(localProjects, workspace.workspaceRoot) };
+    return { runtime, workspace, project: projectForWorkspace(localProjects, workspace) };
   }
   return await withT3Api(runtime, config, async (api) => {
     const projects = await projectsFromApi(api);
-    return { runtime, workspace, project: projectForWorkspace(projects, workspace.workspaceRoot) };
+    return { runtime, workspace, project: projectForWorkspace(projects, workspace) };
   });
 }
 
@@ -337,7 +360,7 @@ export async function ensureProject(config: CliConfig, options: WorkspaceOptions
     ...(await ensureProjectWithApi(
       api,
       localProjects,
-      workspace.workspaceRoot,
+      workspace,
       options.projectPolicy ?? config.projectPolicy,
       options.dryRun ?? false,
       defaultModelSelectionForVersion(runtime.serverVersion),
@@ -360,11 +383,15 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
     const projectResult = await ensureProjectWithApi(
       api,
       localProjects,
-      workspace.workspaceRoot,
+      workspace,
       options.projectPolicy ?? config.projectPolicy,
       true,
       installedDefaultModelSelection,
     );
+    // A handover from a linked worktree of the project's checkout keeps working in that worktree.
+    const currentWorktreePath = pathsEqual(projectResult.project.workspaceRoot, workspace.workspaceRoot)
+      ? null
+      : workspace.workspaceRoot;
     const envModeResolution = effectiveEnvMode(
       options.threadEnvMode ?? config.threadEnvMode,
       projectResult.project,
@@ -414,7 +441,7 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
       runtimeMode,
       interactionMode,
       branch: workspace.branch,
-      worktreePath: null,
+      worktreePath: currentWorktreePath,
       createdAt,
     };
     const bootstrap = envMode === "worktree"
@@ -430,9 +457,12 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
             createdAt,
           },
           prepareWorktree: {
-            projectCwd: workspace.workspaceRoot,
+            projectCwd: projectResult.project.workspaceRoot,
             baseBranch: workspace.branch!,
+            // Without a new branch, `git worktree add` fails when the base branch is checked out elsewhere.
+            branch: temporaryWorktreeBranch(),
             startFromOrigin: settings.newWorktreesStartFromOrigin,
+            requireWorktree: true,
           },
           runSetupScript: true,
         }
@@ -459,11 +489,18 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
     if (!options.dryRun) {
       if (envMode === "worktree") {
         try {
-          dispatch = await api.dispatch(command);
+          dispatch = await api.dispatchOverWebSocket(command);
         } catch (cause) {
+          const disposition =
+            cause instanceof CliError
+              ? (cause.details as { bootstrapThreadDisposition?: unknown } | undefined)?.bootstrapThreadDisposition
+              : undefined;
           throw new CliError("THREAD_START_FAILED", "T3 could not prepare the worktree and start its handover prompt.", {
             cause,
-            details: { threadId, cleanup: "server-managed" },
+            details: {
+              threadId,
+              cleanup: disposition === "deleted" || disposition === "not-created" ? disposition : "server-managed",
+            },
           });
         }
       } else {
@@ -508,13 +545,27 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
   return { ...result, opened, dryRun: options.dryRun ?? false };
 }
 
-export async function rawGet(config: CliConfig, requestPath: string) {
-  if (!requestPath.startsWith("/") || requestPath.startsWith("//")) {
-    throw new CliError("INVALID_REQUEST_PATH", "Request path must start with one slash.");
+export function normalizeRequestPath(requestPath: string): string {
+  if (/^[A-Za-z]:[\\/]/u.test(requestPath)) {
+    throw new CliError(
+      "INVALID_REQUEST_PATH",
+      "Request path is a Windows file path. Git Bash converts arguments that start with a slash: pass the path without its leading slash (api/...) or set MSYS_NO_PATHCONV=1.",
+      { details: { requestPath } },
+    );
   }
+  const normalized = requestPath.startsWith("/") ? requestPath : `/${requestPath}`;
+  // URL parsing treats a backslash like a slash, so both spellings would leave the T3 origin.
+  if (/^[\\/]{2}/u.test(normalized)) {
+    throw new CliError("INVALID_REQUEST_PATH", "Request path must be a T3 API path such as /api/orchestration/shell.");
+  }
+  return normalized;
+}
+
+export async function rawGet(config: CliConfig, requestPath: string) {
+  const normalizedPath = normalizeRequestPath(requestPath);
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, config, async (api) => ({
     runtime,
-    response: await api.request("GET", requestPath),
+    response: await api.request("GET", normalizedPath),
   }));
 }
