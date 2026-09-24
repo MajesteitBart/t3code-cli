@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { stdin as input } from "node:process";
 
@@ -35,11 +36,13 @@ import type {
   WorkspaceMode,
 } from "./types.js";
 
+const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
+
 const program = new Command();
 program
   .name("t3code")
   .description("Create T3 Code projects and handover threads from the current folder.")
-  .version("0.1.0")
+  .version(packageJson.version)
   .option("--json", "Emit stable JSON envelopes.")
   .option("--config <path>", "Use a specific config file.")
   .option("--t3-home <path>", "Override T3CODE_HOME for this command.")
@@ -289,7 +292,7 @@ program
   .command("request")
   .description("Raw read-only HTTP escape hatch.")
   .command("get")
-  .argument("<path>", "Absolute T3 API path, starting with one slash.")
+  .argument("<path>", "T3 API path, such as api/orchestration/shell (the leading slash is optional).")
   .action((requestPath: string) =>
     action(async () => {
       const context = await commandContext();

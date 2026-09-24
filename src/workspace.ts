@@ -40,7 +40,24 @@ export async function resolveWorkspace(
     mode,
     isGitRepository: repoRoot !== null,
     branch,
+    mainWorktreeRoot: mode === "repo" && repoRoot ? await mainWorktreeRootOf(workspaceRoot) : null,
   };
+}
+
+/**
+ * Returns the main checkout when `workspaceRoot` is a linked worktree (for example one T3 created
+ * for a thread), so the workspace can resolve to the main checkout's project.
+ */
+async function mainWorktreeRootOf(workspaceRoot: string): Promise<string | null> {
+  const [gitDir, commonDir] = await Promise.all([
+    gitOutput(workspaceRoot, ["rev-parse", "--path-format=absolute", "--git-dir"]),
+    gitOutput(workspaceRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+  ]);
+  if (!gitDir || !commonDir || pathsEqual(gitDir, commonDir)) return null;
+  // A bare repository has no main checkout to resolve to.
+  if (path.basename(commonDir) !== ".git") return null;
+  const mainRoot = await realpath(path.dirname(commonDir)).catch(() => null);
+  return mainRoot && !pathsEqual(mainRoot, workspaceRoot) ? mainRoot : null;
 }
 
 export function pathsEqual(left: string, right: string): boolean {

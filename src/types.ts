@@ -91,4 +91,6 @@ export interface WorkspaceResolution {
   mode: WorkspaceMode;
   isGitRepository: boolean;
   branch: string | null;
+  /** The main checkout when `workspaceRoot` is a linked Git worktree in repo mode; otherwise null. */
+  mainWorktreeRoot: string | null;
 }
