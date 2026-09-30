@@ -114,7 +114,7 @@ describe.sequential("CLI parsing", () => {
     expect(help.exitCode).toBe(0);
     expect(help.stderr).toBe("");
     expect(help.stdout).toContain("Usage: t3code [options] [command]");
-    expect(version).toEqual({ stdout: "0.1.2\n", stderr: "", exitCode: 0 });
+    expect(version).toEqual({ stdout: "0.1.3\n", stderr: "", exitCode: 0 });
   });
 
   it("leaves action-level JSON errors unchanged", async () => {

@@ -75,8 +75,9 @@ export async function runProcess(
 }
 
 export async function commandExists(command: string): Promise<boolean> {
-  const locator = process.platform === "win32" ? "where.exe" : "which";
-  const result = await runProcess(locator, [command], { allowFailure: true, timeoutMs: 5_000 }).catch(
+  // `where.exe` searches the current folder before PATH, which can outlast the timeout in a large folder.
+  const [locator, pattern] = process.platform === "win32" ? ["where.exe", `$PATH:${command}`] : ["which", command];
+  const result = await runProcess(locator, [pattern], { allowFailure: true, timeoutMs: 5_000 }).catch(
     () => null,
   );
   return result?.exitCode === 0;

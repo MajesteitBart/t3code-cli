@@ -27,6 +27,8 @@ t3code --json projects resolve --cwd .
 
 The default `workspaceMode` is `repo`, which resolves nested folders to their Git root. Use `--workspace-mode folder` only when the exact subfolder must be a separate T3 project.
 
+A linked Git worktree, such as the one T3 created for your own thread, resolves to the main checkout's project; `data.workspace.mainWorktreeRoot` shows that checkout. With `--checkout current`, the new thread works in the same linked worktree. With `--checkout worktree`, T3 prepares a new worktree from the linked worktree's current branch.
+
 ## Create a handover thread
 
 Pass prompts over stdin to avoid shell quoting and command-length problems:
@@ -107,7 +109,7 @@ Read `data.project.id`, `data.thread.id`, `data.projectCreated`, and `data.opene
 
 For existing-thread writes, require `data.verification.accepted: true`. Record `data.thread.id` and, for sends, `data.message.messageId` when reporting the result. The CLI verifies the requested projection state rather than treating HTTP submission as success.
 
-On `{ "ok": false }`, report `error.code` and `error.message`. Do not retry write commands blindly. `THREAD_START_FAILED` already attempts to delete the newly-created thread.
+On `{ "ok": false }`, report `error.code`, `error.message`, and `error.cause` when present. The cause carries T3's own reason, for example why it rejected a worktree bootstrap. Read the whole envelope instead of filtering it with `grep`, and do not retry write commands blindly. Each handover attempt creates a new thread id. `THREAD_START_FAILED` already attempts to delete the newly-created thread; `error.details.cleanup` reports `deleted`, `not-created`, or `server-managed`.
 
 `THREAD_TURN_NOT_VERIFIED` or `THREAD_SETTLEMENT_NOT_VERIFIED` means dispatch returned but projection verification timed out. Do not retry automatically because the first operation may still appear later.
 
@@ -117,4 +119,4 @@ T3 0.0.28 and later support new-worktree handovers through the atomic bootstrap 
 
 Thread settlement commands require a T3 server that exposes the `threadSettlement` capability. Existing-thread sends preserve the target's saved model, runtime mode, and interaction mode.
 
-Use `t3code --json request get <path>` only as a read-only escape hatch.
+Use `t3code --json request get <path>` only as a read-only escape hatch. Write the path without its leading slash, for example `api/orchestration/shell`: Git Bash rewrites `/api/...` into a Windows file path before the CLI sees it.

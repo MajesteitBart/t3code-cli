@@ -211,6 +211,22 @@ describe("thread discovery and messaging", () => {
     expect(settled.filter).toMatchObject({ projectId: "project-1", status: "settled" });
   });
 
+  it("lists the main checkout's threads from a linked worktree", async () => {
+    const harness = await testHarness([makeThread("target")]);
+    await runProcess("git", [
+      "-c", "user.name=Test", "-c", "user.email=test@example.com",
+      "commit", "--allow-empty", "-m", "Initial commit",
+    ], { cwd: harness.root });
+    const worktree = path.join(harness.root, "linked");
+    await runProcess("git", ["worktree", "add", "-b", "feature/linked", worktree], { cwd: harness.root });
+
+    const result = await listThreads(harness.config, { cwd: worktree });
+
+    expect(result.filter.projectId).toBe(harness.project.id);
+    expect(result.threads.map((thread) => thread.id)).toEqual(["target"]);
+    expect(harness.commands).toHaveLength(0);
+  });
+
   it("inspects an exact thread with its project", async () => {
     const harness = await testHarness([makeThread("target", {
       messages: [{
