@@ -202,6 +202,7 @@ interface SettingsCommandOptions {
 interface ThreadSendCommandOptions extends PromptOptions, ThreadWaitCommandOptions, SettingsCommandOptions {
   wakeSettled?: boolean;
   wait?: boolean;
+  ifBusy: "reject" | "inject";
 }
 
 interface ThreadRequestCommandOptions extends ThreadWaitCommandOptions {
@@ -592,7 +593,12 @@ addReplyOptions(
       .option("--prompt-file <path>", "Read the message from a UTF-8 file.")
       .option("--stdin", "Read the message from stdin.")
       .option("--wake-settled", "Explicitly allow this message to wake a settled thread.")
-      .option("--wait", "Wait for the turn that handles the message and print its reply."),
+      .option("--wait", "Wait for the turn that handles the message and print its reply.")
+      .addOption(
+        new Option("--if-busy <mode>", "reject: refuse while a turn runs or a message waits; inject: send into the running turn.")
+          .choices(["reject", "inject"])
+          .default("reject"),
+      ),
   ),
 ).action((options: ThreadSendCommandOptions) =>
   action(async () => {
@@ -605,6 +611,7 @@ addReplyOptions(
       ...(!context.json && !options.stdin ? { confirmSettled: confirmSettledThread } : {}),
       ...(options.wait ? { wait: waitOptions(options) } : {}),
       settings: settingsChange(options),
+      ifBusy: options.ifBusy,
     });
     const changed = result.settings ? describeChanges(result.settings) : "";
     const sent = `${changed ? `Changed ${changed}. ` : ""}Sent message ${result.message.messageId} to thread ${result.thread.id}; T3 accepted and projected the turn.`;

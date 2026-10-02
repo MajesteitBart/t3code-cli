@@ -90,7 +90,7 @@ Rules for sending:
 
 - A settled thread needs `--wake-settled`. The user's explicit instruction to message this thread authorizes it.
 - Archived threads cannot receive messages.
-- If the thread is mid-turn, the provider either folds the message into the running turn or queues a new turn. `--wait` handles both.
+- `send` refuses a busy thread with `THREAD_BUSY` (exit code 4): a turn runs or an earlier message waits. Wait with `threads wait`, then send. Pass `--if-busy inject` only when the user wants to steer the running turn; the provider then folds the message in or queues it, and `--wait` follows either way.
 - `THREAD_WAIT_TIMEOUT` (exit code 6) means the message was sent. Never resend it. Keep waiting with `t3code threads wait --thread <id> --timeout 540`.
 - `THREAD_TURN_NOT_VERIFIED` (exit code 5) means T3 has not shown the message yet. Do not retry automatically; read the thread first.
 

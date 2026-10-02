@@ -22,7 +22,7 @@ import {
   type ThreadWaitOptions,
   type ThreadWaitView,
 } from "./threadSupport.js";
-import { pendingRequests, type PendingQuestion, type PendingRequest } from "./transcript.js";
+import { pendingRequests, queuedMessages, type PendingQuestion, type PendingRequest } from "./transcript.js";
 import type { CliConfig, InteractionMode, ModelSelection, RuntimeMode, T3Thread } from "./types.js";
 
 /** Settings a caller asks to change on an existing thread; anything left out stays as it is. */
@@ -63,6 +63,13 @@ export function hasSettingsChange(change: ThreadSettingsChange | undefined): cha
 /** A provider session that T3 restarts when the permission mode changes. */
 function liveSession(thread: T3Thread): boolean {
   return thread.session != null && thread.session.status !== "stopped";
+}
+
+/** What keeps a thread busy: a running turn, or messages that still wait for their turn. */
+export function busyState(thread: T3Thread): { turnRunning: boolean; queuedMessages: number } | null {
+  const running = turnRunning(thread);
+  const queued = queuedMessages(thread).length;
+  return running || queued > 0 ? { turnRunning: running, queuedMessages: queued } : null;
 }
 
 /** T3 binds a conversation to its provider once the thread has a session or any history. */

@@ -84,6 +84,16 @@ describe("CLI parsing", () => {
     });
   });
 
+  it("rejects an unknown busy-thread mode", async () => {
+    const result = await run(["--json", "threads", "send", "--thread", "thread-1", "--prompt", "x", "--if-busy", "queue"]);
+
+    expect(result.code).toBe(2);
+    expect(JSON.parse(result.stderr).error).toEqual({
+      code: "INVALID_USAGE",
+      message: "option '--if-busy <mode>' argument 'queue' is invalid. Allowed choices are reject, inject.",
+    });
+  });
+
   it("rejects an unknown read detail", async () => {
     const result = await run(["--json", "threads", "read", "--thread", "thread-1", "--detail", "verbose"]);
 
