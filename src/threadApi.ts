@@ -78,7 +78,8 @@ export interface ThreadSettlementVerification {
   unsettledAt: string | null;
 }
 
-export type TurnWaitOutcome = "completed" | "interrupted" | "error" | "needs-attention" | "idle";
+/** `ended`: the turn finished, but a later turn replaced it before the wait saw how it ended. */
+export type TurnWaitOutcome = "completed" | "interrupted" | "error" | "ended" | "needs-attention" | "idle";
 
 export interface TurnWaitResult {
   outcome: TurnWaitOutcome;
@@ -272,12 +273,16 @@ function observeTurn(
   const busy = thread.latestTurn?.state === "running" || session === "starting" || session === "running";
   if (busy && (messageId === undefined || thread.latestTurn?.turnId === turn?.turnId)) return null;
   if (!turn) return { outcome: "idle", turnIndex: null };
-  // T3 reports only the latest turn's state; an earlier turn keeps the state seen while it was latest.
+  // Only a state seen while the turn was latest counts; a remembered "running" says nothing about its end.
   const remembered = turn.turnId === null ? undefined : knownStates.get(turn.turnId);
-  const state = thread.latestTurn?.turnId === turn.turnId ? turn.state : (remembered ?? turn.state);
+  const state = thread.latestTurn?.turnId === turn.turnId ? turn.state : remembered === "running" ? undefined : remembered;
   // A turn that ended by asking a message-mode question waits for a person too.
   const askedBack = requests.some((request) => request.responseMode === "message" && request.turnId === turn.turnId);
-  const outcome = askedBack ? "needs-attention" : state === "interrupted" || state === "error" ? state : "completed";
+  const outcome = askedBack
+    ? "needs-attention"
+    : state === "completed" || state === "interrupted" || state === "error"
+      ? state
+      : "ended";
   const turnStart = turn.startedAt;
   const mayBeQueued =
     turnStart !== null &&
@@ -319,13 +324,19 @@ export class T3ThreadApi {
     const knownStates = new Map<string, T3LatestTurn["state"]>();
     for (;;) {
       // Polls read a bounded window of recent turns; the whole thread is read once the outcome is clear.
-      const read = await beforeDeadline(
+      const windowed = await beforeDeadline(
         this.inspect(threadId).catch((error: unknown) => {
           if (error instanceof CliError && error.code === "THREAD_NOT_FOUND") throw error;
           return null;
         }),
         deadline,
       );
+      // Many newer turns can push the awaited message out of the window; then read the whole thread.
+      const outOfWindow =
+        windowed !== null &&
+        options.messageId !== undefined &&
+        !(windowed.thread.messages ?? []).some((message) => message.id === options.messageId);
+      const read = outOfWindow ? await beforeDeadline(this.read(threadId).catch(() => null), deadline) : windowed;
       if (read) {
         last = read;
         if (read.thread.latestTurn) knownStates.set(read.thread.latestTurn.turnId, read.thread.latestTurn.state);

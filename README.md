@@ -164,6 +164,7 @@ printf '%s' "Which tests still fail?" \
 `data.wait.outcome` is one of:
 
 - `completed` or `interrupted`: `data.reply` holds that turn as a transcript, without your own message.
+- `ended`: the turn finished, but a later turn replaced it before the wait could see whether it completed. `data.reply` still holds it.
 - `error`: the provider could not start the turn; `data.wait.error` says why.
 - `needs-attention`: the thread waits for an approval or an answer, listed in `data.pendingRequests`.
 
