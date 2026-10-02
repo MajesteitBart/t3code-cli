@@ -173,6 +173,19 @@ describe("T3ThreadApi", () => {
     } satisfies Partial<CliError>);
   });
 
+  it("ends turn verification at its deadline when a read stalls", async () => {
+    const adapter = new T3ThreadApi(mockApi({ request: () => new Promise(() => undefined) }), {
+      verificationTimeoutMs: 50,
+      verificationIntervalMs: 0,
+    });
+    const started = Date.now();
+
+    await expect(adapter.dispatchTurn(adapter.buildTurnStart(thread(), "Review findings"))).rejects.toMatchObject({
+      code: "THREAD_TURN_NOT_VERIFIED",
+    });
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
   it("does not accept a projection watermark without the exact message id", async () => {
     let projected = thread();
     const adapter = new T3ThreadApi(mockApi({
