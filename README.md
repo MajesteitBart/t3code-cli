@@ -2,11 +2,11 @@
 
 `t3code` hands the current folder or Git repository to a new thread in [T3 Code](https://github.com/pingdotgg/t3code), and lets automation discover, inspect, and message existing threads.
 
-It does not fake a handover by copying text or opening a generic app URL. It connects to the running local T3 server, resolves the workspace against T3 projects, optionally creates the missing project, creates a fresh thread, and starts its first prompt through T3's orchestration API.
+It connects to the running local T3 server. For a handover, it resolves the workspace against T3 projects, optionally creates the missing project, creates a fresh thread, and starts its first prompt through T3's orchestration API. For existing threads, it lists, reads, sends messages, and waits for replies. It also changes models, effort, and modes, interrupts turns, responds to approvals and questions, and settles or reopens threads.
 
 ## Install
 
-Requirements: Node.js 22.16+ and T3 Code.
+Requirements: T3 Code and Node.js 22.16+ on the 22 line, 23.11+ on the 23 line, or 24.10+.
 
 ```bash
 npm install --global @bvdm/t3code-cli
@@ -20,14 +20,15 @@ t3code --json doctor
 
 ## Develop locally
 
-Requirements: Node.js 22.16+ and T3 Code.
+Requirements: the same Node.js versions and T3 Code.
 
 ```bash
 pnpm install
 pnpm check
-pnpm build
 npm link
 ```
+
+`pnpm check` runs typechecking, tests, and the build.
 
 Then verify the linked command:
 
@@ -42,6 +43,8 @@ From any folder in a repository:
 ```bash
 t3code handover --prompt "Continue from this handover..."
 ```
+
+`threads create` accepts the same options as `handover` and runs the same handover flow.
 
 When `--cwd` is omitted, the command starts from the process's current working directory. In the default `repo` workspace mode, that folder then resolves to its Git root.
 
@@ -96,6 +99,31 @@ t3code handover \
 Command flags override the CLI config, which overrides the T3 project's saved model selection. Without either override, the saved selection and its options are passed through unchanged. A newly-created project uses the detected T3 version's default (`gpt-5.4` on 0.0.28 and `gpt-5.6-sol` on 0.0.29 and later).
 
 Speed and thinking effort are stored as model options. T3 applies the option ids supported by the selected provider/model. If `--provider` changes the project's default provider instance, also pass `--model` because provider instance ids can be user-defined and do not imply a model.
+
+T3 0.0.28 and later expose an atomic thread bootstrap contract for new worktrees. `--checkout worktree` uses it to create the thread, prepare the worktree from the current branch, run the matching setup script, and start the prompt. T3 only runs that bootstrap for WebSocket RPC clients: its HTTP dispatch route ignores it and rejects the turn because the thread does not exist yet. The CLI therefore sends this one command over T3's `/ws` endpoint, authenticated with a short-lived WebSocket ticket. Like T3's own UI, it asks for a temporary `t3code/<hex>` branch, which T3 renames once the thread has a title. Worktree creation honors the current installation's explicit `newWorktreesStartFromOrigin` value; when that value is absent, it uses the installed version's default (`false` on 0.0.28, `true` on 0.0.29 and later). A repository without a current branch returns `WORKTREE_REQUIRES_BRANCH` instead of silently falling back to the current checkout.
+
+## Projects
+
+```bash
+t3code projects list
+t3code projects resolve --cwd .
+t3code projects ensure --cwd . --project-policy create --dry-run
+```
+
+`projects list` shows active projects with their ids, workspace roots, and titles. `projects resolve` finds the existing project for a folder without creating one. If no project matches, it reports that and returns `project: null` in JSON.
+
+`projects ensure` returns the existing project or creates one when the project policy is `create`, the default. `--project-policy existing` makes a missing project an error. `--dry-run` previews the result without creating the project.
+
+Both `resolve` and `ensure` default to the current working directory and accept `--cwd <path>` and `--workspace-mode repo|folder`. Project discovery prefers the read-only local projection database and falls back to authenticated HTTP when it is unavailable.
+
+## Models
+
+```bash
+t3code models list
+t3code models list --provider codex
+```
+
+`models list` shows T3's configured provider instances, their models, and model options such as reasoning effort. Human-readable output summarizes providers with more than 40 models. Use `--provider <instance-id>` to select one provider instance and expand its full model list. Disabled providers show only their status in human-readable output. JSON includes the full catalog for the selected providers.
 
 ## Existing threads
 
@@ -178,7 +206,7 @@ To wait for whatever a thread is doing, for example after a handover:
 t3code threads wait --thread <thread-id> --timeout 540
 ```
 
-Both waits default to 600 seconds. A waiting command issues its T3 session for the timeout plus two minutes, and revokes it when it ends.
+Both waits default to 600 seconds. A waiting command issues its T3 session for the timeout rounded up to whole minutes plus two minutes, and revokes it when it ends.
 
 ### Change a thread's model and modes
 
@@ -200,7 +228,9 @@ printf '%s' "Continue with the migration." \
 
 `--option id=value` sets any other model option, such as Claude's `contextWindow`. The CLI checks every value against T3's model catalog, which `t3code models list` prints. When the model changes, settings the new model supports carry over and the rest are dropped. A T3 server without the catalog gets every effort alias, unchecked.
 
-`--permission` and `--mode build|plan` change the thread's permission and plan mode. A permission change restarts a live provider session, so the CLI refuses it while a turn runs. `send` with new settings also waits for an idle thread, because a message sent mid-turn can join the running turn and keep its old settings. T3 keeps a started conversation on its provider, so `--provider` only switches between instances of the same driver that share resume state; hand the work over to a new thread to use another provider. Every turn the CLI sends carries the thread's model selection, because that is how T3 applies a change to a live session.
+`--permission` and `--mode build|plan` change the thread's permission and plan mode. For `threads send` and `threads set`, `--permission` also accepts `auto`, alongside `approval-required`, `auto-accept-edits`, and `full-access`. `handover` and `threads create` do not accept `auto`.
+
+A permission change restarts a live provider session, so the CLI refuses it while a turn runs. `send` with new settings also requires an idle thread, because a message sent mid-turn can join the running turn and keep its old settings. T3 keeps a started conversation on its provider, so `--provider` only switches between instances of the same driver that share resume state; hand the work over to a new thread to use another provider. Every turn the CLI sends carries the thread's model selection, because that is how T3 applies a change to a live session.
 
 ### Interrupt, approve, and answer
 
@@ -233,9 +263,38 @@ t3code threads unsettle --thread <thread-id>
 
 `settle` refuses a thread with a running/starting session or a pending approval or user-input request. `unsettle` marks the thread manually active but does not send a message or start its provider session. Both commands require the server to advertise the `threadSettlement` capability and wait for the requested lifecycle state to appear in T3's projection before succeeding.
 
+## Global options
+
+These options apply to every command:
+
+| Option | Effect |
+| --- | --- |
+| `--json` | Emit JSON success and error envelopes instead of human-readable output. |
+| `--config <path>` | Use this config file instead of `T3CODE_CLI_CONFIG` or the default location. |
+| `--t3-home <path>` | Override `T3CODE_HOME` and the `t3Home` setting for this command. |
+| `--origin <url>` | Override `T3CODE_CLI_ORIGIN` and the `origin` setting for this command. |
+| `-V`, `--version` | Print the package version. |
+| `-h`, `--help` | Show help for the command. |
+
+An explicit origin is tried first during discovery. If it does not expose a T3 environment, discovery continues with local runtime files under the T3 home, checking `userdata` before `dev`.
+
 ## Settings
 
+`config path` prints the selected config file's path. `config show` prints that path, whether the file exists, and the effective settings after defaults, environment variables, and global options have been applied. A missing config file uses defaults and environment overrides.
+
+The config file location is selected in this order:
+
+1. `--config <path>`.
+2. `T3CODE_CLI_CONFIG`.
+3. `%APPDATA%/t3code-cli/config.json` on Windows when `APPDATA` is set.
+4. `$XDG_CONFIG_HOME/t3code-cli/config.json` when `XDG_CONFIG_HOME` is set, otherwise `~/.config/t3code-cli/config.json`.
+
+Command flags take precedence over environment overrides, which take precedence over values in the config file, then built-in defaults. `T3CODE_HOME` overrides `t3Home`, and `T3CODE_CLI_ORIGIN` overrides `origin`. Other environment overrides use the `T3CODE_CLI_` prefix, such as `T3CODE_CLI_PROJECT_POLICY` and `T3CODE_CLI_WORKSPACE_MODE`.
+
+`config set <key> <value>` writes every effective setting to the selected file, not only the one you change. Values that come from environment variables, `--t3-home`, or `--origin` at that moment are saved too.
+
 ```bash
+t3code config path
 t3code config show
 t3code config set projectPolicy existing
 t3code config set workspaceMode folder
@@ -259,19 +318,30 @@ t3code config set thinkingEffort xhigh
 | `model` | Provider model slug | T3 project selection |
 | `speedMode` | `standard`, `fast` | T3 project selection |
 | `thinkingEffort` | Model-supported effort value | T3 project selection |
+| `sessionTtl` | T3 auth session duration | `2m` |
+| `t3Home` | Path to the T3 home directory | `~/.t3` |
+| `origin` | T3 server URL | Discovered from local runtime files |
 
 `projectPolicy: "existing"` makes a missing project a hard error. `workspaceMode: "folder"` uses the exact current folder instead of walking up to the Git root. `threadEnvMode: "t3"` follows T3's project → `t3.json` → global local/worktree preference. Explicit CLI config values remain overrides.
 
-T3 0.0.28 and later expose an atomic thread bootstrap contract for new worktrees. `--checkout worktree` uses it to create the thread, prepare the worktree from the current branch, run the matching setup script, and start the prompt. T3 only runs that bootstrap for WebSocket RPC clients: its HTTP dispatch route ignores it and rejects the turn because the thread does not exist yet. The CLI therefore sends this one command over T3's `/ws` endpoint, authenticated with a short-lived WebSocket ticket. Like T3's own UI, it asks for a temporary `t3code/<hex>` branch, which T3 renames once the thread has a title. Worktree creation honors the current installation's explicit `newWorktreesStartFromOrigin` value; when that value is absent, it uses the installed version's default (`false` on 0.0.28, `true` on 0.0.29 and later). A repository without a current branch returns `WORKTREE_REQUIRES_BRANCH` instead of silently falling back to the current checkout.
+Waiting commands replace `sessionTtl` with their own session length, described under [Existing threads](#existing-threads).
 
 ## Commands
 
 ```text
 t3code --json doctor
-t3code config path|show|set
+t3code config path
+t3code config show
+t3code config set <key> <value>
+
 t3code projects list
 t3code projects resolve --cwd .
 t3code projects ensure --cwd . --project-policy create
+
+t3code models list
+
+t3code handover --stdin
+t3code threads create --stdin
 t3code threads list --status active --cwd .
 t3code threads inspect --thread <thread-id>
 t3code threads read --thread <thread-id> --detail answers --turns 3
@@ -279,19 +349,31 @@ t3code threads send --thread <thread-id> --stdin --wait
 t3code threads wait --thread <thread-id>
 t3code threads set --thread <thread-id> --thinking-effort high --speed fast
 t3code threads interrupt --thread <thread-id>
-t3code threads approve|decline --thread <thread-id>
+t3code threads approve --thread <thread-id>
+t3code threads decline --thread <thread-id>
 t3code threads answer --thread <thread-id> --answer <answer>
-t3code models list
 t3code threads settle --thread <thread-id>
 t3code threads unsettle --thread <thread-id>
-t3code threads create --stdin
-t3code handover --stdin
+
 t3code request get api/orchestration/shell
+t3code help [command]
 ```
 
-Every command supports human-readable output. `--json` produces `{ "ok": true, "data": ... }` on success and a stable error envelope on failure. When a failure wraps an upstream CLI error, such as T3's reason for rejecting a worktree bootstrap, `error.cause` carries that error's code, message, and details.
+Every command supports human-readable output. `--json` writes `{ "ok": true, "data": ... }` to stdout on success and a stable error envelope to stderr on failure. When a failure wraps an upstream CLI error, such as T3's reason for rejecting a worktree bootstrap, `error.cause` carries that error's code, message, and details.
 
-Thread targeting uses exit code `3` for a missing target, `4` for a lifecycle/confirmation refusal, `5` when dispatch returned but turn acceptance could not be verified, and `6` when a wait timed out.
+The CLI uses these exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | General failure, including configuration, discovery, or API errors. |
+| `2` | Usage or validation error, such as `INVALID_USAGE`. |
+| `3` | Missing target, such as a thread, pending request, project filter, or provider requested by `models list`. |
+| `4` | Operation refused because of lifecycle state, confirmation, provider restrictions, or a rejected command or response. |
+| `5` | A command was dispatched, but its turn, settings, lifecycle change, or provider response could not be verified. |
+| `6` | A thread wait timed out. |
+
+Any command can fail with `1` or `2`, and usage errors use the same JSON error envelope. Check `error.code` for the specific failure.
 
 The leading slash of a `request get` path is optional. Git Bash rewrites arguments that start with a slash into Windows paths (`/api/...` becomes `C:/Program Files/Git/api/...`), so write `api/...` there or set `MSYS_NO_PATHCONV=1`.
 
@@ -347,7 +429,7 @@ Publishing uses npm trusted publishing from [publish.yml](.github/workflows/publ
 
 The workflow uses short-lived OIDC credentials, so it does not need an `NPM_TOKEN` repository secret. It also publishes npm provenance automatically.
 
-To release a new version:
+Choose `patch` or `minor` to match the change. For a patch release:
 
 ```bash
 npm version patch
