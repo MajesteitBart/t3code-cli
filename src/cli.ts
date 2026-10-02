@@ -302,5 +302,8 @@ program
   );
 
 await program.parseAsync(process.argv);
-// Let pending stdout/stderr writes drain, especially when large JSON is piped.
-// HTTP requests own and close their sockets rather than relying on forced exit.
+// Exit only after pending stdout/stderr writes drain, so large piped JSON is complete.
+// Exiting still stops lingering handles, such as a WebSocket awaiting its close handshake.
+const flush = (stream: NodeJS.WriteStream) => new Promise<void>((resolve) => stream.write("", () => resolve()));
+await Promise.all([flush(process.stdout), flush(process.stderr)]);
+process.exit(process.exitCode ?? 0);
