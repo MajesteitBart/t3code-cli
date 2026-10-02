@@ -18,6 +18,7 @@ import {
 import { renderCatalog } from "./catalog.js";
 import { doctor } from "./doctor.js";
 import { CliError } from "./errors.js";
+import { normalizeProviderOptions } from "./modelSelection.js";
 import { writeError, writeSuccess } from "./output.js";
 import { READ_DETAILS, renderPendingRequests, renderTranscript, type ReadDetail } from "./transcript.js";
 import {
@@ -269,7 +270,8 @@ function settingsChange(options: SettingsCommandOptions): ThreadSettingsChange {
 
 function describeSelection(selection: ModelSelection | null | undefined): string {
   if (!selection) return "unknown";
-  const options = (selection.options ?? []).map((option) => `${option.id}=${String(option.value)}`).join(", ");
+  // Older projections store options as an object map.
+  const options = normalizeProviderOptions(selection.options).map((option) => `${option.id}=${String(option.value)}`).join(", ");
   return `${selection.instanceId}/${selection.model}${options ? ` (${options})` : ""}`;
 }
 
