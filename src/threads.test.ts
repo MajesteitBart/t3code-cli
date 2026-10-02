@@ -69,6 +69,7 @@ async function testHarness(
     respond?: boolean;
     catalog?: unknown;
     interruptFails?: boolean;
+    queueAfterInterrupt?: boolean;
     omitShell?: boolean;
   } = {},
 ) {
@@ -213,6 +214,11 @@ async function testHarness(
           target!.session = { ...target!.session, status: options.interruptFails ? "stopped" : "ready", activeTurnId: null };
         }
         if (options.interruptFails) activity("provider.turn.interrupt.failed", { detail: "Provider did not respond." });
+        if (options.queueAfterInterrupt) {
+          // A queued message starts its own turn as soon as the interrupted one stops.
+          target!.latestTurn = { turnId: "turn-queued", state: "running", requestedAt: now, startedAt: now, completedAt: null, assistantMessageId: null };
+          target!.session = { ...target!.session!, status: "running", activeTurnId: "turn-queued" };
+        }
       }
       if (command.type === "thread.approval.respond") {
         activity("approval.resolved", { requestId: command.requestId, decision: command.decision });
@@ -767,6 +773,30 @@ describe("thread controls", () => {
     expect(harness.commands).toEqual([expect.objectContaining({ type: "thread.turn.interrupt", turnId: "turn-1" })]);
     expect(result).toMatchObject({ turnId: "turn-1", latestTurn: { state: "interrupted" }, sessionStatus: "ready" });
     await expect(interruptThread(harness.config, "idle")).rejects.toMatchObject({ code: "THREAD_NOT_RUNNING", exitCode: 4 });
+  });
+
+  it("verifies the interrupted turn even when a queued turn starts next", async () => {
+    const harness = await testHarness([makeThread("target", running())], { queueAfterInterrupt: true });
+
+    const result = await interruptThread(harness.config, "target");
+
+    expect(result).toMatchObject({ turnId: "turn-1", latestTurn: { turnId: "turn-queued", state: "running" } });
+  });
+
+  it("reports a response that T3 accepted when the wait after it times out", async () => {
+    const question = {
+      id: "question-activity",
+      kind: "user-input.requested",
+      turnId: "turn-1",
+      createdAt: at(1),
+      payload: { requestId: "q-1", questions: [{ id: "q1", question: "Which branch?", options: [{ label: "main" }] }] },
+    };
+    const harness = await testHarness([makeThread("target", { ...running(), activities: [question] })]);
+
+    await expect(
+      answerThread(harness.config, { threadId: "target", answers: ["main"], wait: { timeoutMs: 50 } }),
+    ).rejects.toMatchObject({ code: "THREAD_WAIT_TIMEOUT", details: { responded: true, requestId: "q-1" } });
+    expect(harness.commands).toEqual([expect.objectContaining({ type: "thread.user-input.respond", requestId: "q-1" })]);
   });
 
   it("reports a provider interrupt failure after T3 stopped the session", async () => {

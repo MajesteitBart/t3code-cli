@@ -151,7 +151,7 @@ t3code threads answer --thread <id> --answer "<the user's answer>" --wait --time
 - `decline --cancel` also stops the turn on Codex.
 - For several questions, number the answers: `--answer 1=main --answer 2=lint`. An answer that matches an option label sends that option.
 - `answer --dismiss` closes a question that outlived its turn without answering it.
-- With `--wait`, read `data.wait.outcome` as for `send --wait`.
+- With `--wait`, read `data.wait.outcome` as for `send --wait`. A `THREAD_WAIT_TIMEOUT` with `error.details.responded: true` means the response went through; never send it again.
 
 ### Settle or reopen
 

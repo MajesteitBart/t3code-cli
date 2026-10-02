@@ -238,10 +238,12 @@ async function applyThreadSettings(
     thread.id,
     (candidate) => {
       const session = candidate.session;
-      if (liveSession(candidate) && session?.runtimeMode === requested) return "restarted" as const;
       // A failed restart leaves a stopped or errored session with a new error.
       const newError = session?.lastError != null && session.lastError !== errorBefore;
-      return newError && (session?.status === "stopped" || session?.status === "error") ? ("failed" as const) : null;
+      if (newError && (session?.status === "stopped" || session?.status === "error")) return "failed" as const;
+      // Only a usable session has restarted; an errored or still-starting one has not.
+      const usable = session?.status === "ready" || session?.status === "idle" || session?.status === "running";
+      return usable && session?.runtimeMode === requested ? ("restarted" as const) : null;
     },
     adapter.controlTimeoutMs,
   );
@@ -367,9 +369,15 @@ export async function interruptThread(config: CliConfig, rawThreadId: string) {
     // When the provider fails to interrupt, T3 stops the session, so keep waiting for the turn to end.
     const failureOf = (candidate: T3Thread) =>
       newActivity(candidate, before, (kind) => kind === "provider.turn.interrupt.failed");
+    // Check the interrupted turn itself: a queued turn may start as soon as it stops.
+    const stopped = (candidate: T3Thread) =>
+      turnId
+        ? !(candidate.latestTurn?.turnId === turnId && candidate.latestTurn.state === "running") &&
+          candidate.session?.activeTurnId !== turnId
+        : !turnRunning(candidate);
     const settled = await adapter.poll(
       threadId,
-      (candidate) => (turnRunning(candidate) ? null : { thread: candidate, failure: failureOf(candidate) }),
+      (candidate) => (stopped(candidate) ? { thread: candidate, failure: failureOf(candidate) } : null),
       adapter.controlTimeoutMs,
     );
     if (!settled.value) {
@@ -471,14 +479,22 @@ async function awaitResolution(
 async function waitAfterResponse(
   adapter: T3ThreadApi,
   threadId: string,
+  requestId: string,
   wait: ThreadWaitOptions | undefined,
   messageId?: string,
 ): Promise<Partial<ThreadWaitView>> {
   if (!wait) return {};
-  const waited = await adapter.waitForTurn(threadId, {
-    timeoutMs: wait.timeoutMs,
-    ...(messageId === undefined ? {} : { messageId }),
-  });
+  const waited = await adapter
+    .waitForTurn(threadId, { timeoutMs: wait.timeoutMs, ...(messageId === undefined ? {} : { messageId }) })
+    .catch((cause: unknown) => {
+      if (!(cause instanceof CliError) || cause.code !== "THREAD_WAIT_TIMEOUT") throw cause;
+      // T3 already accepted the response; a caller must not send it again.
+      throw new CliError(
+        "THREAD_WAIT_TIMEOUT",
+        `T3 accepted the response to request ${requestId}, but thread ${threadId} did not finish within ${Math.round(wait.timeoutMs / 1000)} seconds. Do not respond again; run threads wait to keep waiting.`,
+        { exitCode: cause.exitCode, details: { ...(cause.details as object), responded: true, requestId } },
+      );
+    });
   return waitView(waited, wait);
 }
 
@@ -525,7 +541,7 @@ export async function respondToApproval(
       command,
       dispatch,
       verification: { resolved: true, activityId: resolution.id ?? null },
-      ...(await waitAfterResponse(adapter, threadId, options.wait)),
+      ...(await waitAfterResponse(adapter, threadId, requestId, options.wait)),
     };
   });
 }
@@ -650,7 +666,7 @@ export async function answerThread(
       command,
       dispatch,
       verification: { resolved: true, activityId: resolution.id ?? null },
-      ...(await waitAfterResponse(adapter, threadId, options.dismiss ? undefined : options.wait, answerMessageId)),
+      ...(await waitAfterResponse(adapter, threadId, requestId, options.dismiss ? undefined : options.wait, answerMessageId)),
     };
   });
 }

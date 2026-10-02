@@ -218,7 +218,7 @@ t3code threads answer --thread <thread-id> --dismiss
 - `decline` denies the request and lets the agent continue. With `--cancel`, Codex also stops the turn.
 - `answer` matches each answer to the question's options by label or value, and otherwise sends it as free text when the question allows that. Prefix answers with the question number when a request asks several. Codex can ask questions that outlive their turn: answering one starts a new turn, which `--wait` follows, and `--dismiss` closes it without an answer.
 
-Each command waits until T3 shows the provider's response. With `--wait`, it then waits for the turn to finish or stop again, like `send --wait`.
+Each command waits until T3 shows the provider's response. With `--wait`, it then waits for the turn to finish or stop again, like `send --wait`. If that wait times out, the error carries `responded: true`: the response already went through, so do not send it again.
 
 ### Settle or reopen
 

@@ -298,6 +298,21 @@ describe("changeSettingsWithApi", () => {
     });
   });
 
+  it("does not count an errored session with the new mode as restarted", async () => {
+    const before = thread({ session: liveSession });
+    const errored = thread({
+      runtimeMode: "approval-required",
+      session: { ...liveSession, status: "error", runtimeMode: "approval-required", lastError: "Provider crashed" },
+    });
+    const api = scriptedApi([errored], []);
+    const adapter = new T3ThreadApi(api, { verificationIntervalMs: 0, controlTimeoutMs: 60_000 });
+
+    await expect(changeSettingsWithApi(api, adapter, before, { runtimeMode: "approval-required" })).rejects.toMatchObject({
+      code: "THREAD_PERMISSION_NOT_APPLIED",
+      details: { sessionStatus: "error", lastError: "Provider crashed" },
+    });
+  });
+
   it("waits through a stopped session to the restarted one", async () => {
     const before = thread({ session: liveSession });
     const stopping = thread({ runtimeMode: "approval-required", session: { ...liveSession, status: "stopped" } });
