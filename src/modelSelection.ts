@@ -46,10 +46,16 @@ export interface ModelOverrides {
 }
 
 /** Applies explicit overrides to a saved model selection; `owner` names the selection in errors. */
+/** The option ids T3 drivers use for reasoning effort. Handovers write the first three. */
+const HANDOVER_EFFORT_OPTION_IDS = ["reasoningEffort", "effort", "reasoning"] as const;
+/** An existing thread may run OpenCode, which calls its effort option `variant`. */
+export const THREAD_EFFORT_OPTION_IDS = [...HANDOVER_EFFORT_OPTION_IDS, "variant"] as const;
+
 export function applyModelOverrides(
   base: ModelSelection,
   overrides: ModelOverrides,
   owner: "project default" | "thread",
+  effortOptionIds: readonly string[] = HANDOVER_EFFORT_OPTION_IDS,
 ): ModelSelection {
   const provider = nonEmptyOption(overrides.provider, "provider");
   const requestedModel = nonEmptyOption(overrides.model, "model");
@@ -72,9 +78,7 @@ export function applyModelOverrides(
   }
   if (thinkingEffort !== undefined) {
     // T3 provider drivers use different descriptor ids for the same user-facing control.
-    setProviderOption(selections, "reasoningEffort", thinkingEffort);
-    setProviderOption(selections, "effort", thinkingEffort);
-    setProviderOption(selections, "reasoning", thinkingEffort);
+    for (const id of effortOptionIds) setProviderOption(selections, id, thinkingEffort);
   }
   for (const option of overrides.options ?? []) setProviderOption(selections, option.id, option.value);
 

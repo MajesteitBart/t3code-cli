@@ -10,7 +10,7 @@ import {
   type ProviderCatalog,
 } from "./catalog.js";
 import { CliError } from "./errors.js";
-import { applyModelOverrides } from "./modelSelection.js";
+import { applyModelOverrides, THREAD_EFFORT_OPTION_IDS } from "./modelSelection.js";
 import { discoverRuntime } from "./runtime.js";
 import { T3ThreadApi } from "./threadApi.js";
 import {
@@ -123,12 +123,16 @@ export function planThreadSettings(
         details: { threadId: thread.id },
       });
     }
-    const next = catalog ? resolveModelChange(current, change, catalog) : applyModelOverrides(current, change, "thread");
+    const next = catalog
+      ? resolveModelChange(current, change, catalog)
+      : applyModelOverrides(current, change, "thread", THREAD_EFFORT_OPTION_IDS);
     if (next.instanceId !== current.instanceId && thread.session != null) {
       // T3 rejects moving a started conversation to another driver or to incompatible resume state.
       const from = catalog ? findProvider(catalog, current.instanceId) : null;
       const to = catalog ? findProvider(catalog, next.instanceId) : null;
-      const compatible = from && to && from.driver === to.driver && from.continuationKey === to.continuationKey;
+      // Without a continuation key, nothing shows the two instances can resume each other's conversation.
+      const compatible =
+        from && to && from.driver === to.driver && from.continuationKey !== null && from.continuationKey === to.continuationKey;
       if (!compatible) {
         throw new CliError(
           "PROVIDER_SWITCH_UNSUPPORTED",

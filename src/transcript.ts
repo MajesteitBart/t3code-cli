@@ -211,9 +211,10 @@ function groupTurns(thread: T3Thread, checkpoints: Map<string, Checkpoint>): Tur
     if (!next || running.endedAt === null) return running;
     const queuedTurn =
       Date.parse(next.startedAt) - Date.parse(running.endedAt) <= QUEUED_TURN_GRACE_MS &&
+      // Another message sent while the turn ran was queued too; only a prompt sent after it ended starts the next turn.
       !sorted.some(
         (other) =>
-          other !== message && other.role === "user" && other.createdAt > message.createdAt && other.createdAt <= next.startedAt,
+          other.role === "user" && other.createdAt > running.endedAt! && other.createdAt <= next.startedAt,
       );
     return queuedTurn ? next : running;
   };
@@ -432,14 +433,15 @@ export function pendingRequests(thread: T3Thread): PendingRequest[] {
     const turnId = typeof activity.turnId === "string" ? activity.turnId : null;
     const responseMode = kind === "user-input" && payload.responseMode === "message" ? "message" : null;
     const inRunningTurn = runningTurn !== null && turnId === runningTurn;
-    if (kind === "approval" && !inRunningTurn && flag !== true) return [];
+    // T3 closes ordinary questions when their turn ends; message-mode questions stay open.
+    if (responseMode === null && !inRunningTurn && flag !== true) return [];
     return [{
       kind,
       requestId,
       turnId,
       responseMode,
       blocking: responseMode === null && inRunningTurn,
-      detail: text(payload.detail),
+      detail: text(payload.detail) ?? text(payload.requestKind) ?? text(activity.summary),
       requestKind: text(payload.requestKind),
       decisions: list(payload.options).flatMap((option) => {
         const decision = record(option)?.decision;

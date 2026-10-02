@@ -225,6 +225,26 @@ describe("buildTranscript", () => {
     expect(transcript.messages.find((entry) => entry.id === "folded")?.turnIndex).toBe(1);
   });
 
+  it("gives every message queued during a turn to the turn that starts right after it", () => {
+    const second = (value: number) => `2026-09-04T10:04:${String(value).padStart(2, "0")}.000Z`;
+    const at4 = (base: T3Message, value: number) => ({ ...base, createdAt: second(value), updatedAt: second(value) });
+    const source = thread({
+      latestTurn: { turnId: "turn-2", state: "running", requestedAt: second(11), startedAt: second(11), completedAt: null, assistantMessageId: null },
+      checkpoints: [{ turnId: "turn-1", completedAt: second(10) }],
+      messages: [
+        at4(message("prompt-1", "user", null, 0), 0),
+        at4(message("progress-1", "assistant", "turn-1", 0), 1),
+        at4(message("queued-a", "user", null, 0), 2),
+        at4(message("queued-b", "user", null, 0), 3),
+        at4(message("answer-1", "assistant", "turn-1", 0), 9),
+        at4(message("progress-2", "assistant", "turn-2", 0), 12),
+      ],
+    });
+
+    const owners = Object.fromEntries(buildTranscript(source).messages.map((entry) => [entry.id, entry.turnIndex]));
+    expect(owners).toMatchObject({ "queued-a": 2, "queued-b": 2, "answer-1": 1 });
+  });
+
   it("gives a queued message to the turn that starts right after its turn ends", () => {
     const second = (value: number) => `2026-09-04T10:04:${String(value).padStart(2, "0")}.000Z`;
     const queuedThread = (extra: T3Message[]) =>
@@ -365,6 +385,19 @@ describe("pendingRequests", () => {
     ]);
     // The shell snapshot's flags, when present, close a kind of request entirely.
     expect(pendingRequests(thread({ activities, latestTurn: running, hasPendingApprovals: false, hasPendingUserInput: false }))).toEqual([]);
+  });
+
+  it("drops ordinary questions whose turn ended and keeps the request kind as detail", () => {
+    const completed = { turnId: "turn-1", state: "completed" as const, requestedAt: at(0), startedAt: at(0), completedAt: at(3), assistantMessageId: null };
+    const activities = [
+      { kind: "user-input.requested", turnId: "turn-1", createdAt: at(1), payload: { requestId: "ordinary", questions: [{ id: "q", question: "Which?" }] } },
+      { kind: "user-input.requested", turnId: "turn-1", createdAt: at(2), payload: { requestId: "async", responseMode: "message", questions: [{ id: "0", question: "Later?" }] } },
+    ];
+    expect(pendingRequests(thread({ activities, latestTurn: completed })).map((request) => request.requestId)).toEqual(["async"]);
+
+    const running = { ...completed, state: "running" as const, completedAt: null };
+    const approval = { kind: "approval.requested", turnId: "turn-1", createdAt: at(1), summary: "Command approval requested", payload: { requestId: "a", requestKind: "command" } };
+    expect(pendingRequests(thread({ activities: [approval], latestTurn: running }))[0]?.detail).toBe("command");
   });
 
   it("derives pending requests from a running turn when T3 omits its flags", () => {

@@ -123,7 +123,7 @@ describe("planThreadSettings", () => {
     ).toThrow(expect.objectContaining({ code: "PLAN_MODE_UNSUPPORTED", message: expect.stringContaining("--option agent=plan") }));
   });
 
-  it("falls back to every effort alias without a catalog", () => {
+  it("falls back to every effort alias, including OpenCode's variant, without a catalog", () => {
     const plan = planThreadSettings(thread(), { thinkingEffort: "max" }, null);
 
     expect(plan.catalogUsed).toBe(false);
@@ -131,7 +131,22 @@ describe("planThreadSettings", () => {
       { id: "effort", value: "max" },
       { id: "reasoningEffort", value: "max" },
       { id: "reasoning", value: "max" },
+      { id: "variant", value: "max" },
     ]);
+  });
+
+  it("refuses a provider switch when neither instance names its resume state", () => {
+    const keyless = parseCatalog({
+      providers: [
+        { instanceId: "acp-one", driver: "acp", models: [{ slug: "m", capabilities: { optionDescriptors: [] } }] },
+        { instanceId: "acp-two", driver: "acp", models: [{ slug: "m", capabilities: { optionDescriptors: [] } }] },
+      ],
+    });
+    const started = thread({ modelSelection: { instanceId: "acp-one", model: "m" }, session: { ...runningSession, status: "ready" } });
+
+    expect(() => planThreadSettings(started, { provider: "acp-two", model: "m" }, keyless)).toThrow(
+      expect.objectContaining({ code: "PROVIDER_SWITCH_UNSUPPORTED" }),
+    );
   });
 });
 
