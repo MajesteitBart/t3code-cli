@@ -413,6 +413,20 @@ export function renderPendingRequests(requests: readonly PendingRequest[]): stri
     .join("\n");
 }
 
+/** User messages that wait for a turn, leaving out those the provider already refused to start. */
+export function queuedMessages(thread: T3Thread): T3Message[] {
+  const failed = new Set(
+    (list(thread.activities) as Activity[]).flatMap((activity) => {
+      const requestId = record(activity.payload)?.requestId;
+      return activity.kind === "provider.turn.start.failed" && typeof requestId === "string" ? [requestId] : [];
+    }),
+  );
+  return groupTurns(thread, checkpointsByTurn(thread))
+    .filter((turn) => turn.turnId === null)
+    .flatMap((turn) => turn.messages)
+    .filter((message) => message.role === "user" && !failed.has(message.id));
+}
+
 export function buildTranscript(thread: T3Thread, options: TranscriptOptions = {}): Transcript {
   const detail = options.detail ?? "messages";
   const maxChars = options.maxChars;

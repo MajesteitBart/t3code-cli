@@ -392,6 +392,26 @@ describe("T3ThreadApi.waitForTurn", () => {
     expect(paths.at(-1)).toBe("/api/orchestration/threads/thread-1");
   });
 
+  it("keeps an interrupted turn interrupted after a later turn becomes the latest", async () => {
+    const interrupted = { ...turn("turn-1", "completed", 0, 2), state: "interrupted" as const };
+    const laterTurn = [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)];
+    const { adapter } = scripted([
+      thread({ latestTurn: interrupted, session: session("ready"), messages: firstTurn }),
+      // A queued turn starts before the wait confirms; T3 now reports only turn 2's state.
+      thread({
+        latestTurn: turn("turn-2", "running", 10, null),
+        session: session("running"),
+        checkpoints: [{ turnId: "turn-1", completedAt: at(2) }],
+        messages: laterTurn,
+      }),
+    ]);
+
+    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
+      outcome: "interrupted",
+      turnIndex: 1,
+    });
+  });
+
   it("returns a message's own turn while a later turn runs", async () => {
     // Turn 1 answered prompt-1 and completed; turn 2 runs for a later prompt.
     const { adapter } = scripted([
