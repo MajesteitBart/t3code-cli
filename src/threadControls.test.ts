@@ -102,8 +102,15 @@ describe("planThreadSettings", () => {
     );
     expect(sameDriver.modelSelection?.instanceId).toBe("claudeAgent_two");
 
-    // A thread without a session has not started a conversation yet.
+    // A thread without a session or history has not started a conversation yet.
     expect(planThreadSettings(thread(), { provider: "codex", model: "gpt-6-astra" }, catalog).modelSelection?.instanceId).toBe("codex");
+    // History without a live session still binds the conversation to its provider.
+    const withHistory = thread({
+      latestTurn: { turnId: "turn-1", state: "completed", requestedAt: "2026-10-02T10:00:00.000Z", startedAt: "2026-10-02T10:00:00.000Z", completedAt: "2026-10-02T10:01:00.000Z", assistantMessageId: null },
+    });
+    expect(() => planThreadSettings(withHistory, { provider: "codex", model: "gpt-6-astra" }, catalog)).toThrow(
+      expect.objectContaining({ code: "PROVIDER_SWITCH_UNSUPPORTED" }),
+    );
   });
 
   it("refuses a permission change that would restart a running turn", () => {
@@ -115,6 +122,14 @@ describe("planThreadSettings", () => {
     // A session that is restarting after an earlier permission change runs no turn.
     const restarting = { ...runningSession, status: "starting" as const, activeTurnId: null };
     expect(planThreadSettings(thread({ session: restarting }), { runtimeMode: "auto" }, catalog).runtimeMode).toBe("auto");
+  });
+
+  it("checks that a new provider supports the plan mode the thread keeps", () => {
+    const planning = thread({ interactionMode: "plan" });
+
+    expect(() => planThreadSettings(planning, { provider: "opencode", model: "openrouter/aion-3.5" }, catalog)).toThrow(
+      expect.objectContaining({ code: "PLAN_MODE_UNSUPPORTED" }),
+    );
   });
 
   it("points OpenCode threads at its plan agent", () => {
@@ -266,6 +281,46 @@ describe("changeSettingsWithApi", () => {
       exitCode: 5,
       details: { sessionRuntimeMode: "full-access", lastError: "restart failed" },
     });
+  });
+
+  it("fails at once when the restart stops the session with a new error", async () => {
+    const before = thread({ session: liveSession });
+    const failed = thread({
+      runtimeMode: "approval-required",
+      session: { ...liveSession, status: "stopped", lastError: "Provider failed to restart" },
+    });
+    const api = scriptedApi([failed], []);
+    const adapter = new T3ThreadApi(api, { verificationIntervalMs: 0, controlTimeoutMs: 60_000 });
+
+    await expect(changeSettingsWithApi(api, adapter, before, { runtimeMode: "approval-required" })).rejects.toMatchObject({
+      code: "THREAD_PERMISSION_NOT_APPLIED",
+      details: { sessionStatus: "stopped", lastError: "Provider failed to restart" },
+    });
+  });
+
+  it("waits through a stopped session to the restarted one", async () => {
+    const before = thread({ session: liveSession });
+    const stopping = thread({ runtimeMode: "approval-required", session: { ...liveSession, status: "stopped" } });
+    const restarted = thread({ runtimeMode: "approval-required", session: { ...liveSession, runtimeMode: "approval-required" } });
+    const api = scriptedApi([stopping, stopping, restarted], []);
+
+    const result = await changeSettingsWithApi(api, new T3ThreadApi(api, { verificationIntervalMs: 0 }), before, {
+      runtimeMode: "approval-required",
+    });
+
+    expect(result.sessionRestarted).toBe(true);
+  });
+
+  it("accepts a session that stays stopped without an error", async () => {
+    const before = thread({ session: liveSession });
+    const stopped = thread({ runtimeMode: "approval-required", session: { ...liveSession, status: "stopped" } });
+    const api = scriptedApi([stopped], []);
+    const adapter = new T3ThreadApi(api, { verificationIntervalMs: 0, controlTimeoutMs: 20 });
+
+    const result = await changeSettingsWithApi(api, adapter, before, { runtimeMode: "approval-required" });
+
+    // The next session starts with the saved mode, but nothing restarted now.
+    expect(result.sessionRestarted).toBe(false);
   });
 
   it("reapplies a permission mode the live session never took", () => {

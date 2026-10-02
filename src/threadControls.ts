@@ -65,6 +65,11 @@ function liveSession(thread: T3Thread): boolean {
   return thread.session != null && thread.session.status !== "stopped";
 }
 
+/** T3 binds a conversation to its provider once the thread has a session or any history. */
+function conversationStarted(thread: T3Thread): boolean {
+  return thread.session != null || thread.latestTurn != null || (thread.messages?.length ?? 0) > 0;
+}
+
 function turnRunning(thread: T3Thread): boolean {
   return (
     thread.latestTurn?.state === "running" || thread.session?.status === "running" || thread.session?.activeTurnId != null
@@ -126,7 +131,7 @@ export function planThreadSettings(
     const next = catalog
       ? resolveModelChange(current, change, catalog)
       : applyModelOverrides(current, change, "thread", THREAD_EFFORT_OPTION_IDS);
-    if (next.instanceId !== current.instanceId && thread.session != null) {
+    if (next.instanceId !== current.instanceId && conversationStarted(thread)) {
       // T3 rejects moving a started conversation to another driver or to incompatible resume state.
       const from = catalog ? findProvider(catalog, current.instanceId) : null;
       const to = catalog ? findProvider(catalog, next.instanceId) : null;
@@ -161,7 +166,10 @@ export function planThreadSettings(
       { exitCode: 4, details: { threadId: thread.id, sessionStatus: thread.session?.status ?? null } },
     );
   }
-  if (interactionMode === "plan" && catalog) {
+  // A thread already in plan mode keeps it, so a new provider must support it too.
+  const keepsPlanMode =
+    thread.interactionMode === "plan" && modelSelection !== null && modelSelection.instanceId !== current?.instanceId;
+  if ((interactionMode === "plan" || keepsPlanMode) && catalog) {
     const provider = findProvider(catalog, (modelSelection ?? current)?.instanceId ?? "");
     if (provider && !provider.supportsPlanMode) {
       throw new CliError(
@@ -225,29 +233,39 @@ async function applyThreadSettings(
   // T3 saves the mode at once but restarts the live session afterwards, and logs a failed restart only
   // on the server. The session's own mode shows whether the restart took effect.
   const requested = plan.runtimeMode;
+  const errorBefore = thread.session?.lastError ?? null;
   const restarted = await adapter.poll(
     thread.id,
-    (candidate) => (!liveSession(candidate) || candidate.session?.runtimeMode === requested ? candidate : null),
+    (candidate) => {
+      const session = candidate.session;
+      if (liveSession(candidate) && session?.runtimeMode === requested) return "restarted" as const;
+      // A failed restart leaves a stopped or errored session with a new error.
+      const newError = session?.lastError != null && session.lastError !== errorBefore;
+      return newError && (session?.status === "stopped" || session?.status === "error") ? ("failed" as const) : null;
+    },
     adapter.controlTimeoutMs,
   );
-  if (!restarted.value) {
-    const lastError = restarted.thread?.session?.lastError ?? null;
-    throw new CliError(
-      "THREAD_PERMISSION_NOT_APPLIED",
-      `T3 saved permission ${requested} for thread ${thread.id}, but its provider session still runs with ${restarted.thread?.session?.runtimeMode ?? "another mode"}.${lastError ? ` T3 reported: ${lastError}` : ""}`,
-      {
-        exitCode: 5,
-        details: {
-          threadId: thread.id,
-          runtimeMode: requested,
-          sessionRuntimeMode: restarted.thread?.session?.runtimeMode ?? null,
-          sessionStatus: restarted.thread?.session?.status ?? null,
-          lastError,
-        },
-      },
-    );
+  const after = restarted.thread;
+  if (restarted.value === "restarted" && after) return { dispatches, thread: after, sessionRestarted: true };
+  // A session that stopped without a new error starts with the saved mode next time.
+  if (restarted.value === null && after?.session?.status === "stopped" && (after.session.lastError ?? null) === errorBefore) {
+    return { dispatches, thread: after, sessionRestarted: false };
   }
-  return { dispatches, thread: restarted.value, sessionRestarted: liveSession(restarted.value) };
+  const lastError = after?.session?.lastError ?? null;
+  throw new CliError(
+    "THREAD_PERMISSION_NOT_APPLIED",
+    `T3 saved permission ${requested} for thread ${thread.id}, but its provider session did not restart with it.${lastError ? ` T3 reported: ${lastError}` : ""}`,
+    {
+      exitCode: 5,
+      details: {
+        threadId: thread.id,
+        runtimeMode: requested,
+        sessionRuntimeMode: after?.session?.runtimeMode ?? null,
+        sessionStatus: after?.session?.status ?? null,
+        lastError,
+      },
+    },
+  );
 }
 
 /** Plans and applies a settings change inside an open T3 session; used before a message is sent. */

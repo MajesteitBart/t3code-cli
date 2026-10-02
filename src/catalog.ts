@@ -1,5 +1,6 @@
 import type { T3Api } from "./api.js";
 import { CliError } from "./errors.js";
+import { applyModelOverrides, normalizeProviderOptions, THREAD_EFFORT_OPTION_IDS } from "./modelSelection.js";
 import type { ModelSelection, ProviderOptionSelection, SpeedMode } from "./types.js";
 
 export interface OptionDescriptor {
@@ -212,8 +213,18 @@ export function resolveModelChange(current: ModelSelection, change: ModelChange,
 
   const sameModel = instanceId === current.instanceId && model.slug === current.model;
   const descriptors = model.options;
-  const carried = (current.options ?? []).filter((option) => {
-    if (descriptors === null) return sameModel;
+  // Older projections store options as an object map.
+  const saved = normalizeProviderOptions(current.options);
+  if (descriptors === null) {
+    // T3 does not describe this model's options, so set them unchecked, the way handovers do.
+    return applyModelOverrides(
+      { instanceId, model: model.slug, ...(sameModel && saved.length > 0 ? { options: saved } : {}) },
+      { thinkingEffort: change.thinkingEffort, speedMode: change.speedMode, options: change.options },
+      "thread",
+      THREAD_EFFORT_OPTION_IDS,
+    );
+  }
+  const carried = saved.filter((option) => {
     const descriptor = descriptors.find((candidate) => candidate.id === option.id);
     return descriptor !== undefined && validValue(descriptor, option.value);
   });
@@ -261,7 +272,7 @@ export function resolveModelChange(current: ModelSelection, change: ModelChange,
 export function sameModelSelection(left: ModelSelection | null | undefined, right: ModelSelection | null | undefined): boolean {
   if (!left || !right) return left === right;
   const normalize = (selection: ModelSelection) =>
-    JSON.stringify([...(selection.options ?? [])].sort((a, b) => a.id.localeCompare(b.id)));
+    JSON.stringify(normalizeProviderOptions(selection.options).sort((a, b) => a.id.localeCompare(b.id)));
   return left.instanceId === right.instanceId && left.model === right.model && normalize(left) === normalize(right);
 }
 

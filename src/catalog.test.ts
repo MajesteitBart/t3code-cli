@@ -241,6 +241,41 @@ describe("resolveModelChange", () => {
   });
 });
 
+describe("resolveModelChange without descriptors", () => {
+  const undescribed = parseCatalog({
+    providers: [{ instanceId: "codex", driver: "codex", models: [{ slug: "gpt-old", capabilities: null }] }],
+  });
+
+  it("sets speed and effort unchecked when T3 does not describe the model's options", () => {
+    const next = resolveModelChange(
+      { instanceId: "codex", model: "gpt-old", options: [{ id: "fastMode", value: true }, { id: "serviceTier", value: "fast" }] },
+      { speedMode: "standard", thinkingEffort: "high" },
+      undescribed,
+    );
+
+    expect(next.options).toEqual(
+      expect.arrayContaining([
+        { id: "fastMode", value: false },
+        { id: "serviceTier", value: "default" },
+        { id: "reasoningEffort", value: "high" },
+        { id: "variant", value: "high" },
+      ]),
+    );
+  });
+
+  it("reads saved options stored as an object map", () => {
+    const legacy = { instanceId: "codex", model: "gpt-6.1-sol", options: { reasoningEffort: "low" } } as unknown as Parameters<
+      typeof resolveModelChange
+    >[0];
+
+    expect(resolveModelChange(legacy, { speedMode: "fast" }, catalog).options).toEqual([
+      { id: "reasoningEffort", value: "low" },
+      { id: "serviceTier", value: "priority" },
+    ]);
+    expect(sameModelSelection(legacy, { instanceId: "codex", model: "gpt-6.1-sol", options: [{ id: "reasoningEffort", value: "low" }] })).toBe(true);
+  });
+});
+
 describe("sameModelSelection", () => {
   it("ignores option order", () => {
     expect(
