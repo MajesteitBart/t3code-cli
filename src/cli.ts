@@ -2,9 +2,10 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { stdin as input } from "node:process";
+import { stdin as input, stderr as errorOutput } from "node:process";
+import { createInterface } from "node:readline/promises";
 
-import { Command, Option } from "commander";
+import { Command, CommanderError, InvalidArgumentError, Option } from "commander";
 
 import {
   CONFIG_KEYS,
@@ -17,13 +18,24 @@ import {
 import { doctor } from "./doctor.js";
 import { CliError } from "./errors.js";
 import { writeError, writeSuccess } from "./output.js";
+import { READ_DETAILS, renderPendingRequests, renderTranscript, type ReadDetail } from "./transcript.js";
 import {
   createHandoverThread,
   ensureProject,
+  inspectThread,
   listProjects,
+  listThreads,
   rawGet,
+  readThread,
   resolveProject,
+  sendThreadMessage,
+  settleThread,
   type ThreadCreateOptions,
+  type ThreadListStatus,
+  unsettleThread,
+  waitForThread,
+  type ThreadWaitOptions,
+  type ThreadWaitView,
 } from "./service.js";
 import type {
   CliConfig,
@@ -33,20 +45,24 @@ import type {
   RuntimeMode,
   SpeedMode,
   ThreadEnvMode,
+  T3Project,
+  T3Thread,
   WorkspaceMode,
 } from "./types.js";
 
 const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
 
 const program = new Command();
+const jsonRequested = process.argv.slice(2).includes("--json");
 program
   .name("t3code")
-  .description("Create T3 Code projects and handover threads from the current folder.")
+  .description("Manage T3 Code projects, handover threads, and cross-thread messages.")
   .version(packageJson.version)
   .option("--json", "Emit stable JSON envelopes.")
   .option("--config <path>", "Use a specific config file.")
   .option("--t3-home <path>", "Override T3CODE_HOME for this command.")
   .option("--origin <url>", "Override the running T3 server origin.");
+program.configureOutput({ outputError: () => undefined }).exitOverride();
 
 interface GlobalOptions {
   json?: boolean;
@@ -143,6 +159,71 @@ interface ThreadCommandOptions extends WorkspaceCommandOptions {
   thinkingEffort?: string;
 }
 
+interface PromptOptions {
+  prompt?: string;
+  promptFile?: string;
+  stdin?: boolean;
+}
+
+interface ThreadListCommandOptions extends WorkspaceCommandOptions {
+  project?: string;
+  status?: ThreadListStatus;
+}
+
+interface ThreadWaitCommandOptions {
+  thread: string;
+  timeout?: number;
+  detail?: ReadDetail;
+  maxChars?: number;
+}
+
+interface ThreadSendCommandOptions extends PromptOptions, ThreadWaitCommandOptions {
+  wakeSettled?: boolean;
+  wait?: boolean;
+}
+
+const DEFAULT_WAIT_TIMEOUT_SECONDS = 600;
+
+function waitOptions(options: ThreadWaitCommandOptions): ThreadWaitOptions {
+  return {
+    timeoutMs: (options.timeout ?? DEFAULT_WAIT_TIMEOUT_SECONDS) * 1000,
+    ...(options.detail ? { detail: options.detail } : {}),
+    ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
+  };
+}
+
+function renderWait(result: ThreadWaitView): string {
+  const { wait } = result;
+  const seconds = Math.round(wait.waitedMs / 1000);
+  const headline =
+    wait.error !== undefined
+      ? `T3 could not start the turn: ${wait.error}`
+      : wait.outcome === "needs-attention"
+        ? `The thread is waiting for a person (waited ${seconds}s):\n${renderPendingRequests(result.pendingRequests) || "- a pending approval or question"}`
+        : wait.outcome === "idle"
+          ? "The thread has no turns yet."
+          : `Turn ${wait.turnIndex} ${wait.outcome} (waited ${seconds}s); the thread is now ${wait.statusAfter}.`;
+  const transcript = renderTranscript(result.reply);
+  return transcript ? `${headline}\n\n${transcript}` : headline;
+}
+
+interface ThreadReadCommandOptions {
+  thread: string;
+  detail: ReadDetail;
+  turns?: number;
+  lastTurn?: boolean;
+  firstTurn?: boolean;
+  maxChars?: number;
+}
+
+function positiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!/^\d+$/u.test(value.trim()) || !Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new InvalidArgumentError("Expected a positive whole number.");
+  }
+  return parsed;
+}
+
 async function readStdin(): Promise<string> {
   input.setEncoding("utf8");
   let value = "";
@@ -150,7 +231,7 @@ async function readStdin(): Promise<string> {
   return value;
 }
 
-async function resolvePrompt(options: ThreadCommandOptions): Promise<string> {
+async function resolvePrompt(options: PromptOptions): Promise<string> {
   const sources = [options.prompt !== undefined, options.promptFile !== undefined, options.stdin === true].filter(Boolean);
   if (sources.length !== 1) {
     throw new CliError("PROMPT_SOURCE_REQUIRED", "Use exactly one of --prompt, --prompt-file, or --stdin.");
@@ -158,6 +239,26 @@ async function resolvePrompt(options: ThreadCommandOptions): Promise<string> {
   if (options.prompt !== undefined) return options.prompt;
   if (options.promptFile !== undefined) return await readFile(path.resolve(options.promptFile), "utf8");
   return await readStdin();
+}
+
+async function confirmSettledThread(thread: T3Thread, project: T3Project | null): Promise<boolean> {
+  if (!input.isTTY || !errorOutput.isTTY) {
+    throw new CliError(
+      "SETTLED_THREAD_CONFIRMATION_REQUIRED",
+      `Thread ${thread.id} is settled. Re-run with --wake-settled to send and wake it.`,
+      { exitCode: 4, details: { threadId: thread.id, settledAt: thread.settledAt } },
+    );
+  }
+  const readline = createInterface({ input, output: errorOutput });
+  try {
+    const projectLabel = project ? ` in ${project.title}` : "";
+    const answer = await readline.question(
+      `Thread “${thread.title}”${projectLabel} is settled. Send this message and wake it? [y/N] `,
+    );
+    return /^(?:y|yes)$/iu.test(answer.trim());
+  } finally {
+    readline.close();
+  }
 }
 
 function threadCreateOptions(options: ThreadCommandOptions, prompt: string): ThreadCreateOptions {
@@ -257,7 +358,205 @@ addProjectPolicyOption(addWorkspaceOptions(projects.command("ensure")))
     }),
   );
 
-const threads = program.command("threads").description("Create T3 Code threads.");
+const threads = program.command("threads").description("Create, inspect, and message T3 Code threads.");
+threads.command("list")
+  .description("List active and settled threads.")
+  .option("--cwd <path>", "Filter by the T3 project resolved from this folder.")
+  .addOption(new Option("--workspace-mode <mode>").choices(["repo", "folder"]))
+  .option("--project <project-id>", "Filter by an exact T3 project id.")
+  .addOption(
+    new Option("--status <status>", "Filter by thread lifecycle status.")
+      .choices(["active", "settled", "all"])
+      .default("all"),
+  )
+  .action((options: ThreadListCommandOptions) =>
+    action(async () => {
+      const context = await commandContext();
+      const result = await listThreads(context.config, options);
+      const projectById = new Map(result.projects.map((project) => [project.id, project]));
+      const lines = result.threads.map((thread) => {
+        const project = projectById.get(thread.projectId);
+        return [
+          thread.status,
+          thread.id,
+          project?.title ?? thread.projectId,
+          thread.title,
+          thread.modelSelection?.model ?? "unknown-model",
+          thread.updatedAt ?? "unknown-time",
+        ].join("\t");
+      });
+      writeSuccess(result, context, lines.length > 0 ? lines.join("\n") : "No matching threads.");
+    }),
+  );
+
+threads
+  .command("inspect")
+  .description("Inspect a thread before targeting it.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .action((options: { thread: string }) =>
+    action(async () => {
+      const context = await commandContext();
+      const result = await inspectThread(context.config, options.thread);
+      const thread = result.thread;
+      const latestTurn = thread.latestTurn;
+      const requests = thread.pendingRequests;
+      const blocked = [
+        ...(thread.hasPendingApprovals || requests.some((request) => request.kind === "approval") ? ["approval"] : []),
+        ...(thread.hasPendingUserInput || requests.some((request) => request.kind === "user-input") ? ["user input"] : []),
+      ];
+      writeSuccess(
+        result,
+        context,
+        [
+          `Thread: ${thread.id}`,
+          `Title: ${thread.title}`,
+          `Project: ${result.project?.title ?? thread.projectId}`,
+          `Workspace: ${thread.worktreePath ?? result.project?.workspaceRoot ?? "unknown"}${thread.branch ? ` (branch ${thread.branch})` : ""}`,
+          `Status: ${thread.status}`,
+          `Model: ${thread.modelSelection?.instanceId ?? "unknown"}/${thread.modelSelection?.model ?? "unknown"}`,
+          `Session: ${thread.session?.status ?? "none"}`,
+          `Turns: ${thread.turnCount} (${thread.messageCount} messages)`,
+          `Latest turn: ${latestTurn ? `${latestTurn.state} (${latestTurn.turnId})` : "none"}`,
+          ...(blocked.length > 0 ? [`Waiting for: ${blocked.join(" and ")}`] : []),
+          ...(requests.length > 0 ? [renderPendingRequests(requests)] : []),
+          ...(thread.contextWindow
+            ? [`Context: ${thread.contextWindow.usedTokens} tokens${thread.contextWindow.maxTokens ? ` of ${thread.contextWindow.maxTokens}` : ""}`]
+            : []),
+          `Updated: ${thread.updatedAt ?? "unknown"}`,
+        ].join("\n"),
+      );
+    }),
+  );
+
+threads
+  .command("read")
+  .description("Read a thread's conversation as a transcript, from final answers only to full tool detail.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .addOption(
+    new Option("--detail <level>", "answers: prompts and final answers; messages: without reasoning or tools; full: everything.")
+      .choices(READ_DETAILS)
+      .default("messages"),
+  )
+  .option("--turns <count>", "Return only the last <count> turns.", positiveInteger)
+  .option("--last-turn", "Return only the latest turn (same as --turns 1).")
+  .option("--first-turn", "Also return the first turn, which holds the original request.")
+  .option("--max-chars <count>", "Clip each message, tool input, and tool output to <count> characters.", positiveInteger)
+  .action((options: ThreadReadCommandOptions) =>
+    action(async () => {
+      const context = await commandContext();
+      if (options.lastTurn && options.turns !== undefined && options.turns !== 1) {
+        throw new CliError("THREAD_FILTER_CONFLICT", "Use either --last-turn or --turns, not both.", { exitCode: 2 });
+      }
+      const turns = options.lastTurn ? 1 : options.turns;
+      const result = await readThread(context.config, options.thread, {
+        detail: options.detail,
+        ...(turns === undefined ? {} : { turns }),
+        ...(options.firstTurn ? { firstTurn: true } : {}),
+        ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
+      });
+      const thread = result.thread;
+      const shown = thread.turns.filter((turn) => turn.turnId !== null).map((turn) => turn.index);
+      const range = shown.length === thread.view.totalTurns ? "all" : shown.join(", ") || "none";
+      writeSuccess(
+        result,
+        context,
+        [
+          `Thread: ${thread.id}`,
+          `Title: ${thread.title}`,
+          `Project: ${result.project?.title ?? thread.projectId}`,
+          `Status: ${thread.status}${thread.latestTurn ? `, latest turn ${thread.latestTurn.state}` : ""}`,
+          `View: ${thread.view.detail}, turns ${range} of ${thread.view.totalTurns}`,
+          "",
+          renderTranscript(thread) || "No messages.",
+        ].join("\n"),
+      );
+    }),
+  );
+
+threads
+  .command("send")
+  .description("Start a new turn on an existing thread.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .option("--prompt <text>", "Message text.")
+  .option("--prompt-file <path>", "Read the message from a UTF-8 file.")
+  .option("--stdin", "Read the message from stdin.")
+  .option("--wake-settled", "Explicitly allow this message to wake a settled thread.")
+  .option("--wait", "Wait for the turn that handles the message and print its reply.")
+  .option("--timeout <seconds>", "Stop waiting after <seconds> (default 600).", positiveInteger)
+  .addOption(
+    new Option("--detail <level>", "Reply detail: answers, messages, or full (default answers).").choices(READ_DETAILS),
+  )
+  .option("--max-chars <count>", "Clip each reply message and tool entry to <count> characters.", positiveInteger)
+  .action((options: ThreadSendCommandOptions) =>
+    action(async () => {
+      const context = await commandContext();
+      const prompt = await resolvePrompt(options);
+      const result = await sendThreadMessage(context.config, {
+        threadId: options.thread,
+        prompt,
+        ...(options.wakeSettled ? { wakeSettled: true } : {}),
+        ...(!context.json && !options.stdin ? { confirmSettled: confirmSettledThread } : {}),
+        ...(options.wait ? { wait: waitOptions(options) } : {}),
+      });
+      const sent = `Sent message ${result.message.messageId} to thread ${result.thread.id}; T3 accepted and projected the turn.`;
+      const { wait, pendingRequests, reply } = result;
+      writeSuccess(
+        result,
+        context,
+        wait && pendingRequests && reply ? `${sent}\n${renderWait({ wait, pendingRequests, reply })}` : sent,
+      );
+    }),
+  );
+
+threads
+  .command("wait")
+  .description("Wait until a thread's current turn finishes or needs a person, then print that turn.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .option("--timeout <seconds>", "Stop waiting after <seconds> (default 600).", positiveInteger)
+  .addOption(
+    new Option("--detail <level>", "Turn detail: answers, messages, or full (default answers).").choices(READ_DETAILS),
+  )
+  .option("--max-chars <count>", "Clip each message and tool entry to <count> characters.", positiveInteger)
+  .action((options: ThreadWaitCommandOptions) =>
+    action(async () => {
+      const context = await commandContext();
+      const result = await waitForThread(context.config, options.thread, waitOptions(options));
+      writeSuccess(result, context, `Thread: ${result.thread.id}\nTitle: ${result.thread.title}\n${renderWait(result)}`);
+    }),
+  );
+
+threads
+  .command("settle")
+  .description("Mark a thread as settled after verifying it can be settled.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .action((options: { thread: string }) =>
+    action(async () => {
+      const context = await commandContext();
+      const result = await settleThread(context.config, options.thread);
+      writeSuccess(
+        result,
+        context,
+        `Settled thread ${result.thread.id}; T3 projected the lifecycle change.`,
+      );
+    }),
+  );
+
+threads
+  .command("unsettle")
+  .description("Mark a settled thread as active without starting a turn.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .action((options: { thread: string }) =>
+    action(async () => {
+      const context = await commandContext();
+      const result = await unsettleThread(context.config, options.thread);
+      writeSuccess(
+        result,
+        context,
+        `Marked thread ${result.thread.id} active; T3 projected the lifecycle change.`,
+      );
+    }),
+  );
+
 addThreadOptions(threads.command("create"))
   .description("Create a new project thread and start its first turn.")
   .action((options: ThreadCommandOptions) =>
@@ -301,7 +600,20 @@ program
     }),
   );
 
-await program.parseAsync(process.argv);
+try {
+  await program.parseAsync(process.argv);
+} catch (error) {
+  if (!(error instanceof CommanderError)) throw error;
+  if (error.exitCode === 0) {
+    process.exitCode = 0;
+  } else {
+    const message = error.message.replace(/^error:\s*/u, "");
+    const cliError = writeError(new CliError("INVALID_USAGE", message, { exitCode: 2 }), {
+      json: jsonRequested,
+    });
+    process.exitCode = cliError.exitCode;
+  }
+}
 // Exit only after pending stdout/stderr writes drain, so large piped JSON is complete.
 // Exiting still stops lingering handles, such as a WebSocket awaiting its close handshake.
 const flush = (stream: NodeJS.WriteStream) => new Promise<void>((resolve) => stream.write("", () => resolve()));

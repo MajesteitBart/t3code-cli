@@ -1,17 +1,10 @@
-import { execFile } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
-import { promisify } from "node:util";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
-const exec = promisify(execFile);
-// Node 22/24 warn on the CLI's existing node:sqlite import. Remove only that
-// known runtime diagnostic; unexpected stderr must still fail the assertions.
-function withoutSqliteWarning(stderr) {
-  return stderr.replace(/^\(node:\d+\) ExperimentalWarning: SQLite is an experimental feature and might change at any time\r?\n\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\r?\n/m, "");
-}
+import { buildCli, exec, withoutSqliteWarning } from "./helpers/built-cli.mjs";
 
 test("stderr normalization removes only the known SQLite runtime warning", () => {
   const warning = "(node:123) ExperimentalWarning: SQLite is an experimental feature and might change at any time\n(Use `node --trace-warnings ...` to show where the warning was created)\n";
@@ -23,16 +16,14 @@ test("stderr normalization removes only the known SQLite runtime warning", () =>
   expect(withoutSqliteWarning(warning.replace("SQLite", "Something else"))).toBe(warning.replace("SQLite", "Something else"));
 });
 
+let built;
 let directory;
 let build;
 beforeAll(async () => {
-  directory = await mkdtemp(path.resolve(".http-test-"));
-  build = path.join(directory, "dist");
-  await exec(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "tsconfig.json", "--outDir", build]);
-  // The CLI reads its version from ../package.json relative to the build output.
-  await copyFile("package.json", path.join(directory, "package.json"));
+  built = await buildCli(".http-test-");
+  ({ directory, build } = built);
 }, 20_000);
-afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+afterAll(async () => { await built?.remove(); });
 
 for (const framing of ["length", "eof", "chunked", "truncated-length", "truncated-chunked"]) {
   test(`child survives backpressure and socket FIN: ${framing}`, async () => {

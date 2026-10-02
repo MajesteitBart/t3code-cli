@@ -1,0 +1,4 @@
+interface:
+  display_name: "T3 thread"
+  short_description: "Read, continue, or message an existing T3 Code thread"
+  default_prompt: "Use $t3thread with a T3 Code thread id to brief me on that thread."
