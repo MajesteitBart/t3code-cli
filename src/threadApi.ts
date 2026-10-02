@@ -177,6 +177,21 @@ function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+/** Resolves null once the deadline passes, so one slow request cannot outlast a wait's timeout. */
+async function beforeDeadline<T>(request: Promise<T>, deadline: number): Promise<T | null> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return null;
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), remaining);
+  });
+  try {
+    return await Promise.race([request, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 interface TurnObservation {
   outcome: TurnWaitOutcome;
   turnIndex: number | null;
@@ -273,10 +288,13 @@ export class T3ThreadApi {
     const knownStates = new Map<string, T3LatestTurn["state"]>();
     for (;;) {
       // Polls read a bounded window of recent turns; the whole thread is read once the outcome is clear.
-      const read = await this.inspect(threadId).catch((error: unknown) => {
-        if (error instanceof CliError && error.code === "THREAD_NOT_FOUND") throw error;
-        return null;
-      });
+      const read = await beforeDeadline(
+        this.inspect(threadId).catch((error: unknown) => {
+          if (error instanceof CliError && error.code === "THREAD_NOT_FOUND") throw error;
+          return null;
+        }),
+        deadline,
+      );
       if (read) {
         last = read;
         if (read.thread.latestTurn) knownStates.set(read.thread.latestTurn.turnId, read.thread.latestTurn.state);
@@ -287,7 +305,7 @@ export class T3ThreadApi {
           observed !== null &&
           (final || (previous?.outcome === observed.outcome && previous.turnIndex === observed.turnIndex));
         const full: { snapshotSequence: number; thread: T3Thread } | null =
-          observed && confirmed ? await this.read(threadId).catch(() => null) : null;
+          observed && confirmed ? await beforeDeadline(this.read(threadId).catch(() => null), deadline) : null;
         // Turn numbers and the reply come from the whole thread, which must still show the same outcome.
         const settled: TurnObservation | null = full ? observeTurn(full.thread, options.messageId, knownStates) : null;
         if (full && settled && settled.outcome === observed?.outcome) {
