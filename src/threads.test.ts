@@ -600,6 +600,31 @@ describe("thread discovery and messaging", () => {
     expect(harness.commands).toHaveLength(0);
   });
 
+  it("refuses to settle a thread while a message waits for its turn", async () => {
+    const harness = await testHarness([makeThread("target", {
+      latestTurn: {
+        turnId: "turn-1",
+        state: "completed",
+        requestedAt: "2026-09-04T10:00:00.000Z",
+        startedAt: "2026-09-04T10:00:00.000Z",
+        completedAt: "2026-09-04T10:01:00.000Z",
+        assistantMessageId: "answer",
+      },
+      session: { threadId: "target", status: "ready", providerName: "codex", runtimeMode: "full-access", activeTurnId: null, lastError: null, updatedAt: "2026-09-04T10:01:00.000Z" },
+      messages: [
+        { id: "prompt", role: "user", text: "Go", turnId: null, streaming: false, createdAt: "2026-09-04T10:00:00.000Z", updatedAt: "2026-09-04T10:00:00.000Z" },
+        { id: "answer", role: "assistant", text: "Done", turnId: "turn-1", streaming: false, createdAt: "2026-09-04T10:00:30.000Z", updatedAt: "2026-09-04T10:00:30.000Z" },
+        { id: "queued", role: "user", text: "Next", turnId: null, streaming: false, createdAt: "2026-09-04T10:02:00.000Z", updatedAt: "2026-09-04T10:02:00.000Z" },
+      ],
+    })]);
+
+    await expect(settleThread(harness.config, "target")).rejects.toMatchObject({
+      code: "THREAD_SETTLE_BLOCKED",
+      details: { queuedMessages: 1 },
+    });
+    expect(harness.commands).toEqual([]);
+  });
+
   it("refuses to settle a thread with an active turn", async () => {
     const harness = await testHarness([
       makeThread("running", {

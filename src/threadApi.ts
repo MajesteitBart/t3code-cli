@@ -8,6 +8,7 @@ import type {
   ModelSelection,
   OrchestrationSnapshot,
   RuntimeMode,
+  T3LatestTurn,
   T3Message,
   T3Project,
   T3Thread,
@@ -213,7 +214,11 @@ function turnStartFailure(thread: T3Thread, messageId: string): string | null {
  * Returns how the awaited turn ended, or null while it is still pending or running. With a message
  * id, the awaited turn is the one that handled that message; otherwise it is the latest turn.
  */
-function observeTurn(thread: T3Thread, messageId: string | undefined): TurnObservation | null {
+function observeTurn(
+  thread: T3Thread,
+  messageId: string | undefined,
+  knownStates: ReadonlyMap<string, T3LatestTurn["state"]> = new Map(),
+): TurnObservation | null {
   const transcript = buildTranscript(thread, { detail: "answers" });
   const latest = transcript.turns.findLast((turn) => turn.turnId !== null) ?? null;
   if (messageId !== undefined) {
@@ -249,13 +254,12 @@ function observeTurn(thread: T3Thread, messageId: string | undefined): TurnObser
   const busy = thread.latestTurn?.state === "running" || session === "starting" || session === "running";
   if (busy && (messageId === undefined || thread.latestTurn?.turnId === turn?.turnId)) return null;
   if (!turn) return { outcome: "idle", turnIndex: null };
+  // T3 reports only the latest turn's state; an earlier turn keeps the state seen while it was latest.
+  const remembered = turn.turnId === null ? undefined : knownStates.get(turn.turnId);
+  const state = thread.latestTurn?.turnId === turn.turnId ? turn.state : (remembered ?? turn.state);
   // A turn that ended by asking a message-mode question waits for a person too.
   const askedBack = requests.some((request) => request.responseMode === "message" && request.turnId === turn.turnId);
-  const outcome = askedBack
-    ? "needs-attention"
-    : turn.state === "interrupted" || turn.state === "error"
-      ? turn.state
-      : "completed";
+  const outcome = askedBack ? "needs-attention" : state === "interrupted" || state === "error" ? state : "completed";
   const turnStart = turn.startedAt;
   const mayBeQueued =
     turnStart !== null &&
@@ -294,6 +298,7 @@ export class T3ThreadApi {
     const deadline = startedAt + options.timeoutMs;
     let candidate: (TurnObservation & { since: number }) | null = null;
     let last: { snapshotSequence: number; thread: T3Thread } | null = null;
+    const knownStates = new Map<string, T3LatestTurn["state"]>();
     for (;;) {
       // Polls read a bounded window of recent turns; the whole thread is read once the outcome is clear.
       const read = await this.inspect(threadId).catch((error: unknown) => {
@@ -302,8 +307,9 @@ export class T3ThreadApi {
       });
       if (read) {
         last = read;
+        if (read.thread.latestTurn) knownStates.set(read.thread.latestTurn.turnId, read.thread.latestTurn.state);
         const previous = candidate as (TurnObservation & { since: number }) | null;
-        const observed = observeTurn(read.thread, options.messageId);
+        const observed = observeTurn(read.thread, options.messageId, knownStates);
         // A blocking request or a failed start cannot change by itself. A question the turn ended with
         // still waits out a queue window, because a queued turn may yet claim the awaited message.
         const final = observed?.blocked === true || observed?.error !== undefined;
@@ -317,7 +323,7 @@ export class T3ThreadApi {
         const full: { snapshotSequence: number; thread: T3Thread } | null =
           observed && confirmed ? await this.read(threadId).catch(() => null) : null;
         // Turn numbers and the reply come from the whole thread, which must still show the same outcome.
-        const whole: TurnObservation | null = full ? observeTurn(full.thread, options.messageId) : null;
+        const whole: TurnObservation | null = full ? observeTurn(full.thread, options.messageId, knownStates) : null;
         if (full && whole && whole.outcome === observed?.outcome) {
           return {
             outcome: whole.outcome,

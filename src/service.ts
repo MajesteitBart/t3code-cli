@@ -24,7 +24,7 @@ import {
   type ThreadLifecycleStatus,
   type ThreadWaitOptions,
 } from "./threadSupport.js";
-import { buildTranscript, pendingRequests, type TranscriptOptions } from "./transcript.js";
+import { buildTranscript, pendingRequests, queuedMessages, type TranscriptOptions } from "./transcript.js";
 import type {
   CliConfig,
   EffectiveThreadEnvMode,
@@ -629,20 +629,26 @@ async function changeThreadSettlement(
     const hasPendingApprovals = thread.hasPendingApprovals === true || requests.some((request) => request.kind === "approval");
     const hasPendingUserInput =
       thread.hasPendingUserInput === true || requests.some((request) => request.kind === "user-input");
+    // A message queued between turns is submitted work, even while the session looks ready.
+    const queued = queuedMessages(thread);
     if (
       state === "settled" &&
       (thread.session?.status === "starting" ||
         thread.session?.status === "running" ||
+        thread.latestTurn?.state === "running" ||
         hasPendingApprovals ||
-        hasPendingUserInput)
+        hasPendingUserInput ||
+        queued.length > 0)
     ) {
       throw new CliError("THREAD_SETTLE_BLOCKED", `Thread ${threadId} still has active or blocked work.`, {
         exitCode: 4,
         details: {
           threadId,
           sessionStatus: thread.session?.status ?? null,
+          latestTurnState: thread.latestTurn?.state ?? null,
           hasPendingApprovals,
           hasPendingUserInput,
+          queuedMessages: queued.length,
         },
       });
     }
