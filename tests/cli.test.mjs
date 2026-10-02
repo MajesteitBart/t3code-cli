@@ -69,6 +69,40 @@ describe("CLI parsing", () => {
     });
   });
 
+  it("rejects a turn count that is not a positive whole number", async () => {
+    const result = await run(["--json", "threads", "read", "--thread", "thread-1", "--turns", "0"]);
+
+    expect(result.code).toBe(2);
+    expect(JSON.parse(result.stderr)).toEqual({
+      ok: false,
+      error: {
+        code: "INVALID_USAGE",
+        message: "option '--turns <count>' argument '0' is invalid. Expected a positive whole number.",
+      },
+    });
+  });
+
+  it("rejects an unknown read detail", async () => {
+    const result = await run(["--json", "threads", "read", "--thread", "thread-1", "--detail", "verbose"]);
+
+    expect(result.code).toBe(2);
+    expect(JSON.parse(result.stderr).error).toEqual({
+      code: "INVALID_USAGE",
+      message: "option '--detail <level>' argument 'verbose' is invalid. Allowed choices are answers, messages, full.",
+    });
+  });
+
+  it("rejects conflicting turn windows before contacting T3", async () => {
+    const missingConfig = path.join(built.directory, "missing-config.json");
+    const result = await run(["--json", "--config", missingConfig, "threads", "read", "--thread", "thread-1", "--last-turn", "--turns", "2"]);
+
+    expect(result.code).toBe(2);
+    expect(JSON.parse(result.stderr).error).toEqual({
+      code: "THREAD_FILTER_CONFLICT",
+      message: "Use either --last-turn or --turns, not both.",
+    });
+  });
+
   it("keeps human-readable usage errors", async () => {
     const result = await run(["threads", "inspect"]);
 

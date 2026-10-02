@@ -116,7 +116,8 @@ export interface T3Session {
 
 export interface T3Message {
   id: string;
-  role: "user" | "assistant" | "system";
+  /** T3 reports reasoning summaries as `system` unless the client opts into `reasoning`. */
+  role: "user" | "assistant" | "system" | "reasoning";
   text: string;
   turnId: string | null;
   streaming: boolean;

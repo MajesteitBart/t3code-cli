@@ -7,7 +7,14 @@ import { CliError } from "./errors.js";
 import { readLocalProjects } from "./localProjects.js";
 import { openThread } from "./open.js";
 import { discoverRuntime } from "./runtime.js";
-import { T3ThreadApi, type ThreadSettlementState } from "./threadApi.js";
+import { T3ThreadApi, type ThreadSettlementState, type TurnWaitResult } from "./threadApi.js";
+import {
+  buildTranscript,
+  pendingRequests,
+  selectTurn,
+  type ReadDetail,
+  type TranscriptOptions,
+} from "./transcript.js";
 import type {
   CliConfig,
   EffectiveThreadEnvMode,
@@ -59,11 +66,19 @@ export interface ThreadListOptions extends WorkspaceOptions {
   status?: ThreadListStatus;
 }
 
+export interface ThreadWaitOptions {
+  timeoutMs: number;
+  detail?: ReadDetail;
+  maxChars?: number;
+}
+
 export interface ThreadSendOptions {
   threadId: string;
   prompt: string;
   wakeSettled?: boolean;
   confirmSettled?: (thread: T3Thread, project: T3Project | null) => Promise<boolean>;
+  /** Wait for the turn that handles the message and return its reply. */
+  wait?: ThreadWaitOptions;
 }
 
 interface EffectiveT3Settings {
@@ -158,17 +173,42 @@ function requireThreadId(value: string): string {
   return threadId;
 }
 
-function threadInspectionView(thread: T3Thread) {
-  const messages = thread.messages ?? [];
+/** Prefers the read-only local projection over downloading the shell snapshot of every thread. */
+async function projectById(api: T3Api, projectId: string): Promise<T3Project | null> {
+  const local = readLocalProjects(api.runtime)?.find((project) => project.id === projectId);
+  if (local) return local;
+  const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
+  const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
+  return projects.find((candidate) => candidate.id === projectId) ?? null;
+}
+
+function threadSummary(thread: T3Thread) {
   const summary = { ...thread };
   delete summary.messages;
   delete summary.activities;
   delete summary.checkpoints;
   delete summary.proposedPlans;
+  return { ...summary, status: threadStatus(thread) };
+}
+
+/** The latest context-window report, so callers can see how full the target's context is. */
+function contextWindow(thread: T3Thread): { usedTokens: number; maxTokens: number | null } | null {
+  const activities = Array.isArray(thread.activities) ? (thread.activities as Array<Record<string, unknown>>) : [];
+  const latest = activities.findLast((activity) => activity?.kind === "context-window.updated");
+  const payload = latest?.payload as Record<string, unknown> | undefined;
+  if (typeof payload?.usedTokens !== "number") return null;
+  return { usedTokens: payload.usedTokens, maxTokens: typeof payload.maxTokens === "number" ? payload.maxTokens : null };
+}
+
+function threadInspectionView(thread: T3Thread) {
+  const messages = thread.messages ?? [];
+  const transcript = buildTranscript(thread, { detail: "answers" });
   return {
-    ...summary,
-    status: threadStatus(thread),
+    ...threadSummary(thread),
     messageCount: messages.length,
+    turnCount: transcript.view.totalTurns,
+    contextWindow: contextWindow(thread),
+    pendingRequests: pendingRequests(thread),
     recentMessages: messages.slice(-INSPECT_RECENT_MESSAGE_LIMIT).map((message) => ({
       id: message.id,
       role: message.role,
@@ -184,22 +224,12 @@ function threadInspectionView(thread: T3Thread) {
   };
 }
 
-function threadReadView(thread: T3Thread, lastTurn: boolean) {
-  const turnId = lastTurn ? (thread.latestTurn?.turnId ?? null) : null;
-  const messages = lastTurn
-    ? (thread.messages ?? []).filter((message) => turnId !== null && message.turnId === turnId)
-    : (thread.messages ?? []);
-  const summary = { ...thread };
-  delete summary.messages;
-  delete summary.activities;
-  delete summary.checkpoints;
-  delete summary.proposedPlans;
+function threadReadView(thread: T3Thread, options: TranscriptOptions) {
+  const transcript = buildTranscript(thread, options);
   return {
-    ...summary,
-    status: threadStatus(thread),
-    messageCount: messages.length,
-    messages,
-    ...(lastTurn ? { messageFilter: { scope: "last-turn" as const, turnId } } : {}),
+    ...threadSummary(thread),
+    messageCount: transcript.messages.length,
+    ...transcript,
   };
 }
 
@@ -510,10 +540,9 @@ export async function inspectThread(config: CliConfig, rawThreadId: string) {
   const threadId = requireThreadId(rawThreadId);
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, config, async (api, invocation) => {
-    const inspected = await new T3ThreadApi(api).inspect(threadId);
-    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
-    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
-    const project = projects.find((candidate) => candidate.id === inspected.thread.projectId) ?? null;
+    // A turn window would understate the turn and message counts of a long thread.
+    const inspected = await new T3ThreadApi(api).read(threadId);
+    const project = await projectById(api, inspected.thread.projectId);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
@@ -524,25 +553,19 @@ export async function inspectThread(config: CliConfig, rawThreadId: string) {
   });
 }
 
-export async function readThread(
-  config: CliConfig,
-  rawThreadId: string,
-  options: { lastTurn?: boolean } = {},
-) {
+export async function readThread(config: CliConfig, rawThreadId: string, options: TranscriptOptions = {}) {
   const threadId = requireThreadId(rawThreadId);
-  const lastTurn = options.lastTurn ?? false;
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, config, async (api, invocation) => {
-    const read = await new T3ThreadApi(api).read(threadId, { lastTurn });
-    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
-    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
-    const project = projects.find((candidate) => candidate.id === read.thread.projectId) ?? null;
+    // Turn windows are applied locally: numbering, the first turn, and prompt grouping need the whole thread.
+    const read = await new T3ThreadApi(api).read(threadId);
+    const project = await projectById(api, read.thread.projectId);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
       snapshotSequence: read.snapshotSequence,
       project,
-      thread: threadReadView(read.thread, lastTurn),
+      thread: threadReadView(read.thread, options),
     };
   });
 }
@@ -555,7 +578,7 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
   }
 
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
-  return await withT3Api(runtime, config, async (api, invocation) => {
+  return await withT3Api(runtime, configForWait(config, options.wait), async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
     const inspected = await adapter.inspect(threadId);
     const thread = inspected.thread;
@@ -566,9 +589,7 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
       });
     }
 
-    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
-    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
-    const project = projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    const project = await projectById(api, thread.projectId);
     if (threadStatus(thread) === "settled" && !options.wakeSettled) {
       if (!options.confirmSettled) {
         throw new CliError(
@@ -587,6 +608,17 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
 
     const command = adapter.buildTurnStart(thread, prompt);
     const sent = await adapter.dispatchTurn(command);
+    const messageId = command.message.messageId;
+    const waited = options.wait
+      ? await adapter.waitForTurn(threadId, { messageId, timeoutMs: options.wait.timeoutMs }).catch((cause: unknown) => {
+          if (!(cause instanceof CliError) || cause.code !== "THREAD_WAIT_TIMEOUT") throw cause;
+          throw new CliError(
+            "THREAD_WAIT_TIMEOUT",
+            `Sent message ${messageId}, but thread ${threadId} did not finish within ${Math.round(options.wait!.timeoutMs / 1000)} seconds. Do not resend it; run threads wait to keep waiting.`,
+            { exitCode: cause.exitCode, details: { ...(cause.details as object), sent: true } },
+          );
+        })
+      : null;
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
@@ -598,7 +630,7 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
         statusBeforeSend: threadStatus(thread),
       },
       message: {
-        messageId: command.message.messageId,
+        messageId,
         textLength: command.message.text.length,
       },
       command: {
@@ -611,6 +643,48 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
       },
       dispatch: sent.dispatch,
       verification: sent.verification,
+      ...(waited && options.wait ? waitView(waited, options.wait, [messageId]) : {}),
+    };
+  });
+}
+
+/** Issues a session that outlives the wait; `withT3Api` still revokes it when the command ends. */
+function configForWait(config: CliConfig, wait: ThreadWaitOptions | undefined): CliConfig {
+  return wait ? { ...config, sessionTtl: `${Math.ceil(wait.timeoutMs / 60_000) + 2}m` } : config;
+}
+
+export type ThreadWaitView = ReturnType<typeof waitView>;
+
+function waitView(waited: TurnWaitResult, options: ThreadWaitOptions, omitMessageIds: readonly string[] = []) {
+  const transcript = buildTranscript(waited.thread, {
+    detail: options.detail ?? "answers",
+    ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
+  });
+  return {
+    wait: {
+      outcome: waited.outcome,
+      turnIndex: waited.turnIndex,
+      waitedMs: waited.waitedMs,
+      statusAfter: threadStatus(waited.thread),
+      ...(waited.error === undefined ? {} : { error: waited.error }),
+    },
+    pendingRequests: pendingRequests(waited.thread),
+    reply: selectTurn(transcript, waited.turnIndex, omitMessageIds),
+  };
+}
+
+export async function waitForThread(config: CliConfig, rawThreadId: string, options: ThreadWaitOptions) {
+  const threadId = requireThreadId(rawThreadId);
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
+  return await withT3Api(runtime, configForWait(config, options), async (api, invocation) => {
+    const waited = await new T3ThreadApi(api).waitForTurn(threadId, { timeoutMs: options.timeoutMs });
+    const project = await projectById(api, waited.thread.projectId);
+    return {
+      runtime,
+      auth: { source: invocation.source, version: invocation.version },
+      project,
+      thread: { id: waited.thread.id, projectId: waited.thread.projectId, title: waited.thread.title },
+      ...waitView(waited, options),
     };
   });
 }
@@ -642,27 +716,30 @@ async function changeThreadSettlement(
         details: { threadId, archivedAt: thread.archivedAt },
       });
     }
+    // The thread detail omits T3's pending flags, so derive them from the request activities too.
+    const requests = pendingRequests(thread);
+    const hasPendingApprovals = thread.hasPendingApprovals === true || requests.some((request) => request.kind === "approval");
+    const hasPendingUserInput =
+      thread.hasPendingUserInput === true || requests.some((request) => request.kind === "user-input");
     if (
       state === "settled" &&
       (thread.session?.status === "starting" ||
         thread.session?.status === "running" ||
-        thread.hasPendingApprovals === true ||
-        thread.hasPendingUserInput === true)
+        hasPendingApprovals ||
+        hasPendingUserInput)
     ) {
       throw new CliError("THREAD_SETTLE_BLOCKED", `Thread ${threadId} still has active or blocked work.`, {
         exitCode: 4,
         details: {
           threadId,
           sessionStatus: thread.session?.status ?? null,
-          hasPendingApprovals: thread.hasPendingApprovals ?? false,
-          hasPendingUserInput: thread.hasPendingUserInput ?? false,
+          hasPendingApprovals,
+          hasPendingUserInput,
         },
       });
     }
 
-    const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
-    const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
-    const project = projects.find((candidate) => candidate.id === thread.projectId) ?? null;
+    const project = await projectById(api, thread.projectId);
     const command = adapter.buildSettlement(threadId, state);
     const changed = await adapter.dispatchSettlement(command, thread.updatedAt);
     return {

@@ -1,4 +1,4 @@
-o# @bvdm/t3code-cli
+# @bvdm/t3code-cli
 
 `t3code` hands the current folder or Git repository to a new thread in [T3 Code](https://github.com/pingdotgg/t3code), and lets automation discover, inspect, and message existing threads.
 
@@ -113,15 +113,28 @@ t3code threads list --status settled --project <project-id>
 t3code threads inspect --thread <thread-id>
 ```
 
-`inspect` returns a bounded preview in JSON: the 6 most recent messages, with message text limited to 2,000 characters. Read the complete message history without truncation when you need the conversation itself:
+`inspect` prints the workspace and branch, model, turn count, latest turn state, context use, and any approval or question the thread waits on. Its JSON also holds a bounded preview: the 6 most recent messages, with message text limited to 2,000 characters.
+
+Read the conversation itself with `read`. It prints a Markdown transcript grouped by turn, which an agent can read directly:
 
 ```bash
 t3code threads read --thread <thread-id>
+t3code threads read --thread <thread-id> --detail answers --turns 3 --first-turn
+t3code threads read --thread <thread-id> --detail full --last-turn --max-chars 1500
 t3code --json threads read --thread <thread-id>
-t3code --json threads read --thread <thread-id> --last-turn
 ```
 
-The JSON result stores the transcript in `data.thread.messages`. Messages remain in chronological order and retain their `turnId`. Without a filter, T3's full-history endpoint returns the whole thread without a turn window. `--last-turn` uses `data.thread.latestTurn.turnId` and keeps only messages assigned to that exact turn. Pending user messages can have a null `turnId`, so this strict filter normally returns the assistant or system messages from the latest turn. Neither mode truncates message text.
+`--detail` sets how much of each turn to return:
+
+- `answers`: the user's prompts and the turn's final answer.
+- `messages` (default): prompts and every assistant message, without reasoning summaries or tool calls.
+- `full`: everything, including reasoning summaries, tool calls, changed files, and proposed plans.
+
+`--turns <n>` keeps the last n turns, and `--last-turn` is short for `--turns 1`. `--first-turn` adds the first turn, which holds the original request. `--max-chars <n>` clips each message and tool entry but keeps its start and end. Without it, message text is never shortened.
+
+T3 stores user messages without a turn id. The CLI assigns each one to the turn it started, so a prompt stays with its answer. A message sent during a running turn stays with that turn when the provider folds it in, as Claude does. When the provider queues it instead, as Codex does, it waits as pending until its own turn starts. The CLI tells the two apart by the thread's provider. Messages that no turn has picked up yet appear as a pending group.
+
+The JSON result keeps `data.thread.messages` in turn order and adds `turnIndex` and `textTruncated` to each message. `data.thread.turns` describes each returned turn: its number, state, final message id, and, in `full` detail, its changed files and tool call count. `data.thread.view` reports the detail level and how many turns were returned or left out. `full` also returns `data.thread.toolCalls` and `data.thread.proposedPlans`. T3 shortens tool output to its first line and keeps at most 500 activities per thread, so very long threads lose their oldest tool calls. Changed files come from T3's checkpoint diff of the workspace, so they include any other edits made there during the turn.
 
 Start a new turn on that thread with one of `--prompt`, `--prompt-file`, or `--stdin`:
 
@@ -138,6 +151,29 @@ printf '%s' "New findings that require more work..." \
 ```
 
 The send command does not report success from the HTTP response alone. It waits until the exact message is visible in T3's thread projection. Archived threads are rejected.
+
+Add `--wait` to wait for the turn that handles the message and print its reply:
+
+```bash
+printf '%s' "Which tests still fail?" \
+  | t3code --json threads send --thread <thread-id> --stdin --wait --timeout 540
+```
+
+`data.wait.outcome` is one of:
+
+- `completed` or `interrupted`: `data.reply` holds that turn as a transcript, without your own message.
+- `error`: the provider could not start the turn; `data.wait.error` says why.
+- `needs-attention`: the thread waits for an approval or an answer, listed in `data.pendingRequests`.
+
+The reply uses `--detail answers` unless you pass another level. A finished turn must show on two consecutive polls, two seconds apart, so a Codex turn queued behind a running one is not mistaken for the reply. When the wait times out, the command fails with `THREAD_WAIT_TIMEOUT` and `error.details.sent: true`. Do not resend the message; keep waiting with `threads wait`.
+
+To wait for whatever a thread is doing, for example after a handover:
+
+```bash
+t3code threads wait --thread <thread-id> --timeout 540
+```
+
+Both waits default to 600 seconds. A waiting command issues its T3 session for the timeout plus two minutes, and revokes it when it ends.
 
 Manage settlement explicitly without starting a new turn:
 
@@ -189,8 +225,9 @@ t3code projects resolve --cwd .
 t3code projects ensure --cwd . --project-policy create
 t3code threads list --status active --cwd .
 t3code threads inspect --thread <thread-id>
-t3code threads read --thread <thread-id>
-t3code threads send --thread <thread-id> --stdin
+t3code threads read --thread <thread-id> --detail answers --turns 3
+t3code threads send --thread <thread-id> --stdin --wait
+t3code threads wait --thread <thread-id>
 t3code threads settle --thread <thread-id>
 t3code threads unsettle --thread <thread-id>
 t3code threads create --stdin
@@ -200,13 +237,22 @@ t3code request get api/orchestration/shell
 
 Every command supports human-readable output. `--json` produces `{ "ok": true, "data": ... }` on success and a stable error envelope on failure. When a failure wraps an upstream CLI error, such as T3's reason for rejecting a worktree bootstrap, `error.cause` carries that error's code, message, and details.
 
-Thread targeting uses exit code `3` for a missing target, `4` for a lifecycle/confirmation refusal, and `5` when dispatch returned but turn acceptance could not be verified.
+Thread targeting uses exit code `3` for a missing target, `4` for a lifecycle/confirmation refusal, `5` when dispatch returned but turn acceptance could not be verified, and `6` when a wait timed out.
 
 The leading slash of a `request get` path is optional. Git Bash rewrites arguments that start with a slash into Windows paths (`/api/...` becomes `C:/Program Files/Git/api/...`), so write `api/...` there or set `MSYS_NO_PATHCONV=1`.
 
 Authenticated API requests use Node's native HTTP/HTTPS transport to avoid the bundled Undici parser crash on backpressured responses. Each request owns its connection and closes it after completion or failure. The 30-second deadline covers the response body too; truncated bodies return `T3_REQUEST_FAILED`. Redirects are reported as `T3_API_ERROR` rather than followed, and the client does not request compressed responses. Point `--origin` at the T3 server itself.
 
 Responses are still buffered in memory, so available memory limits the largest response. Large JSON output can be piped to a file; the CLI lets output finish before exiting.
+
+## Agent skills
+
+The package ships two skills for coding agents in `skills/`:
+
+- `use-t3code-cli` covers setup, handovers, and the full command set.
+- `t3thread` points an agent at an existing thread: `$t3thread <thread-id> <what to do>`. The agent inspects the thread and reads only as much as the instruction needs. It can brief you on the thread, answer questions about it, continue or review its work, or message it and wait for the reply.
+
+Copy or link a skill folder into your agent's skills directory, such as `~/.claude/skills/` for Claude Code or `~/.agents/skills/` for Codex. A global npm install keeps them in `$(npm root -g)/@bvdm/t3code-cli/skills`.
 
 ## Origin and optional UI example
 

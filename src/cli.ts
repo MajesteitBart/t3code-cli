@@ -5,7 +5,7 @@ import path from "node:path";
 import { stdin as input, stderr as errorOutput } from "node:process";
 import { createInterface } from "node:readline/promises";
 
-import { Command, CommanderError, Option } from "commander";
+import { Command, CommanderError, InvalidArgumentError, Option } from "commander";
 
 import {
   CONFIG_KEYS,
@@ -18,6 +18,7 @@ import {
 import { doctor } from "./doctor.js";
 import { CliError } from "./errors.js";
 import { writeError, writeSuccess } from "./output.js";
+import { READ_DETAILS, renderPendingRequests, renderTranscript, type ReadDetail } from "./transcript.js";
 import {
   createHandoverThread,
   ensureProject,
@@ -32,6 +33,9 @@ import {
   type ThreadCreateOptions,
   type ThreadListStatus,
   unsettleThread,
+  waitForThread,
+  type ThreadWaitOptions,
+  type ThreadWaitView,
 } from "./service.js";
 import type {
   CliConfig,
@@ -166,14 +170,58 @@ interface ThreadListCommandOptions extends WorkspaceCommandOptions {
   status?: ThreadListStatus;
 }
 
-interface ThreadSendCommandOptions extends PromptOptions {
+interface ThreadWaitCommandOptions {
   thread: string;
+  timeout?: number;
+  detail?: ReadDetail;
+  maxChars?: number;
+}
+
+interface ThreadSendCommandOptions extends PromptOptions, ThreadWaitCommandOptions {
   wakeSettled?: boolean;
+  wait?: boolean;
+}
+
+const DEFAULT_WAIT_TIMEOUT_SECONDS = 600;
+
+function waitOptions(options: ThreadWaitCommandOptions): ThreadWaitOptions {
+  return {
+    timeoutMs: (options.timeout ?? DEFAULT_WAIT_TIMEOUT_SECONDS) * 1000,
+    ...(options.detail ? { detail: options.detail } : {}),
+    ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
+  };
+}
+
+function renderWait(result: ThreadWaitView): string {
+  const { wait } = result;
+  const seconds = Math.round(wait.waitedMs / 1000);
+  const headline =
+    wait.error !== undefined
+      ? `T3 could not start the turn: ${wait.error}`
+      : wait.outcome === "needs-attention"
+        ? `The thread is waiting for a person (waited ${seconds}s):\n${renderPendingRequests(result.pendingRequests) || "- a pending approval or question"}`
+        : wait.outcome === "idle"
+          ? "The thread has no turns yet."
+          : `Turn ${wait.turnIndex} ${wait.outcome} (waited ${seconds}s); the thread is now ${wait.statusAfter}.`;
+  const transcript = renderTranscript(result.reply);
+  return transcript ? `${headline}\n\n${transcript}` : headline;
 }
 
 interface ThreadReadCommandOptions {
   thread: string;
+  detail: ReadDetail;
+  turns?: number;
   lastTurn?: boolean;
+  firstTurn?: boolean;
+  maxChars?: number;
+}
+
+function positiveInteger(value: string): number {
+  const parsed = Number(value);
+  if (!/^\d+$/u.test(value.trim()) || !Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new InvalidArgumentError("Expected a positive whole number.");
+  }
+  return parsed;
 }
 
 async function readStdin(): Promise<string> {
@@ -349,19 +397,32 @@ threads
     action(async () => {
       const context = await commandContext();
       const result = await inspectThread(context.config, options.thread);
-      const latestTurn = result.thread.latestTurn;
+      const thread = result.thread;
+      const latestTurn = thread.latestTurn;
+      const requests = thread.pendingRequests;
+      const blocked = [
+        ...(thread.hasPendingApprovals || requests.some((request) => request.kind === "approval") ? ["approval"] : []),
+        ...(thread.hasPendingUserInput || requests.some((request) => request.kind === "user-input") ? ["user input"] : []),
+      ];
       writeSuccess(
         result,
         context,
         [
-          `Thread: ${result.thread.id}`,
-          `Title: ${result.thread.title}`,
-          `Project: ${result.project?.title ?? result.thread.projectId}`,
-          `Status: ${result.thread.status}`,
-          `Model: ${result.thread.modelSelection?.instanceId ?? "unknown"}/${result.thread.modelSelection?.model ?? "unknown"}`,
-          `Session: ${result.thread.session?.status ?? "none"}`,
+          `Thread: ${thread.id}`,
+          `Title: ${thread.title}`,
+          `Project: ${result.project?.title ?? thread.projectId}`,
+          `Workspace: ${thread.worktreePath ?? result.project?.workspaceRoot ?? "unknown"}${thread.branch ? ` (branch ${thread.branch})` : ""}`,
+          `Status: ${thread.status}`,
+          `Model: ${thread.modelSelection?.instanceId ?? "unknown"}/${thread.modelSelection?.model ?? "unknown"}`,
+          `Session: ${thread.session?.status ?? "none"}`,
+          `Turns: ${thread.turnCount} (${thread.messageCount} messages)`,
           `Latest turn: ${latestTurn ? `${latestTurn.state} (${latestTurn.turnId})` : "none"}`,
-          `Updated: ${result.thread.updatedAt ?? "unknown"}`,
+          ...(blocked.length > 0 ? [`Waiting for: ${blocked.join(" and ")}`] : []),
+          ...(requests.length > 0 ? [renderPendingRequests(requests)] : []),
+          ...(thread.contextWindow
+            ? [`Context: ${thread.contextWindow.usedTokens} tokens${thread.contextWindow.maxTokens ? ` of ${thread.contextWindow.maxTokens}` : ""}`]
+            : []),
+          `Updated: ${thread.updatedAt ?? "unknown"}`,
         ].join("\n"),
       );
     }),
@@ -369,34 +430,44 @@ threads
 
 threads
   .command("read")
-  .description("Read the complete message history of a thread without truncation.")
+  .description("Read a thread's conversation as a transcript, from final answers only to full tool detail.")
   .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
-  .option("--last-turn", "Return only messages assigned to the latest turn.")
+  .addOption(
+    new Option("--detail <level>", "answers: prompts and final answers; messages: without reasoning or tools; full: everything.")
+      .choices(READ_DETAILS)
+      .default("messages"),
+  )
+  .option("--turns <count>", "Return only the last <count> turns.", positiveInteger)
+  .option("--last-turn", "Return only the latest turn (same as --turns 1).")
+  .option("--first-turn", "Also return the first turn, which holds the original request.")
+  .option("--max-chars <count>", "Clip each message, tool input, and tool output to <count> characters.", positiveInteger)
   .action((options: ThreadReadCommandOptions) =>
     action(async () => {
       const context = await commandContext();
+      if (options.lastTurn && options.turns !== undefined && options.turns !== 1) {
+        throw new CliError("THREAD_FILTER_CONFLICT", "Use either --last-turn or --turns, not both.", { exitCode: 2 });
+      }
+      const turns = options.lastTurn ? 1 : options.turns;
       const result = await readThread(context.config, options.thread, {
-        lastTurn: options.lastTurn === true,
+        detail: options.detail,
+        ...(turns === undefined ? {} : { turns }),
+        ...(options.firstTurn ? { firstTurn: true } : {}),
+        ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
       });
-      const transcript = result.thread.messages
-        .map((message) => {
-          const turn = message.turnId === null ? "" : ` turn=${message.turnId}`;
-          return `[${message.role}${turn}]\n${message.text}`;
-        })
-        .join("\n\n");
+      const thread = result.thread;
+      const shown = thread.turns.filter((turn) => turn.turnId !== null).map((turn) => turn.index);
+      const range = shown.length === thread.view.totalTurns ? "all" : shown.join(", ") || "none";
       writeSuccess(
         result,
         context,
         [
-          `Thread: ${result.thread.id}`,
-          `Title: ${result.thread.title}`,
-          `Project: ${result.project?.title ?? result.thread.projectId}`,
-          ...(result.thread.messageFilter
-            ? [`Turn: ${result.thread.messageFilter.turnId ?? "none"}`]
-            : []),
-          `Messages: ${result.thread.messageCount}`,
+          `Thread: ${thread.id}`,
+          `Title: ${thread.title}`,
+          `Project: ${result.project?.title ?? thread.projectId}`,
+          `Status: ${thread.status}${thread.latestTurn ? `, latest turn ${thread.latestTurn.state}` : ""}`,
+          `View: ${thread.view.detail}, turns ${range} of ${thread.view.totalTurns}`,
           "",
-          transcript || "No messages.",
+          renderTranscript(thread) || "No messages.",
         ].join("\n"),
       );
     }),
@@ -410,6 +481,12 @@ threads
   .option("--prompt-file <path>", "Read the message from a UTF-8 file.")
   .option("--stdin", "Read the message from stdin.")
   .option("--wake-settled", "Explicitly allow this message to wake a settled thread.")
+  .option("--wait", "Wait for the turn that handles the message and print its reply.")
+  .option("--timeout <seconds>", "Stop waiting after <seconds> (default 600).", positiveInteger)
+  .addOption(
+    new Option("--detail <level>", "Reply detail: answers, messages, or full (default answers).").choices(READ_DETAILS),
+  )
+  .option("--max-chars <count>", "Clip each reply message and tool entry to <count> characters.", positiveInteger)
   .action((options: ThreadSendCommandOptions) =>
     action(async () => {
       const context = await commandContext();
@@ -419,12 +496,32 @@ threads
         prompt,
         ...(options.wakeSettled ? { wakeSettled: true } : {}),
         ...(!context.json && !options.stdin ? { confirmSettled: confirmSettledThread } : {}),
+        ...(options.wait ? { wait: waitOptions(options) } : {}),
       });
+      const sent = `Sent message ${result.message.messageId} to thread ${result.thread.id}; T3 accepted and projected the turn.`;
+      const { wait, pendingRequests, reply } = result;
       writeSuccess(
         result,
         context,
-        `Sent message ${result.message.messageId} to thread ${result.thread.id}; T3 accepted and projected the turn.`,
+        wait && pendingRequests && reply ? `${sent}\n${renderWait({ wait, pendingRequests, reply })}` : sent,
       );
+    }),
+  );
+
+threads
+  .command("wait")
+  .description("Wait until a thread's current turn finishes or needs a person, then print that turn.")
+  .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
+  .option("--timeout <seconds>", "Stop waiting after <seconds> (default 600).", positiveInteger)
+  .addOption(
+    new Option("--detail <level>", "Turn detail: answers, messages, or full (default answers).").choices(READ_DETAILS),
+  )
+  .option("--max-chars <count>", "Clip each message and tool entry to <count> characters.", positiveInteger)
+  .action((options: ThreadWaitCommandOptions) =>
+    action(async () => {
+      const context = await commandContext();
+      const result = await waitForThread(context.config, options.thread, waitOptions(options));
+      writeSuccess(result, context, `Thread: ${result.thread.id}\nTitle: ${result.thread.title}\n${renderWait(result)}`);
     }),
   );
 

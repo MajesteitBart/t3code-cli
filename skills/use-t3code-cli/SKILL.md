@@ -68,14 +68,17 @@ t3code --json threads list --cwd . --status all
 t3code --json threads inspect --thread "$TARGET_THREAD_ID"
 ```
 
-Use `read` when the full conversation is needed. It returns every projected message without truncating its text:
+Use `read` for the conversation. Without `--json` it prints a Markdown transcript grouped by turn, which is the cheapest form to read. Ask only for what the task needs:
 
 ```bash
-t3code --json threads read --thread "$TARGET_THREAD_ID"
-t3code --json threads read --thread "$TARGET_THREAD_ID" --last-turn
+t3code threads read --thread "$TARGET_THREAD_ID" --detail answers --turns 3 --first-turn
+t3code threads read --thread "$TARGET_THREAD_ID" --detail messages --last-turn
+t3code threads read --thread "$TARGET_THREAD_ID" --detail full --turns 2 --max-chars 1500
 ```
 
-Read `data.thread.messages` in chronological order. Each message retains its `turnId`; user messages that are waiting to start a turn can have a null `turnId`. Without a filter, the command requests T3's complete unwindowed thread history. `--last-turn` requests a one-turn window and keeps only messages whose `turnId` equals `data.thread.latestTurn.turnId`. It does not include activities, checkpoints, or proposed plans.
+`answers` keeps each turn's prompts and final answer. `messages`, the default, adds progress messages but leaves out reasoning summaries and tool calls. `full` adds reasoning, tool calls, changed files, and proposed plans. `--first-turn` keeps the original request when `--turns` would cut it off. `--max-chars` clips long entries at their start and end; without it, nothing is shortened.
+
+In JSON, `data.thread.messages` is in turn order and each message carries `turnIndex`. `data.thread.turns` gives each turn's state and `finalMessageId`, and `data.thread.view` says how many turns were left out. User messages have a null `turnId` in T3, so use `turnIndex` to group them.
 
 Use `--project <project-id>` instead of `--cwd` when the caller provides an exact project id. Filter with `--status active` or `--status settled` when useful. Do not select a target from its title alone because titles are not unique.
 
@@ -87,6 +90,16 @@ printf '%s' "$THREAD_MESSAGE" \
 ```
 
 Sending is an external state change. Keep the target and message within the caller's authorization. A settled thread requires interactive confirmation or `--wake-settled`; JSON and stdin workflows are non-interactive, so use that override only when waking the inspected target is authorized. Archived threads cannot receive a turn.
+
+Add `--wait` to get the reply. Give the shell call a longer timeout than `--timeout`:
+
+```bash
+printf '%s' "$THREAD_MESSAGE"   | t3code --json threads send --thread "$TARGET_THREAD_ID" --stdin --wait --timeout 540
+```
+
+Read `data.wait.outcome`. On `completed` or `interrupted`, `data.reply` holds the turn that handled the message. `needs-attention` means the thread waits for an approval or answer, listed in `data.pendingRequests`; a person must answer it in T3 Code. `error` means the provider could not start the turn, with the reason in `data.wait.error`. To wait without sending, for example after a handover, run `t3code threads wait --thread "$TARGET_THREAD_ID" --timeout 540`.
+
+The `t3thread` skill builds on these commands for `$t3thread <thread-id> <instruction>` requests.
 
 Manage lifecycle state without sending a message:
 
@@ -112,6 +125,8 @@ For existing-thread writes, require `data.verification.accepted: true`. Record `
 On `{ "ok": false }`, report `error.code`, `error.message`, and `error.cause` when present. The cause carries T3's own reason, for example why it rejected a worktree bootstrap. Read the whole envelope instead of filtering it with `grep`, and do not retry write commands blindly. Each handover attempt creates a new thread id. `THREAD_START_FAILED` already attempts to delete the newly-created thread; `error.details.cleanup` reports `deleted`, `not-created`, or `server-managed`.
 
 `THREAD_TURN_NOT_VERIFIED` or `THREAD_SETTLEMENT_NOT_VERIFIED` means dispatch returned but projection verification timed out. Do not retry automatically because the first operation may still appear later.
+
+`THREAD_WAIT_TIMEOUT` (exit code 6) after `send --wait` means the message was sent and `error.details.sent` is `true`. Never resend it; continue with `threads wait`.
 
 ## Current compatibility boundary
 
