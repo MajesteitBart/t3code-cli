@@ -522,7 +522,8 @@ export async function listThreads(config: CliConfig, options: ThreadListOptions 
       .filter((thread) => project === null || thread.projectId === project.id)
       .filter((thread) => requestedStatus === "all" || threadStatus(thread) === requestedStatus)
       .sort((left, right) => (right.updatedAt ?? "").localeCompare(left.updatedAt ?? ""))
-      .map((thread) => ({ ...thread, status: threadStatus(thread) }));
+      // The snapshot fallback carries whole transcripts; the list returns thread summaries only.
+      .map(threadSummary);
 
     return {
       runtime,

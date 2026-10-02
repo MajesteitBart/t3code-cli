@@ -61,7 +61,7 @@ function makeThread(id: string, overrides: Partial<T3Thread> = {}): T3Thread {
 
 async function testHarness(
   initialThreads: T3Thread[],
-  options: { omitCapabilities?: boolean; threadSettlement?: boolean; respond?: boolean } = {},
+  options: { omitCapabilities?: boolean; threadSettlement?: boolean; respond?: boolean; omitShell?: boolean } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "t3code-cli-threads-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
@@ -122,7 +122,7 @@ async function testHarness(
       json(response, 401, { error: "unauthorized" });
       return;
     }
-    if (request.method === "GET" && request.url === "/api/orchestration/shell") {
+    if (request.method === "GET" && request.url === "/api/orchestration/shell" && !options.omitShell) {
       json(response, 200, shell());
       return;
     }
@@ -241,6 +241,19 @@ describe("thread discovery and messaging", () => {
     expect(active.threads.map((thread) => thread.id)).toEqual(["active"]);
     expect(settled.threads.map((thread) => thread.id)).toEqual(["settled"]);
     expect(settled.filter).toMatchObject({ projectId: "project-1", status: "settled" });
+  });
+
+  it("lists thread summaries when only the full snapshot is available", async () => {
+    const harness = await testHarness(
+      [makeThread("active", { messages: [{ id: "m", role: "user", text: "secret plan", turnId: null, streaming: false, createdAt: "2026-09-04T10:00:00.000Z", updatedAt: "2026-09-04T10:00:00.000Z" }], activities: [{ kind: "tool.completed" }] })],
+      { omitShell: true },
+    );
+
+    const result = await listThreads(harness.config);
+
+    expect(result.threads.map((thread) => thread.id)).toEqual(["active"]);
+    expect(result.threads[0]).not.toHaveProperty("messages");
+    expect(result.threads[0]).not.toHaveProperty("activities");
   });
 
   it("filters by the current folder when --cwd is empty", async () => {

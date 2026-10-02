@@ -392,6 +392,34 @@ describe("T3ThreadApi.waitForTurn", () => {
     expect(paths.at(-1)).toBe("/api/orchestration/threads/thread-1");
   });
 
+  it("reports a completion it saw before a later turn replaced it", async () => {
+    const laterTurn = [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)];
+    const { adapter } = scripted([
+      thread({ latestTurn: turn("turn-1", "completed", 0, 2), session: session("ready"), messages: firstTurn }),
+      thread({ latestTurn: turn("turn-2", "running", 10, null), session: session("running"), messages: laterTurn }),
+    ]);
+
+    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
+      outcome: "completed",
+      turnIndex: 1,
+    });
+  });
+
+  it("reads the whole thread when the awaited message falls outside the poll window", async () => {
+    const whole = thread({ latestTurn: turn("turn-2", "completed", 10, 12), session: session("ready"), messages: [...firstTurn, message("prompt-2", "user", null, 10), message("answer-2", "assistant", "turn-2", 11)] });
+    // The bounded window only holds turn 2.
+    const windowed = thread({ ...whole, messages: whole.messages!.slice(2) });
+    const adapter = new T3ThreadApi(
+      mockApi({ request: async (_method, requestPath) => ({ snapshotSequence: 1, thread: requestPath.includes("turnLimit") ? windowed : whole }) }),
+      { waitIntervalMs: 0 },
+    );
+
+    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
+      outcome: "ended",
+      turnIndex: 1,
+    });
+  });
+
   it("keeps an interrupted turn interrupted after a later turn becomes the latest", async () => {
     const interrupted = { ...turn("turn-1", "completed", 0, 2), state: "interrupted" as const };
     const laterTurn = [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)];
@@ -424,7 +452,8 @@ describe("T3ThreadApi.waitForTurn", () => {
     ]);
 
     await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "completed",
+      // The wait never saw turn 1 as the latest turn, so it cannot say how turn 1 ended.
+      outcome: "ended",
       turnIndex: 1,
     });
     // Without a message, the wait reports the approval that holds up the thread.
@@ -443,7 +472,8 @@ describe("T3ThreadApi.waitForTurn", () => {
     ]);
 
     await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "completed",
+      // The wait never saw turn 1 as the latest turn, so it cannot say how turn 1 ended.
+      outcome: "ended",
       turnIndex: 1,
     });
   });

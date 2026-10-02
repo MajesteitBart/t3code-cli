@@ -83,6 +83,7 @@ Give the shell call a timeout longer than `--timeout`, such as 600 seconds, or r
 - `needs-attention`: the thread waits for an approval or an answer, listed in `data.pendingRequests`. Tell the user; they answer it in T3 Code.
 - `error`: the provider could not start the turn. Report `data.wait.error`.
 - `interrupted`: someone stopped the turn. Report what it produced.
+- `ended`: the turn finished before the wait saw how, because a later turn started right after. Read `data.reply` as for `completed`, and say its result is unconfirmed.
 
 Rules for sending:
 
