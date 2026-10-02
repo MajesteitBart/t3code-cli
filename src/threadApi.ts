@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { T3Api } from "./api.js";
 import { CliError } from "./errors.js";
-import { buildTranscript, waitsForPerson } from "./transcript.js";
+import { buildTranscript, pendingRequests, QUEUED_TURN_GRACE_MS } from "./transcript.js";
 import type {
   InteractionMode,
+  ModelSelection,
   OrchestrationSnapshot,
   RuntimeMode,
   T3LatestTurn,
@@ -17,6 +18,8 @@ import type {
 const DEFAULT_VERIFICATION_TIMEOUT_MS = 5_000;
 const DEFAULT_VERIFICATION_INTERVAL_MS = 100;
 const DEFAULT_WAIT_INTERVAL_MS = 2_000;
+/** Claude needs up to three seconds to stop a turn, and a session restart takes a few more. */
+const DEFAULT_CONTROL_TIMEOUT_MS = 30_000;
 
 export interface ThreadCatalog {
   snapshotSequence: number;
@@ -35,6 +38,11 @@ export interface ExistingThreadTurnCommand {
     text: string;
     attachments: [];
   };
+  /**
+   * T3 applies a thread's model, effort, and speed to a live session only through the turn, so every
+   * turn carries the selection, as T3 Code's composer does.
+   */
+  modelSelection?: ModelSelection;
   runtimeMode: RuntimeMode;
   interactionMode: InteractionMode;
   createdAt: string;
@@ -88,6 +96,9 @@ interface T3ThreadApiOptions {
   verificationTimeoutMs?: number;
   verificationIntervalMs?: number;
   waitIntervalMs?: number;
+  queueGraceMs?: number;
+  /** How long to wait for an interrupt or a session restart to show. */
+  controlTimeoutMs?: number;
 }
 
 function asSnapshot(value: unknown): OrchestrationSnapshot {
@@ -197,6 +208,10 @@ interface TurnObservation {
   outcome: TurnWaitOutcome;
   turnIndex: number | null;
   error?: string;
+  /** The turn holds a message sent while it ran, which a queued turn may still claim. */
+  mayBeQueued?: boolean;
+  /** A request holds up the running turn, so nothing changes until a person answers. */
+  blocked?: boolean;
 }
 
 /** T3 accepts a turn before the provider starts it; a start failure arrives later as an activity. */
@@ -226,17 +241,20 @@ function observeTurn(
     const failure = turnStartFailure(thread, messageId);
     if (failure) return { outcome: "error", turnIndex: null, error: failure };
   }
-  const needsAttention = { outcome: "needs-attention" as const, turnIndex: latest?.index ?? null };
+  // A blocking approval or question holds up the running turn, and any message still waiting on it.
+  const requests = pendingRequests(thread);
+  const blocked = requests.some((request) => request.blocking);
+  const needsAttention = { outcome: "needs-attention" as const, turnIndex: latest?.index ?? null, blocked: true };
   let turn = latest;
   if (messageId !== undefined) {
     const owner = transcript.messages.find((message) => message.id === messageId);
     turn = owner ? (transcript.turns.find((candidate) => candidate.index === owner.turnIndex) ?? null) : null;
     // A request raised in a later turn does not hold up a message whose own turn already ended.
     const ownTurnEnded = turn?.turnId != null && thread.latestTurn?.turnId !== turn.turnId;
-    if (!ownTurnEnded && waitsForPerson(thread)) return needsAttention;
+    if (!ownTurnEnded && blocked) return needsAttention;
     if (turn?.turnId == null) return null;
   } else {
-    if (waitsForPerson(thread)) return needsAttention;
+    if (blocked) return needsAttention;
     const pendingTurn = transcript.turns.find((candidate) => candidate.turnId === null);
     if (pendingTurn) {
       // Queued messages will start another turn, unless the provider already refused every one of them.
@@ -255,12 +273,23 @@ function observeTurn(
   const busy = thread.latestTurn?.state === "running" || session === "starting" || session === "running";
   if (busy && (messageId === undefined || thread.latestTurn?.turnId === turn?.turnId)) return null;
   if (!turn) return { outcome: "idle", turnIndex: null };
-  // T3 reports only the latest turn's state; an earlier turn keeps the state seen while it was latest.
   // Only a state seen while the turn was latest counts; a remembered "running" says nothing about its end.
   const remembered = turn.turnId === null ? undefined : knownStates.get(turn.turnId);
   const state = thread.latestTurn?.turnId === turn.turnId ? turn.state : remembered === "running" ? undefined : remembered;
-  const outcome = state === "completed" || state === "interrupted" || state === "error" ? state : "ended";
-  return { outcome, turnIndex: turn.index };
+  // A turn that ended by asking a message-mode question waits for a person too.
+  const askedBack = requests.some((request) => request.responseMode === "message" && request.turnId === turn.turnId);
+  const outcome = askedBack
+    ? "needs-attention"
+    : state === "completed" || state === "interrupted" || state === "error"
+      ? state
+      : "ended";
+  const turnStart = turn.startedAt;
+  const mayBeQueued =
+    turnStart !== null &&
+    transcript.messages.some(
+      (message) => message.turnIndex === turn.index && message.role === "user" && message.createdAt > turnStart,
+    );
+  return { outcome, turnIndex: turn.index, ...(mayBeQueued ? { mayBeQueued } : {}) };
 }
 
 export class T3ThreadApi {
@@ -268,6 +297,8 @@ export class T3ThreadApi {
   private readonly verificationIntervalMs: number;
 
   private readonly waitIntervalMs: number;
+  private readonly queueGraceMs: number;
+  readonly controlTimeoutMs: number;
 
   constructor(
     private readonly api: T3Api,
@@ -276,16 +307,19 @@ export class T3ThreadApi {
     this.verificationTimeoutMs = options.verificationTimeoutMs ?? DEFAULT_VERIFICATION_TIMEOUT_MS;
     this.verificationIntervalMs = options.verificationIntervalMs ?? DEFAULT_VERIFICATION_INTERVAL_MS;
     this.waitIntervalMs = options.waitIntervalMs ?? DEFAULT_WAIT_INTERVAL_MS;
+    this.queueGraceMs = options.queueGraceMs ?? QUEUED_TURN_GRACE_MS;
+    this.controlTimeoutMs = options.controlTimeoutMs ?? DEFAULT_CONTROL_TIMEOUT_MS;
   }
 
   /**
    * Polls until the awaited turn finishes or the thread needs a person. A finished state must hold on
-   * two consecutive polls: Codex starts a queued turn only after the running one completes.
+   * two consecutive polls, and longer when the turn holds a message sent while it ran: a provider that
+   * queued that message starts its own turn right after the running one completes.
    */
   async waitForTurn(threadId: string, options: { messageId?: string; timeoutMs: number }): Promise<TurnWaitResult> {
     const startedAt = Date.now();
     const deadline = startedAt + options.timeoutMs;
-    let candidate: (TurnObservation & { snapshotSequence: number }) | null = null;
+    let candidate: (TurnObservation & { since: number }) | null = null;
     let last: { snapshotSequence: number; thread: T3Thread } | null = null;
     const knownStates = new Map<string, T3LatestTurn["state"]>();
     for (;;) {
@@ -306,27 +340,34 @@ export class T3ThreadApi {
       if (read) {
         last = read;
         if (read.thread.latestTurn) knownStates.set(read.thread.latestTurn.turnId, read.thread.latestTurn.state);
-        const previous = candidate as (TurnObservation & { snapshotSequence: number }) | null;
+        const previous = candidate as (TurnObservation & { since: number }) | null;
         const observed = observeTurn(read.thread, options.messageId, knownStates);
-        const final = observed?.outcome === "needs-attention" || observed?.error !== undefined;
-        const confirmed: boolean =
+        // A blocking request or a failed start cannot change by itself. A question the turn ended with
+        // still waits out a queue window, because a queued turn may yet claim the awaited message.
+        const final = observed?.blocked === true || observed?.error !== undefined;
+        const repeated: boolean =
+          previous !== null &&
           observed !== null &&
-          (final || (previous?.outcome === observed.outcome && previous.turnIndex === observed.turnIndex));
+          previous.outcome === observed.outcome &&
+          previous.turnIndex === observed.turnIndex;
+        const quiet = !observed?.mayBeQueued || (previous !== null && Date.now() - previous.since >= this.queueGraceMs);
+        const confirmed: boolean = observed !== null && (final || (repeated && quiet));
         const full: { snapshotSequence: number; thread: T3Thread } | null =
           observed && confirmed ? await beforeDeadline(this.read(threadId).catch(() => null), deadline) : null;
         // Turn numbers and the reply come from the whole thread, which must still show the same outcome.
-        const settled: TurnObservation | null = full ? observeTurn(full.thread, options.messageId, knownStates) : null;
-        if (full && settled && settled.outcome === observed?.outcome) {
+        const whole: TurnObservation | null = full ? observeTurn(full.thread, options.messageId, knownStates) : null;
+        if (full && whole && whole.outcome === observed?.outcome) {
           return {
-            outcome: settled.outcome,
+            outcome: whole.outcome,
             snapshotSequence: full.snapshotSequence,
             thread: full.thread,
-            turnIndex: settled.turnIndex,
+            turnIndex: whole.turnIndex,
             waitedMs: Date.now() - startedAt,
-            ...(settled.error === undefined ? {} : { error: settled.error }),
+            ...(whole.error === undefined ? {} : { error: whole.error }),
           };
         }
-        candidate = observed && !full ? { ...observed, snapshotSequence: read.snapshotSequence } : null;
+        const since: number = repeated && previous ? previous.since : Date.now();
+        candidate = observed && !full ? { ...observed, since } : null;
       }
       if (Date.now() >= deadline) break;
       await sleep(Math.min(this.waitIntervalMs, Math.max(0, deadline - Date.now())));
@@ -385,6 +426,7 @@ export class T3ThreadApi {
 
   buildTurnStart(thread: T3Thread, prompt: string): ExistingThreadTurnCommand {
     const { runtimeMode, interactionMode } = requireTurnSettings(thread);
+    const modelSelection = thread.modelSelection;
     return {
       type: "thread.turn.start",
       commandId: randomUUID(),
@@ -395,10 +437,46 @@ export class T3ThreadApi {
         text: prompt,
         attachments: [],
       },
+      ...(modelSelection ? { modelSelection } : {}),
       runtimeMode,
       interactionMode,
       createdAt: new Date().toISOString(),
     };
+  }
+
+  /** Dispatches a control command. T3 reports a command its decider rejects only as an opaque HTTP 500. */
+  async dispatchControl(command: { type: string; threadId: string }): Promise<unknown> {
+    try {
+      return await this.api.dispatch(command);
+    } catch (cause) {
+      const status = cause instanceof CliError ? (cause.details as { status?: unknown } | undefined)?.status : undefined;
+      if (!(cause instanceof CliError) || cause.code !== "T3_API_ERROR" || status !== 500) throw cause;
+      throw new CliError(
+        "THREAD_COMMAND_REJECTED",
+        `T3 rejected ${command.type} for thread ${command.threadId}. T3 logs the reason on the server.`,
+        { exitCode: 4, cause, details: { type: command.type, threadId: command.threadId } },
+      );
+    }
+  }
+
+  /** Reads the thread until `check` returns a value; returns null with the last thread on timeout. */
+  async poll<T>(
+    threadId: string,
+    check: (thread: T3Thread) => T | null,
+    timeoutMs = this.verificationTimeoutMs,
+  ): Promise<{ value: T | null; thread: T3Thread | null }> {
+    const deadline = Date.now() + timeoutMs;
+    let last: T3Thread | null = null;
+    do {
+      const read = await this.read(threadId).catch(() => null);
+      if (read) {
+        last = read.thread;
+        const value = check(read.thread);
+        if (value !== null) return { value, thread: read.thread };
+      }
+      await sleep(this.verificationIntervalMs);
+    } while (Date.now() < deadline);
+    return { value: null, thread: last };
   }
 
   buildSettlement(threadId: string, state: ThreadSettlementState): ThreadSettlementCommand {

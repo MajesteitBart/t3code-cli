@@ -1,4 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { once } from "node:events";
+import { readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -103,6 +105,30 @@ describe("CLI parsing", () => {
     });
   });
 
+  it("rejects thread control requests that are incomplete before contacting T3", async () => {
+    const missingConfig = path.join(built.directory, "missing-config.json");
+    const offline = (args) => run(["--json", "--config", missingConfig, ...args]);
+
+    const noSettings = await offline(["threads", "set", "--thread", "thread-1"]);
+    expect(noSettings.code).toBe(2);
+    expect(JSON.parse(noSettings.stderr).error.code).toBe("THREAD_SETTINGS_REQUIRED");
+
+    const badOption = await offline(["threads", "set", "--thread", "thread-1", "--option", "contextWindow"]);
+    expect(badOption.code).toBe(2);
+    expect(JSON.parse(badOption.stderr).error).toEqual({
+      code: "INVALID_MODEL_OPTION",
+      message: "Write model options as id=value, not contextWindow.",
+    });
+
+    const noAnswer = await offline(["threads", "answer", "--thread", "thread-1"]);
+    expect(noAnswer.code).toBe(2);
+    expect(JSON.parse(noAnswer.stderr).error.code).toBe("ANSWER_REQUIRED");
+
+    const badScope = await offline(["threads", "approve", "--thread", "thread-1", "--scope", "forever"]);
+    expect(badScope.code).toBe(2);
+    expect(JSON.parse(badScope.stderr).error.code).toBe("INVALID_USAGE");
+  });
+
   it("keeps human-readable usage errors", async () => {
     const result = await run(["threads", "inspect"]);
 
@@ -135,5 +161,49 @@ describe("CLI parsing", () => {
         message: "Use exactly one of --prompt, --prompt-file, or --stdin.",
       },
     });
+  });
+});
+
+describe("thread inspection against a T3 server", () => {
+  it("describes a model whose options T3 stores as an object map", async () => {
+    const thread = {
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Legacy options",
+      archivedAt: null,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      modelSelection: { instanceId: "codex", model: "gpt-x", options: { reasoningEffort: "high" } },
+      messages: [],
+      activities: [],
+    };
+    const server = createServer((request, response) => {
+      const send = (value) => response.end(JSON.stringify(value));
+      if (request.url === "/.well-known/t3/environment") return send({ environmentId: "test", serverVersion: "test" });
+      if (request.url?.startsWith("/api/orchestration/threads/thread-1")) return send({ snapshotSequence: 1, thread });
+      if (request.url === "/api/orchestration/shell") return send({ snapshotSequence: 1, projects: [], threads: [thread] });
+      response.statusCode = 404;
+      response.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const authScript = path.join(built.directory, "inspect-auth.mjs");
+    await writeFile(authScript, "if (process.argv.includes('issue')) console.log(JSON.stringify({ sessionId: 's', token: 't' }));\n");
+    const config = path.join(built.directory, "inspect-config.json");
+    await writeFile(config, JSON.stringify({
+      origin: `http://127.0.0.1:${server.address().port}`,
+      t3Home: built.directory,
+      t3Command: [process.execPath, authScript],
+    }));
+    try {
+      const result = await run(["--config", config, "threads", "inspect", "--thread", "thread-1"]);
+
+      expect(result.stderr).toBe("");
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("Model: codex/gpt-x (reasoningEffort=high)");
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
   });
 });

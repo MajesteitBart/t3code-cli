@@ -5,24 +5,32 @@ import path from "node:path";
 import { withT3Api, type T3Api } from "./api.js";
 import { CliError } from "./errors.js";
 import { readLocalProjects } from "./localProjects.js";
+import { applyModelOverrides } from "./modelSelection.js";
 import { openThread } from "./open.js";
 import { discoverRuntime } from "./runtime.js";
-import { T3ThreadApi, type ThreadSettlementState, type TurnWaitResult } from "./threadApi.js";
+import { T3ThreadApi, type ThreadSettlementState } from "./threadApi.js";
 import {
-  buildTranscript,
-  pendingRequests,
-  queuedMessages,
-  selectTurn,
-  type ReadDetail,
-  type TranscriptOptions,
-} from "./transcript.js";
+  changeSettingsWithApi,
+  hasSettingsChange,
+  settingsSummary,
+  type ThreadSettingsChange,
+} from "./threadControls.js";
+import {
+  configForWait,
+  projectById,
+  requireThreadId,
+  threadStatus,
+  waitView,
+  type ThreadLifecycleStatus,
+  type ThreadWaitOptions,
+} from "./threadSupport.js";
+import { buildTranscript, pendingRequests, queuedMessages, type TranscriptOptions } from "./transcript.js";
 import type {
   CliConfig,
   EffectiveThreadEnvMode,
   InteractionMode,
   ModelSelection,
   OpenMode,
-  ProviderOptionSelection,
   ProjectPolicy,
   RuntimeMode,
   SpeedMode,
@@ -60,17 +68,12 @@ export interface ThreadCreateOptions extends WorkspaceOptions {
   dryRun?: boolean;
 }
 
-export type ThreadListStatus = "active" | "settled" | "all";
+export type ThreadListStatus = ThreadLifecycleStatus | "all";
+export type { ThreadWaitOptions, ThreadWaitView } from "./threadSupport.js";
 
 export interface ThreadListOptions extends WorkspaceOptions {
   project?: string;
   status?: ThreadListStatus;
-}
-
-export interface ThreadWaitOptions {
-  timeoutMs: number;
-  detail?: ReadDetail;
-  maxChars?: number;
 }
 
 export interface ThreadSendOptions {
@@ -80,6 +83,8 @@ export interface ThreadSendOptions {
   confirmSettled?: (thread: T3Thread, project: T3Project | null) => Promise<boolean>;
   /** Wait for the turn that handles the message and return its reply. */
   wait?: ThreadWaitOptions;
+  /** Change the thread's model, effort, speed, or modes before the message starts its turn. */
+  settings?: ThreadSettingsChange;
 }
 
 interface EffectiveT3Settings {
@@ -160,27 +165,6 @@ function activeProjects(projects: readonly T3Project[]): T3Project[] {
 
 function nonArchivedThread(thread: T3Thread): boolean {
   return thread.archivedAt == null && thread.deletedAt == null;
-}
-
-function threadStatus(thread: T3Thread): Exclude<ThreadListStatus, "all"> {
-  return thread.settledAt == null ? "active" : "settled";
-}
-
-function requireThreadId(value: string): string {
-  const threadId = value.trim();
-  if (!threadId) {
-    throw new CliError("THREAD_ID_REQUIRED", "A non-empty thread id is required.", { exitCode: 2 });
-  }
-  return threadId;
-}
-
-/** Prefers the read-only local projection over downloading the shell snapshot of every thread. */
-async function projectById(api: T3Api, projectId: string): Promise<T3Project | null> {
-  const local = readLocalProjects(api.runtime)?.find((project) => project.id === projectId);
-  if (local) return local;
-  const snapshot = await api.shellSnapshot().catch(() => api.snapshot().catch(() => null));
-  const projects = snapshot && Array.isArray(snapshot.projects) ? snapshot.projects : [];
-  return projects.find((candidate) => candidate.id === projectId) ?? null;
 }
 
 function threadSummary(thread: T3Thread) {
@@ -293,81 +277,21 @@ function supportsWorktreeBootstrap(version: string): boolean {
   return versionAtLeast(version, MINIMUM_WORKTREE_BOOTSTRAP_VERSION);
 }
 
-function nonEmptyOption(value: string | undefined, name: string): string | undefined {
-  if (value === undefined) return undefined;
-  const trimmed = value.trim();
-  if (!trimmed) throw new CliError("INVALID_THREAD_OPTION", `${name} must be a non-empty string.`);
-  return trimmed;
-}
-
-function normalizeProviderOptions(options: unknown): ProviderOptionSelection[] {
-  if (Array.isArray(options)) {
-    return options.flatMap((entry) => {
-      if (entry === null || typeof entry !== "object") return [];
-      const candidate = entry as Record<string, unknown>;
-      const id = typeof candidate.id === "string" ? candidate.id.trim() : "";
-      const value = candidate.value;
-      return id && (typeof value === "string" || typeof value === "boolean") ? [{ id, value }] : [];
-    });
-  }
-  if (options !== null && typeof options === "object") {
-    return Object.entries(options).flatMap(([id, value]) =>
-      id.trim() && (typeof value === "string" || typeof value === "boolean") ? [{ id: id.trim(), value }] : [],
-    );
-  }
-  return [];
-}
-
-function setProviderOption(
-  selections: ProviderOptionSelection[],
-  id: string,
-  value: string | boolean,
-): void {
-  const existing = selections.find((selection) => selection.id === id);
-  if (existing) existing.value = value;
-  else selections.push({ id, value });
-}
-
 function resolveModelSelection(
   base: ModelSelection,
   config: CliConfig,
   options: ThreadCreateOptions,
 ): ModelSelection {
-  const provider = nonEmptyOption(options.provider ?? config.provider, "provider");
-  const requestedModel = nonEmptyOption(options.model ?? config.model, "model");
-  const thinkingEffort = nonEmptyOption(
-    options.thinkingEffort ?? config.thinkingEffort,
-    "thinking effort",
+  return applyModelOverrides(
+    base,
+    {
+      provider: options.provider ?? config.provider,
+      model: options.model ?? config.model,
+      speedMode: options.speedMode ?? config.speedMode,
+      thinkingEffort: options.thinkingEffort ?? config.thinkingEffort,
+    },
+    "project default",
   );
-  const instanceId = provider ?? base.instanceId;
-  if (provider !== undefined && provider !== base.instanceId && requestedModel === undefined) {
-    throw new CliError(
-      "MODEL_REQUIRED_FOR_PROVIDER",
-      `Provider instance ${provider} differs from the project default; select its model with --model.`,
-      { details: { provider, projectProvider: base.instanceId } },
-    );
-  }
-  const model = requestedModel ?? base.model;
-  const selectionChanged = instanceId !== base.instanceId || model !== base.model;
-  const selections = selectionChanged ? [] : normalizeProviderOptions(base.options);
-  const speedMode = options.speedMode ?? config.speedMode;
-
-  if (speedMode !== undefined) {
-    setProviderOption(selections, "serviceTier", speedMode === "fast" ? "fast" : "default");
-    setProviderOption(selections, "fastMode", speedMode === "fast");
-  }
-  if (thinkingEffort !== undefined) {
-    // T3 provider drivers use different descriptor ids for the same user-facing control.
-    setProviderOption(selections, "reasoningEffort", thinkingEffort);
-    setProviderOption(selections, "effort", thinkingEffort);
-    setProviderOption(selections, "reasoning", thinkingEffort);
-  }
-
-  return {
-    instanceId,
-    model,
-    ...(selections.length > 0 ? { options: selections } : {}),
-  };
 }
 
 function buildProjectCreateCommand(
@@ -610,7 +534,11 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
       }
     }
 
-    const command = adapter.buildTurnStart(thread, prompt);
+    const settings = hasSettingsChange(options.settings)
+      ? await changeSettingsWithApi(api, adapter, thread, options.settings)
+      : null;
+    // The settings change leaves the new selection on the thread, and the turn carries it to the session.
+    const command = adapter.buildTurnStart(settings?.thread ?? thread, prompt);
     const sent = await adapter.dispatchTurn(command);
     const messageId = command.message.messageId;
     const waited = options.wait
@@ -637,10 +565,12 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
         messageId,
         textLength: command.message.text.length,
       },
+      ...(settings ? { settings: { ...settingsSummary(settings.plan), sessionRestarted: settings.sessionRestarted, commands: settings.plan.commands, dispatches: settings.dispatches } } : {}),
       command: {
         type: command.type,
         commandId: command.commandId,
         threadId: command.threadId,
+        ...(command.modelSelection ? { modelSelection: command.modelSelection } : {}),
         runtimeMode: command.runtimeMode,
         interactionMode: command.interactionMode,
         createdAt: command.createdAt,
@@ -650,31 +580,6 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
       ...(waited && options.wait ? waitView(waited, options.wait, [messageId]) : {}),
     };
   });
-}
-
-/** Issues a session that outlives the wait; `withT3Api` still revokes it when the command ends. */
-function configForWait(config: CliConfig, wait: ThreadWaitOptions | undefined): CliConfig {
-  return wait ? { ...config, sessionTtl: `${Math.ceil(wait.timeoutMs / 60_000) + 2}m` } : config;
-}
-
-export type ThreadWaitView = ReturnType<typeof waitView>;
-
-function waitView(waited: TurnWaitResult, options: ThreadWaitOptions, omitMessageIds: readonly string[] = []) {
-  const transcript = buildTranscript(waited.thread, {
-    detail: options.detail ?? "answers",
-    ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
-  });
-  return {
-    wait: {
-      outcome: waited.outcome,
-      turnIndex: waited.turnIndex,
-      waitedMs: waited.waitedMs,
-      statusAfter: threadStatus(waited.thread),
-      ...(waited.error === undefined ? {} : { error: waited.error }),
-    },
-    pendingRequests: pendingRequests(waited.thread),
-    reply: selectTurn(transcript, waited.turnIndex, omitMessageIds),
-  };
 }
 
 export async function waitForThread(config: CliConfig, rawThreadId: string, options: ThreadWaitOptions) {

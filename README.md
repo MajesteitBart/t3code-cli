@@ -128,11 +128,13 @@ t3code --json threads read --thread <thread-id>
 
 - `answers`: the user's prompts and the turn's final answer.
 - `messages` (default): prompts and every assistant message, without reasoning summaries or tool calls.
-- `full`: everything, including reasoning summaries, tool calls, changed files, and proposed plans.
+- `full`: everything, including reasoning summaries, tool calls, and changed files.
+
+A plan-mode turn's proposed plan is its answer, so it appears at every level.
 
 `--turns <n>` keeps the last n turns, and `--last-turn` is short for `--turns 1`. `--first-turn` adds the first turn, which holds the original request. `--max-chars <n>` clips each message and tool entry but keeps its start and end. Without it, message text is never shortened.
 
-T3 stores user messages without a turn id. The CLI assigns each one to the turn it started, so a prompt stays with its answer. A message sent during a running turn stays with that turn when the provider folds it in, as Claude does. When the provider queues it instead, as Codex does, it waits as pending until its own turn starts. The CLI tells the two apart by the thread's provider. Messages that no turn has picked up yet appear as a pending group.
+T3 stores user messages without a turn id. The CLI assigns each one to the turn it started, so a prompt stays with its answer. A message sent during a running turn stays with that turn, because providers usually fold it in. A provider can also queue it and start a new turn right after; a turn that starts within five seconds of the previous one ending, without a prompt of its own, takes the message. Messages that no turn has picked up yet appear as a pending group.
 
 The JSON result keeps `data.thread.messages` in turn order and adds `turnIndex` and `textTruncated` to each message. `data.thread.turns` describes each returned turn: its number, state, final message id, and, in `full` detail, its changed files and tool call count. T3 reports the state of the latest turn only, so earlier turns have a `null` state. `data.thread.view` reports the detail level and how many turns were returned or left out. `full` also returns `data.thread.toolCalls` and `data.thread.proposedPlans`. T3 shortens tool output to its first line and keeps at most 500 activities per thread, so very long threads lose their oldest tool calls. Changed files come from T3's checkpoint diff of the workspace, so they include any other edits made there during the turn.
 
@@ -166,7 +168,7 @@ printf '%s' "Which tests still fail?" \
 - `error`: the provider could not start the turn; `data.wait.error` says why.
 - `needs-attention`: the thread waits for an approval or an answer, listed in `data.pendingRequests`.
 
-The reply uses `--detail answers` unless you pass another level. A finished turn must show on two consecutive polls, two seconds apart, so a Codex turn queued behind a running one is not mistaken for the reply. When the wait times out, the command fails with `THREAD_WAIT_TIMEOUT` and `error.details.sent: true`. Do not resend the message; keep waiting with `threads wait`.
+The reply uses `--detail answers` unless you pass another level. A finished turn must show on two consecutive polls, two seconds apart. When your message reached the thread mid-turn, the wait also gives a queued turn five seconds to start, so the running turn's answer is not mistaken for the reply. When the wait times out, the command fails with `THREAD_WAIT_TIMEOUT` and `error.details.sent: true`. Do not resend the message; keep waiting with `threads wait`.
 
 To wait for whatever a thread is doing, for example after a handover:
 
@@ -175,6 +177,50 @@ t3code threads wait --thread <thread-id> --timeout 540
 ```
 
 Both waits default to 600 seconds. A waiting command issues its T3 session for the timeout plus two minutes, and revokes it when it ends.
+
+### Change a thread's model and modes
+
+`threads set` changes an existing thread's settings without sending a message. `threads send` takes the same flags and applies them before the message's turn starts:
+
+```bash
+t3code threads set --thread <thread-id> --thinking-effort xhigh --speed fast
+t3code threads set --thread <thread-id> --model gpt-6-astra --mode plan
+t3code threads set --thread <thread-id> --option contextWindow=1m --dry-run
+printf '%s' "Continue with the migration." \
+  | t3code threads send --thread <thread-id> --stdin --model claude-opus-5-5 --thinking-effort max
+```
+
+`--thinking-effort` and `--speed` set whichever option the model uses for them:
+
+- Codex: `reasoningEffort`, and `serviceTier`, where fast is `priority`.
+- Claude: `effort` and `fastMode`. Only Opus models have fast mode.
+- Grok: `reasoningEffort`. OpenCode: `variant`.
+
+`--option id=value` sets any other model option, such as Claude's `contextWindow`. The CLI checks every value against T3's model catalog, which `t3code models list` prints. When the model changes, settings the new model supports carry over and the rest are dropped. A T3 server without the catalog gets every effort alias, unchecked.
+
+`--permission` and `--mode build|plan` change the thread's permission and plan mode. A permission change restarts a live provider session, so the CLI refuses it while a turn runs. `send` with new settings also waits for an idle thread, because a message sent mid-turn can join the running turn and keep its old settings. T3 keeps a started conversation on its provider, so `--provider` only switches between instances of the same driver that share resume state; hand the work over to a new thread to use another provider. Every turn the CLI sends carries the thread's model selection, because that is how T3 applies a change to a live session.
+
+### Interrupt, approve, and answer
+
+```bash
+t3code threads interrupt --thread <thread-id>
+t3code threads approve --thread <thread-id> --scope session --wait
+t3code threads decline --thread <thread-id> --cancel
+t3code threads answer --thread <thread-id> --answer "Keep a Changelog" --wait
+t3code threads answer --thread <thread-id> --answer 1=main --answer 2=lint
+t3code threads answer --thread <thread-id> --dismiss
+```
+
+`inspect` and `wait` list the approvals and questions a thread waits for, with their request ids. With one pending request the commands pick it; with several, pass `--request <request-id>`.
+
+- `interrupt` stops the running turn. It refuses an idle thread, because interrupting Claude stops its whole session.
+- `approve` accepts once by default. `--scope session` keeps the approval for the rest of the session. `--scope always` works only when the request offers it; Claude treats it as a denial otherwise.
+- `decline` denies the request and lets the agent continue. With `--cancel`, Codex also stops the turn.
+- `answer` matches each answer to the question's options by label or value, and otherwise sends it as free text when the question allows that. Prefix answers with the question number when a request asks several. Codex can ask questions that outlive their turn: answering one starts a new turn, which `--wait` follows, and `--dismiss` closes it without an answer.
+
+Each command waits until T3 shows the provider's response. With `--wait`, it then waits for the turn to finish or stop again, like `send --wait`. If that wait times out, the error carries `responded: true`: the response already went through, so do not send it again.
+
+### Settle or reopen
 
 Manage settlement explicitly without starting a new turn:
 
@@ -229,6 +275,11 @@ t3code threads inspect --thread <thread-id>
 t3code threads read --thread <thread-id> --detail answers --turns 3
 t3code threads send --thread <thread-id> --stdin --wait
 t3code threads wait --thread <thread-id>
+t3code threads set --thread <thread-id> --thinking-effort high --speed fast
+t3code threads interrupt --thread <thread-id>
+t3code threads approve|decline --thread <thread-id>
+t3code threads answer --thread <thread-id> --answer <answer>
+t3code models list
 t3code threads settle --thread <thread-id>
 t3code threads unsettle --thread <thread-id>
 t3code threads create --stdin
@@ -251,7 +302,7 @@ Responses are still buffered in memory, so available memory limits the largest r
 The package ships two skills for coding agents in `skills/`:
 
 - `use-t3code-cli` covers setup, handovers, and the full command set.
-- `t3thread` points an agent at an existing thread: `$t3thread <thread-id> <what to do>`. The agent inspects the thread and reads only as much as the instruction needs. It can brief you on the thread, answer questions about it, continue or review its work, or message it and wait for the reply.
+- `t3thread` points an agent at an existing thread: `$t3thread <thread-id> <what to do>`. The agent inspects the thread and reads only as much as the instruction needs. It can brief you on the thread, answer questions about it, continue or review its work, or message it and wait for the reply. When you ask, it also changes the thread's model, effort, or mode, stops a running turn, and answers the thread's approvals and questions.
 
 Copy or link a skill folder into your agent's skills directory, such as `~/.claude/skills/` for Claude Code or `~/.agents/skills/` for Codex. A global npm install keeps them in `$(npm root -g)/@bvdm/t3code-cli/skills`.
 
