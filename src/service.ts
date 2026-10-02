@@ -484,7 +484,9 @@ export async function listThreads(config: CliConfig, options: ThreadListOptions 
       exitCode: 2,
     });
   }
-  if (requestedProjectId && options.cwd) {
+  // An empty --cwd, such as an unset variable, still filters: like other commands, it means the current folder.
+  const filtersByWorkspace = options.cwd !== undefined;
+  if (requestedProjectId && filtersByWorkspace) {
     throw new CliError("THREAD_FILTER_CONFLICT", "Use either --project or --cwd, not both.", {
       exitCode: 2,
     });
@@ -498,12 +500,12 @@ export async function listThreads(config: CliConfig, options: ThreadListOptions 
 
     if (requestedProjectId) {
       project = projects.find((candidate) => candidate.id === requestedProjectId) ?? null;
-    } else if (options.cwd) {
-      workspace = await resolveWorkspace(options.cwd, options.workspaceMode ?? config.workspaceMode);
+    } else if (filtersByWorkspace) {
+      workspace = await resolveWorkspace(options.cwd || process.cwd(), options.workspaceMode ?? config.workspaceMode);
       project = projectForWorkspace(projects, workspace);
     }
 
-    if ((requestedProjectId || options.cwd) && !project) {
+    if ((requestedProjectId || filtersByWorkspace) && !project) {
       throw new CliError(
         "PROJECT_NOT_FOUND",
         requestedProjectId

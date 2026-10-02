@@ -280,13 +280,17 @@ describe("T3ThreadApi.waitForTurn", () => {
   /** Serves the given thread states in order and repeats the last one. */
   function scripted(states: T3Thread[]) {
     let reads = 0;
+    const paths: string[] = [];
     const adapter = new T3ThreadApi(
       mockApi({
-        request: async () => ({ snapshotSequence: reads, thread: states[Math.min(reads++, states.length - 1)]! }),
+        request: async (_method, requestPath) => {
+          paths.push(requestPath);
+          return { snapshotSequence: reads, thread: states[Math.min(reads++, states.length - 1)]! };
+        },
       }),
       { waitIntervalMs: 0 },
     );
-    return { adapter, reads: () => reads };
+    return { adapter, reads: () => reads, paths };
   }
 
   it("waits for the turn that handles the sent message and confirms it finished", async () => {
@@ -308,7 +312,8 @@ describe("T3ThreadApi.waitForTurn", () => {
     const result = await adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 });
 
     expect(result).toMatchObject({ outcome: "completed", turnIndex: 2 });
-    expect(reads()).toBe(4);
+    // Four bounded polls, then one read of the whole thread.
+    expect(reads()).toBe(5);
   });
 
   it("keeps waiting while a queued Codex turn has not started yet", async () => {
@@ -375,6 +380,35 @@ describe("T3ThreadApi.waitForTurn", () => {
     });
   });
 
+  it("polls a bounded window and reads the whole thread once at the end", async () => {
+    const { adapter, paths } = scripted([
+      thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: firstTurn }),
+      thread({ latestTurn: turn("turn-1", "completed", 0, 2), session: session("ready"), messages: firstTurn }),
+    ]);
+
+    await adapter.waitForTurn("thread-1", { timeoutMs: 1_000 });
+
+    expect(paths.slice(0, -1).every((requestPath) => requestPath.endsWith("?turnLimit=10"))).toBe(true);
+    expect(paths.at(-1)).toBe("/api/orchestration/threads/thread-1");
+  });
+
+  it("returns a message's own turn while a later turn runs", async () => {
+    // Turn 1 answered prompt-1 and completed; turn 2 runs for a later prompt.
+    const { adapter } = scripted([
+      thread({
+        latestTurn: turn("turn-2", "running", 10, null),
+        session: session("running"),
+        checkpoints: [{ turnId: "turn-1", completedAt: at(2) }],
+        messages: [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)],
+      }),
+    ]);
+
+    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
+      outcome: "completed",
+      turnIndex: 1,
+    });
+  });
+
   it("reports a provider that could not start the turn", async () => {
     const { adapter } = scripted([
       thread({
@@ -405,7 +439,7 @@ describe("T3ThreadApi.waitForTurn", () => {
       outcome: "needs-attention",
       turnIndex: 1,
     });
-    expect(reads()).toBe(1);
+    expect(reads()).toBe(2);
   });
 
   it("notices an approval request in the running turn without T3's pending flags", async () => {
