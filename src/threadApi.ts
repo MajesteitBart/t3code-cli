@@ -210,15 +210,17 @@ function observeTurn(
     const failure = turnStartFailure(thread, messageId);
     if (failure) return { outcome: "error", turnIndex: null, error: failure };
   }
-  if (waitsForPerson(thread)) {
-    return { outcome: "needs-attention", turnIndex: latest?.index ?? null };
-  }
+  const needsAttention = { outcome: "needs-attention" as const, turnIndex: latest?.index ?? null };
   let turn = latest;
   if (messageId !== undefined) {
     const owner = transcript.messages.find((message) => message.id === messageId);
     turn = owner ? (transcript.turns.find((candidate) => candidate.index === owner.turnIndex) ?? null) : null;
+    // A request raised in a later turn does not hold up a message whose own turn already ended.
+    const ownTurnEnded = turn?.turnId != null && thread.latestTurn?.turnId !== turn.turnId;
+    if (!ownTurnEnded && waitsForPerson(thread)) return needsAttention;
     if (turn?.turnId == null) return null;
   } else {
+    if (waitsForPerson(thread)) return needsAttention;
     const pendingTurn = transcript.turns.find((candidate) => candidate.turnId === null);
     if (pendingTurn) {
       // Queued messages will start another turn, unless the provider already refused every one of them.
