@@ -60,7 +60,8 @@ describe("buildTranscript", () => {
       maxChars: null,
     });
     expect(transcript.turns.map(({ index, turnId, state, finalMessageId }) => ({ index, turnId, state, finalMessageId }))).toEqual([
-      { index: 1, turnId: "turn-1", state: "completed", finalMessageId: "answer-1" },
+      // T3 reports only the latest turn's state, so an earlier turn's ending is unknown.
+      { index: 1, turnId: "turn-1", state: null, finalMessageId: "answer-1" },
       { index: 2, turnId: "turn-2", state: "completed", finalMessageId: "answer-2" },
     ]);
     expect(transcript.messages.map((entry) => [entry.id, entry.turnIndex])).toEqual([
@@ -442,7 +443,7 @@ describe("renderTranscript", () => {
 
     expect(rendered).toBe(
       [
-        "## Turn 1 · completed · 2026-09-04 10:00:00Z",
+        "## Turn 1 · 2026-09-04 10:00:00Z",
         "",
         "### user · 2026-09-04 10:00:00Z",
         "Build the feature",

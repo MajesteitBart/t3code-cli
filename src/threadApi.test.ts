@@ -609,6 +609,14 @@ describe("T3ThreadApi.waitForTurn", () => {
     });
   });
 
+  it("keeps to the timeout when a read stalls", async () => {
+    const adapter = new T3ThreadApi(mockApi({ request: () => new Promise(() => undefined) }), { waitIntervalMs: 0 });
+    const started = Date.now();
+
+    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 50 })).rejects.toMatchObject({ code: "THREAD_WAIT_TIMEOUT" });
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
   it("times out with the last observed state", async () => {
     const { adapter } = scripted([
       thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: firstTurn }),

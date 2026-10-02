@@ -272,10 +272,10 @@ function finalMessageId(turn: TurnBuilder, thread: T3Thread, checkpoint: Checkpo
   return turn.messages.findLast((message) => message.role === "assistant")?.id ?? null;
 }
 
-function turnState(turn: TurnBuilder, thread: T3Thread, checkpoint: Checkpoint | undefined): TurnState {
+/** T3 reports only the latest turn's state; an earlier turn's ending, completed or interrupted, is unknown. */
+function turnState(turn: TurnBuilder, thread: T3Thread): TurnState {
   if (turn.turnId === null) return "pending";
-  if (thread.latestTurn?.turnId === turn.turnId) return thread.latestTurn.state;
-  return checkpoint ? "completed" : null;
+  return thread.latestTurn?.turnId === turn.turnId ? thread.latestTurn.state : null;
 }
 
 function keepMessage(message: T3Message, detail: ReadDetail, finalId: string | null): boolean {
@@ -528,7 +528,7 @@ export function buildTranscript(thread: T3Thread, options: TranscriptOptions = {
     turns.push({
       index,
       turnId: turn.turnId,
-      state: turnState(turn, thread, checkpoint),
+      state: turnState(turn, thread),
       // Older turns have no recorded start; the prompt that started them is the best estimate.
       startedAt:
         turn.turnId === null
