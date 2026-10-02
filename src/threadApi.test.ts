@@ -81,7 +81,7 @@ describe("T3ThreadApi", () => {
     expect(paths).toEqual(["/api/orchestration/threads/thread-1?turnLimit=10"]);
   });
 
-  it("builds the exact existing-thread turn payload without creation fields", () => {
+  it("builds the existing-thread turn payload with the saved model but no creation fields", () => {
     const adapter = new T3ThreadApi(mockApi());
     const command = adapter.buildTurnStart(thread(), "Review findings");
 
@@ -94,7 +94,8 @@ describe("T3ThreadApi", () => {
     });
     expect(command).not.toHaveProperty("bootstrap");
     expect(command).not.toHaveProperty("titleSeed");
-    expect(command).not.toHaveProperty("modelSelection");
+    // The saved selection rides on every turn, so a changed model or effort reaches a live session.
+    expect(command.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.6-sol" });
   });
 
   it("preserves a saved auto runtime mode", () => {
@@ -284,7 +285,7 @@ describe("T3ThreadApi.waitForTurn", () => {
       mockApi({
         request: async () => ({ snapshotSequence: reads, thread: states[Math.min(reads++, states.length - 1)]! }),
       }),
-      { waitIntervalMs: 0 },
+      { waitIntervalMs: 0, queueGraceMs: 30 },
     );
     return { adapter, reads: () => reads };
   }
@@ -311,31 +312,59 @@ describe("T3ThreadApi.waitForTurn", () => {
     expect(reads()).toBe(4);
   });
 
-  it("keeps waiting while a queued Codex turn has not started yet", async () => {
-    const sent = message("sent", "user", null, 5);
-    const gap = thread({ latestTurn: turn("turn-1", "completed", 0, 6), session: session("ready"), messages: [...firstTurn, sent] });
+  it("keeps waiting while a queued turn has not started yet", async () => {
+    // Seconds matter here: a queued turn starts right after the running one ends.
+    const second = (value: number) => `2026-09-04T10:05:${String(value).padStart(2, "0")}.000Z`;
+    const atSecond = (base: T3Message, value: number) => ({ ...base, createdAt: second(value), updatedAt: second(value) });
+    const sent = atSecond(message("sent", "user", null, 0), 5);
+    const turnAt = (turnId: string, state: "running" | "completed", requested: number, completed: number | null) => ({
+      ...turn(turnId, state, 0, null),
+      requestedAt: second(requested),
+      startedAt: second(requested),
+      completedAt: completed === null ? null : second(completed),
+    });
+    const gap = thread({ latestTurn: turnAt("turn-1", "completed", 0, 6), session: session("ready"), messages: [...firstTurn, sent] });
     const { adapter } = scripted([
-      thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: [...firstTurn, sent] }),
-      // The running turn finished, but the queued turn only starts several polls later.
+      thread({ latestTurn: turnAt("turn-1", "running", 0, null), session: session("running"), messages: [...firstTurn, sent] }),
+      // The running turn finished; the queued turn starts several polls later.
       gap,
       gap,
       gap,
       thread({
-        latestTurn: turn("turn-2", "running", 7, null),
+        latestTurn: turnAt("turn-2", "running", 7, null),
         session: session("running"),
-        messages: [...firstTurn, sent, message("progress-2", "assistant", "turn-2", 8)],
+        messages: [...firstTurn, sent, atSecond(message("progress-2", "assistant", "turn-2", 0), 8)],
       }),
       thread({
-        latestTurn: turn("turn-2", "completed", 7, 9),
+        latestTurn: turnAt("turn-2", "completed", 7, 9),
         session: session("ready"),
-        messages: [...firstTurn, sent, message("answer-2", "assistant", "turn-2", 9)],
+        messages: [...firstTurn, sent, atSecond(message("answer-2", "assistant", "turn-2", 0), 9)],
       }),
     ]);
 
-    await expect(adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 })).resolves.toMatchObject({
+    await expect(adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
       outcome: "completed",
       turnIndex: 2,
     });
+  });
+
+  it("returns the turn a message was folded into once no queued turn appears", async () => {
+    const sent = message("sent", "user", null, 1);
+    const { adapter, reads } = scripted([
+      thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: [...firstTurn, sent] }),
+      thread({
+        latestTurn: turn("turn-1", "completed", 0, 3),
+        session: session("ready"),
+        messages: [...firstTurn, sent, message("answer-after", "assistant", "turn-1", 2)],
+      }),
+    ]);
+
+    await expect(adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
+      outcome: "completed",
+      turnIndex: 1,
+    });
+    // The quiet period after the turn ended took more than two polls.
+    expect(reads()).toBeGreaterThan(2);
   });
 
   it("reports a start failure while waiting without a message id", async () => {
@@ -391,13 +420,13 @@ describe("T3ThreadApi.waitForTurn", () => {
     });
   });
 
-  it("stops when the thread waits for a person", async () => {
+  it("stops when the running turn asks a question", async () => {
     const { adapter, reads } = scripted([
       thread({
         latestTurn: turn("turn-1", "running", 0, null),
         session: session("running"),
-        hasPendingUserInput: true,
         messages: firstTurn,
+        activities: [{ kind: "user-input.requested", turnId: "turn-1", createdAt: at(1), payload: { requestId: "q", questions: [{ id: "q1", question: "Which branch?" }] } }],
       }),
     ]);
 
@@ -419,6 +448,80 @@ describe("T3ThreadApi.waitForTurn", () => {
     ]);
 
     await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({ outcome: "needs-attention" });
+  });
+
+  it("follows a queued turn even when the previous turn ended with a question", async () => {
+    const second = (value: number) => `2026-09-04T10:05:${String(value).padStart(2, "0")}.000Z`;
+    const atSecond = (base: T3Message, value: number) => ({ ...base, createdAt: second(value), updatedAt: second(value) });
+    const turnAt = (turnId: string, state: "running" | "completed", requested: number, completed: number | null) => ({
+      ...turn(turnId, state, 0, null),
+      requestedAt: second(requested),
+      startedAt: second(requested),
+      completedAt: completed === null ? null : second(completed),
+    });
+    const sent = atSecond(message("sent", "user", null, 0), 5);
+    // Turn 1 ends by asking a message-mode question just after the message arrived mid-turn.
+    const question = {
+      kind: "user-input.requested",
+      turnId: "turn-1",
+      createdAt: second(6),
+      payload: { requestId: "async-1", responseMode: "message", questions: [{ id: "0", question: "Which apps?" }] },
+    };
+    const gap = thread({
+      latestTurn: turnAt("turn-1", "completed", 0, 6),
+      session: session("ready"),
+      messages: [...firstTurn, sent],
+      activities: [question],
+    });
+    const queued = scripted([
+      thread({ latestTurn: turnAt("turn-1", "running", 0, null), session: session("running"), messages: [...firstTurn, sent] }),
+      gap,
+      thread({
+        latestTurn: turnAt("turn-2", "completed", 7, 9),
+        session: session("ready"),
+        messages: [...firstTurn, sent, atSecond(message("answer-2", "assistant", "turn-2", 0), 8)],
+        activities: [question],
+      }),
+    ]);
+
+    await expect(queued.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
+      outcome: "completed",
+      turnIndex: 2,
+    });
+
+    // Without a queued turn, the question the awaited turn ended with needs a person.
+    const folded = scripted([gap]);
+    await expect(folded.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
+      outcome: "needs-attention",
+      turnIndex: 1,
+    });
+    expect(folded.reads()).toBeGreaterThan(2);
+  });
+
+  it("ignores an old message-mode question but reports one the awaited turn asks", async () => {
+    const asked = (turnId: string, minute: number) => ({
+      kind: "user-input.requested",
+      turnId,
+      createdAt: at(minute),
+      payload: { requestId: `async-${turnId}`, responseMode: "message", questions: [{ id: "0", question: "Which apps?" }] },
+    });
+    const sent = message("sent", "user", null, 10);
+    const answered = [...firstTurn, sent, message("answer-2", "assistant", "turn-2", 11)];
+    const old = scripted([
+      thread({ latestTurn: turn("turn-2", "completed", 10, 12), session: session("ready"), messages: answered, activities: [asked("turn-1", 1)] }),
+    ]);
+    await expect(old.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 })).resolves.toMatchObject({
+      outcome: "completed",
+      turnIndex: 2,
+    });
+
+    const fresh = scripted([
+      thread({ latestTurn: turn("turn-2", "completed", 10, 12), session: session("ready"), messages: answered, activities: [asked("turn-2", 12)] }),
+    ]);
+    await expect(fresh.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 })).resolves.toMatchObject({
+      outcome: "needs-attention",
+      turnIndex: 2,
+    });
   });
 
   it("waits for the latest turn when no message is given", async () => {

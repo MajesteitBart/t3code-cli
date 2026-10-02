@@ -99,6 +99,27 @@ printf '%s' "$THREAD_MESSAGE"   | t3code --json threads send --thread "$TARGET_T
 
 Read `data.wait.outcome`. On `completed` or `interrupted`, `data.reply` holds the turn that handled the message. `needs-attention` means the thread waits for an approval or answer, listed in `data.pendingRequests`; a person must answer it in T3 Code. `error` means the provider could not start the turn, with the reason in `data.wait.error`. To wait without sending, for example after a handover, run `t3code threads wait --thread "$TARGET_THREAD_ID" --timeout 540`.
 
+Change an existing thread's settings with `threads set`, or pass the same flags to `threads send` to apply them before the message:
+
+```bash
+t3code --json models list --provider codex
+t3code --json threads set --thread "$TARGET_THREAD_ID" --model gpt-6-astra --thinking-effort xhigh --speed fast --dry-run
+t3code --json threads set --thread "$TARGET_THREAD_ID" --permission auto-accept-edits --mode plan
+```
+
+The CLI maps `--thinking-effort` and `--speed` to the option ids each model uses and checks values against T3's catalog; `--option id=value` sets other options such as `contextWindow`. It refuses a permission change while a turn runs, because T3 restarts the session, and a provider switch on a started thread, because T3 cannot move the conversation. Read `data.changes` for what changed and `data.changes.catalogUsed` for whether the values were checked.
+
+Stop a running turn, or respond to what the thread waits for:
+
+```bash
+t3code --json threads interrupt --thread "$TARGET_THREAD_ID"
+t3code --json threads approve --thread "$TARGET_THREAD_ID" --request "$REQUEST_ID" --wait --timeout 540
+t3code --json threads decline --thread "$TARGET_THREAD_ID" --request "$REQUEST_ID"
+t3code --json threads answer --thread "$TARGET_THREAD_ID" --answer "$ANSWER" --wait --timeout 540
+```
+
+Approvals and answers act with the user's authority: send them only on the caller's explicit instruction. `approve --scope always` works only when the request offers it. Take request ids from `data.pendingRequests` in `inspect` or `send --wait` results. `THREAD_REQUEST_AMBIGUOUS` means several requests are pending; pass `--request`.
+
 The `t3thread` skill builds on these commands for `$t3thread <thread-id> <instruction>` requests.
 
 Manage lifecycle state without sending a message:

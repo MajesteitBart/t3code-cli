@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { WebSocketServer } from "ws";
 
 import { DEFAULT_CONFIG } from "./config.js";
 import { CliError } from "./errors.js";
@@ -16,7 +17,8 @@ import {
   settleThread,
   unsettleThread,
 } from "./service.js";
-import type { CliConfig, T3Message, T3Project, T3Thread } from "./types.js";
+import { answerThread, interruptThread, listModels, respondToApproval, updateThreadSettings } from "./threadControls.js";
+import type { CliConfig, InteractionMode, ModelSelection, RuntimeMode, T3Message, T3Project, T3Thread } from "./types.js";
 
 const cleanup: Array<() => Promise<void>> = [];
 
@@ -61,7 +63,13 @@ function makeThread(id: string, overrides: Partial<T3Thread> = {}): T3Thread {
 
 async function testHarness(
   initialThreads: T3Thread[],
-  options: { omitCapabilities?: boolean; threadSettlement?: boolean; respond?: boolean } = {},
+  options: {
+    omitCapabilities?: boolean;
+    threadSettlement?: boolean;
+    respond?: boolean;
+    catalog?: unknown;
+    interruptFails?: boolean;
+  } = {},
 ) {
   const root = await mkdtemp(path.join(os.tmpdir(), "t3code-cli-threads-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
@@ -120,6 +128,10 @@ async function testHarness(
     }
     if (request.headers.authorization !== "Bearer mock-token") {
       json(response, 401, { error: "unauthorized" });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/auth/websocket-ticket") {
+      json(response, 200, { ticket: "mock-ticket" });
       return;
     }
     if (request.method === "GET" && request.url === "/api/orchestration/shell") {
@@ -182,6 +194,48 @@ async function testHarness(
           };
         }
       }
+      const target = threads.find((thread) => thread.id === command.threadId);
+      const now = new Date().toISOString();
+      const activity = (kind: string, payload: Record<string, unknown>) => {
+        target!.activities = [
+          ...((target!.activities as unknown[] | undefined) ?? []),
+          { id: `activity-${commands.length}-${kind}`, kind, payload, turnId: target!.latestTurn?.turnId ?? null, createdAt: now },
+        ];
+      };
+      if (command.type === "thread.meta.update") target!.modelSelection = command.modelSelection as ModelSelection;
+      if (command.type === "thread.runtime-mode.set") target!.runtimeMode = command.runtimeMode as RuntimeMode;
+      if (command.type === "thread.interaction-mode.set") target!.interactionMode = command.interactionMode as InteractionMode;
+      if (command.type === "thread.turn.interrupt") {
+        if (target!.latestTurn && command.turnId === target!.latestTurn.turnId) target!.latestTurn.state = "interrupted";
+        if (target!.session) {
+          // When the provider cannot interrupt, T3 reports it and stops the session.
+          target!.session = { ...target!.session, status: options.interruptFails ? "stopped" : "ready", activeTurnId: null };
+        }
+        if (options.interruptFails) activity("provider.turn.interrupt.failed", { detail: "Provider did not respond." });
+      }
+      if (command.type === "thread.approval.respond") {
+        activity("approval.resolved", { requestId: command.requestId, decision: command.decision });
+      }
+      if (command.type === "thread.user-input.dismiss") {
+        activity("user-input.resolved", { requestId: command.requestId, responseMode: "message" });
+      }
+      if (command.type === "thread.user-input.respond") {
+        activity("user-input.resolved", { requestId: command.requestId, answers: command.answers });
+        const asked = ((target!.activities as Array<{ kind?: string; payload?: Record<string, unknown> }>) ?? []).find(
+          (entry) => entry.kind === "user-input.requested" && entry.payload?.requestId === command.requestId,
+        );
+        if (asked?.payload?.responseMode === "message") {
+          // T3 turns a message-mode answer into a new turn that the provider answers.
+          const messageId = `async-answer:${String(command.requestId)}`;
+          const repliedAt = new Date(Date.parse(now) + 1_000).toISOString();
+          target!.messages = [
+            ...(target!.messages ?? []),
+            { id: messageId, role: "user", text: "answer", turnId: null, streaming: false, createdAt: now, updatedAt: now },
+            { id: "reply-to-answer", role: "assistant", text: "Thanks, continuing.", turnId: "turn-answer", streaming: false, createdAt: repliedAt, updatedAt: repliedAt },
+          ];
+          target!.latestTurn = { turnId: "turn-answer", state: "completed", requestedAt: now, startedAt: now, completedAt: repliedAt, assistantMessageId: "reply-to-answer" };
+        }
+      }
       if (command.type === "thread.settle") {
         const target = threads.find((thread) => thread.id === command.threadId)!;
         const updatedAt = new Date().toISOString();
@@ -203,6 +257,25 @@ async function testHarness(
     }
     json(response, 404, { error: "not found" });
   });
+  if (options.catalog) {
+    // T3 serves its provider catalog only over WebSocket RPC.
+    const sockets = new WebSocketServer({ noServer: true });
+    server.on("upgrade", (request, socket, head) => {
+      const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      if (url.pathname !== "/ws" || url.searchParams.get("wsTicket") !== "mock-ticket") {
+        socket.end("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        return;
+      }
+      sockets.handleUpgrade(request, socket, head, (client) => {
+        client.on("message", (data) => {
+          const message = JSON.parse(String(data)) as { _tag: string; id: string; tag: string };
+          if (message._tag !== "Request" || message.tag !== "server.getConfig") return;
+          client.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: options.catalog } }));
+        });
+      });
+    });
+    cleanup.push(async () => sockets.close());
+  }
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   cleanup.push(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
   const address = server.address();
@@ -541,5 +614,184 @@ describe("thread discovery and messaging", () => {
       exitCode: 4,
     } satisfies Partial<CliError>);
     expect(harness.commands).toHaveLength(0);
+  });
+});
+
+describe("thread controls", () => {
+  const CATALOG = {
+    providers: [
+      {
+        instanceId: "codex",
+        driver: "codex",
+        enabled: true,
+        status: "ready",
+        continuation: { groupKey: "codex:home" },
+        showInteractionModeToggle: true,
+        models: [
+          {
+            slug: "gpt-5.6-sol",
+            capabilities: {
+              optionDescriptors: [
+                { id: "reasoningEffort", type: "select", options: [{ id: "medium", isDefault: true }, { id: "high" }, { id: "xhigh" }] },
+                { id: "serviceTier", type: "select", options: [{ id: "default", isDefault: true }, { id: "priority" }] },
+              ],
+            },
+          },
+          { slug: "gpt-6-astra", capabilities: { optionDescriptors: [{ id: "reasoningEffort", type: "select", options: [{ id: "high" }] }] } },
+        ],
+      },
+    ],
+  };
+  const at = (minute: number) => `2026-09-04T10:${String(minute).padStart(2, "0")}:00.000Z`;
+  // A fresh copy per use: the mock server mutates threads in place.
+  const running = () => ({
+    latestTurn: { turnId: "turn-1", state: "running" as const, requestedAt: at(0), startedAt: at(0), completedAt: null, assistantMessageId: null },
+    session: { threadId: "target", status: "running" as const, providerName: "codex", runtimeMode: "full-access" as const, activeTurnId: "turn-1", lastError: null, updatedAt: at(0) },
+    messages: [{ id: "prompt", role: "user" as const, text: "Go", turnId: null, streaming: false, createdAt: at(0), updatedAt: at(0) }],
+  });
+
+  it("changes effort, fast mode, and plan mode with the provider catalog", async () => {
+    const harness = await testHarness([makeThread("target")], { catalog: CATALOG });
+
+    const result = await updateThreadSettings(harness.config, {
+      threadId: "target",
+      change: { thinkingEffort: "xhigh", speedMode: "fast", interactionMode: "plan" },
+    });
+
+    expect(harness.commands.map((command) => command.type)).toEqual(["thread.meta.update", "thread.interaction-mode.set"]);
+    expect(harness.commands[0]).toMatchObject({
+      modelSelection: {
+        instanceId: "codex",
+        model: "gpt-5.6-sol",
+        options: [
+          { id: "reasoningEffort", value: "xhigh" },
+          { id: "serviceTier", value: "priority" },
+        ],
+      },
+    });
+    expect(result).toMatchObject({ changed: true, changes: { catalogUsed: true }, after: { interactionMode: "plan" } });
+  });
+
+  it("checks a change without dispatching it on a dry run", async () => {
+    const harness = await testHarness([makeThread("target")], { catalog: CATALOG });
+
+    const result = await updateThreadSettings(harness.config, { threadId: "target", change: { model: "gpt-6-astra" }, dryRun: true });
+
+    expect(harness.commands).toEqual([]);
+    expect(result).toMatchObject({ dryRun: true, changed: true, after: null, changes: { modelSelection: { model: "gpt-6-astra" } } });
+  });
+
+  it("falls back to effort aliases when T3 does not serve its catalog", async () => {
+    const harness = await testHarness([makeThread("target")]);
+
+    const result = await updateThreadSettings(harness.config, { threadId: "target", change: { thinkingEffort: "high" } });
+
+    expect(result.changes.catalogUsed).toBe(false);
+    expect(harness.commands[0]).toMatchObject({ type: "thread.meta.update" });
+  });
+
+  it("sends a message on a new model and carries the selection on the turn", async () => {
+    const harness = await testHarness([makeThread("target")], { catalog: CATALOG });
+
+    const result = await sendThreadMessage(harness.config, {
+      threadId: "target",
+      prompt: "Continue on Astra",
+      settings: { model: "gpt-6-astra" },
+    });
+
+    expect(harness.commands.map((command) => command.type)).toEqual(["thread.meta.update", "thread.turn.start"]);
+    expect(harness.commands[1]).toMatchObject({ modelSelection: { instanceId: "codex", model: "gpt-6-astra" } });
+    expect(result.settings).toMatchObject({ modelSelection: { model: "gpt-6-astra" }, runtimeMode: null });
+  });
+
+  it("interrupts the running turn and refuses an idle thread", async () => {
+    const harness = await testHarness([makeThread("target", running()), makeThread("idle")]);
+
+    const result = await interruptThread(harness.config, "target");
+
+    expect(harness.commands).toEqual([expect.objectContaining({ type: "thread.turn.interrupt", turnId: "turn-1" })]);
+    expect(result).toMatchObject({ turnId: "turn-1", latestTurn: { state: "interrupted" }, sessionStatus: "ready" });
+    await expect(interruptThread(harness.config, "idle")).rejects.toMatchObject({ code: "THREAD_NOT_RUNNING", exitCode: 4 });
+  });
+
+  it("reports a provider interrupt failure after T3 stopped the session", async () => {
+    const harness = await testHarness([makeThread("target", running())], { interruptFails: true });
+
+    const result = await interruptThread(harness.config, "target");
+
+    expect(result).toMatchObject({ sessionStatus: "stopped", providerError: "Provider did not respond." });
+  });
+
+  it("approves the pending approval and checks the decisions it offers", async () => {
+    const approval = {
+      id: "approval-activity",
+      kind: "approval.requested",
+      turnId: "turn-1",
+      createdAt: at(1),
+      payload: { requestId: "approval-1", requestKind: "command", detail: "git push" },
+    };
+    const harness = await testHarness([makeThread("target", { ...running(), activities: [approval] })]);
+
+    await expect(respondToApproval(harness.config, { threadId: "target", decision: "acceptAlways" })).rejects.toMatchObject({
+      code: "DECISION_NOT_OFFERED",
+    });
+    expect(harness.commands).toEqual([]);
+
+    const result = await respondToApproval(harness.config, { threadId: "target", decision: "accept" });
+
+    expect(harness.commands).toEqual([
+      expect.objectContaining({ type: "thread.approval.respond", requestId: "approval-1", decision: "accept" }),
+    ]);
+    expect(result).toMatchObject({ request: { requestId: "approval-1", detail: "git push" }, verification: { resolved: true } });
+  });
+
+  it("answers a message-mode question and waits for the turn that continues with it", async () => {
+    const question = {
+      id: "question-activity",
+      kind: "user-input.requested",
+      turnId: "turn-1",
+      createdAt: at(1),
+      payload: {
+        requestId: "async-1",
+        responseMode: "message",
+        questions: [{ id: "0", header: "Question", question: "Which apps?", options: [{ label: "Reuse the existing apps" }], allowCustomAnswer: true }],
+      },
+    };
+    const completed = {
+      latestTurn: { turnId: "turn-1", state: "completed" as const, requestedAt: at(0), startedAt: at(0), completedAt: at(2), assistantMessageId: null },
+      session: { ...running().session, status: "ready" as const, activeTurnId: null },
+      messages: running().messages,
+      activities: [question],
+    };
+    const harness = await testHarness([makeThread("target", completed), makeThread("other", completed)]);
+
+    await expect(answerThread(harness.config, { threadId: "other", dismiss: true, answers: ["x"] })).rejects.toMatchObject({
+      code: "ANSWER_REQUIRED",
+    });
+    const result = await answerThread(harness.config, {
+      threadId: "target",
+      answers: ["reuse the existing apps"],
+      wait: { timeoutMs: 60_000 },
+    });
+
+    expect(harness.commands).toEqual([
+      expect.objectContaining({ type: "thread.user-input.respond", requestId: "async-1", answers: { "0": "Reuse the existing apps" } }),
+    ]);
+    expect(result).toMatchObject({ answerMessageId: "async-answer:async-1", wait: { outcome: "completed", turnIndex: 2 } });
+    expect(result.reply?.messages.map((message) => message.text)).toContain("Thanks, continuing.");
+
+    const dismissed = await answerThread(harness.config, { threadId: "other", dismiss: true });
+    expect(dismissed).toMatchObject({ dismissed: true, answers: null });
+  });
+
+  it("lists the catalog's providers and models", async () => {
+    const harness = await testHarness([], { catalog: CATALOG });
+
+    const result = await listModels(harness.config);
+
+    expect(result.providers.map((provider) => [provider.instanceId, provider.models.map((model) => model.slug)])).toEqual([
+      ["codex", ["gpt-5.6-sol", "gpt-6-astra"]],
+    ]);
+    await expect(listModels(harness.config, { provider: "claudeAgent" })).rejects.toMatchObject({ code: "PROVIDER_NOT_FOUND" });
   });
 });

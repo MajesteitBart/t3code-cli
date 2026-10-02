@@ -103,6 +103,30 @@ describe("CLI parsing", () => {
     });
   });
 
+  it("rejects thread control requests that are incomplete before contacting T3", async () => {
+    const missingConfig = path.join(built.directory, "missing-config.json");
+    const offline = (args) => run(["--json", "--config", missingConfig, ...args]);
+
+    const noSettings = await offline(["threads", "set", "--thread", "thread-1"]);
+    expect(noSettings.code).toBe(2);
+    expect(JSON.parse(noSettings.stderr).error.code).toBe("THREAD_SETTINGS_REQUIRED");
+
+    const badOption = await offline(["threads", "set", "--thread", "thread-1", "--option", "contextWindow"]);
+    expect(badOption.code).toBe(2);
+    expect(JSON.parse(badOption.stderr).error).toEqual({
+      code: "INVALID_MODEL_OPTION",
+      message: "Write model options as id=value, not contextWindow.",
+    });
+
+    const noAnswer = await offline(["threads", "answer", "--thread", "thread-1"]);
+    expect(noAnswer.code).toBe(2);
+    expect(JSON.parse(noAnswer.stderr).error.code).toBe("ANSWER_REQUIRED");
+
+    const badScope = await offline(["threads", "approve", "--thread", "thread-1", "--scope", "forever"]);
+    expect(badScope.code).toBe(2);
+    expect(JSON.parse(badScope.stderr).error.code).toBe("INVALID_USAGE");
+  });
+
   it("keeps human-readable usage errors", async () => {
     const result = await run(["threads", "inspect"]);
 

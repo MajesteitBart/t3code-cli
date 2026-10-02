@@ -80,6 +80,18 @@ describe("buildTranscript", () => {
     expect(transcript).not.toHaveProperty("toolCalls");
   });
 
+  it("keeps a plan-mode turn's proposed plan at every detail level", () => {
+    const source = twoTurnThread();
+    source.proposedPlans = [{ id: "plan-1", turnId: "turn-2", planMarkdown: "# Plan\n- Add tests", createdAt: at(12) }];
+
+    const transcript = buildTranscript(source, { detail: "answers", turns: 1 });
+
+    expect(transcript.proposedPlans).toEqual([
+      { id: "plan-1", turnId: "turn-2", turnIndex: 2, text: "# Plan\n- Add tests", textTruncated: false, createdAt: at(12) },
+    ]);
+    expect(renderTranscript(transcript)).toContain("### proposed plan\n# Plan\n- Add tests");
+  });
+
   it("includes reasoning, changed files, and tool calls in full detail", () => {
     const source = twoTurnThread();
     source.activities = [
@@ -194,45 +206,55 @@ describe("buildTranscript", () => {
     expect(buildTranscript(source, { turns: 1 }).messages.map((entry) => entry.id)).toEqual(["prompt-2", "answer-2"]);
   });
 
-  it("keeps a Codex message queued during a turn pending until its own turn starts", () => {
+  it("keeps a message sent into a finished turn with that turn when no turn follows", () => {
+    // Live Codex threads fold an answer sent mid-turn into the running turn, just as Claude does.
     const source = thread({
       session: { threadId: "thread-1", status: "ready", providerName: "codex", runtimeMode: "full-access", activeTurnId: null, lastError: null, updatedAt: at(4) },
       latestTurn: { turnId: "turn-1", state: "completed", requestedAt: at(0), startedAt: at(0), completedAt: at(4), assistantMessageId: "answer-1" },
       messages: [
         message("prompt-1", "user", null, 0),
         message("progress-1", "assistant", "turn-1", 1),
-        message("queued", "user", null, 2),
+        message("folded", "user", null, 2),
         message("answer-1", "assistant", "turn-1", 3),
       ],
     });
 
     const transcript = buildTranscript(source);
 
-    expect(transcript.turns.map(({ index, state }) => [index, state])).toEqual([[1, "completed"], [2, "pending"]]);
-    expect(transcript.messages.find((entry) => entry.id === "queued")?.turnIndex).toBe(2);
+    expect(transcript.turns.map(({ index, state }) => [index, state])).toEqual([[1, "completed"]]);
+    expect(transcript.messages.find((entry) => entry.id === "folded")?.turnIndex).toBe(1);
   });
 
-  it("gives a Codex message queued during a turn to the turn that starts after it", () => {
-    const source = thread({
-      modelSelection: { instanceId: "codex", model: "gpt-6.1-sol" },
-      latestTurn: { turnId: "turn-2", state: "running", requestedAt: at(5), startedAt: at(5), completedAt: null, assistantMessageId: null },
-      checkpoints: [{ turnId: "turn-1", completedAt: at(4) }],
-      messages: [
-        message("prompt-1", "user", null, 0),
-        message("progress-1", "assistant", "turn-1", 1),
-        message("queued", "user", null, 2),
-        message("answer-1", "assistant", "turn-1", 3),
-        message("progress-2", "assistant", "turn-2", 6),
-      ],
-    });
+  it("gives a queued message to the turn that starts right after its turn ends", () => {
+    const second = (value: number) => `2026-09-04T10:04:${String(value).padStart(2, "0")}.000Z`;
+    const queuedThread = (extra: T3Message[]) =>
+      thread({
+        latestTurn: { turnId: "turn-2", state: "running", requestedAt: second(1), startedAt: second(1), completedAt: null, assistantMessageId: null },
+        checkpoints: [{ turnId: "turn-1", completedAt: second(0) }],
+        messages: [
+          message("prompt-1", "user", null, 0),
+          message("progress-1", "assistant", "turn-1", 1),
+          message("queued", "user", null, 2),
+          message("answer-1", "assistant", "turn-1", 3),
+          ...extra,
+          { ...message("progress-2", "assistant", "turn-2", 0), createdAt: second(2), updatedAt: second(2) },
+        ],
+      });
 
-    expect(buildTranscript(source).messages.map((entry) => [entry.id, entry.turnIndex])).toEqual([
+    // Turn 2 started one second after turn 1 ended, without a prompt of its own: it took the queued message.
+    expect(buildTranscript(queuedThread([])).messages.map((entry) => [entry.id, entry.turnIndex])).toEqual([
       ["prompt-1", 1],
       ["progress-1", 1],
       ["answer-1", 1],
       ["queued", 2],
       ["progress-2", 2],
     ]);
+
+    // With its own prompt, turn 2 answers that prompt, and the earlier message stays where it was sent.
+    const ownPrompt = { ...message("prompt-2", "user", null, 0), createdAt: second(1), updatedAt: second(1) };
+    expect(
+      buildTranscript(queuedThread([ownPrompt])).messages.find((entry) => entry.id === "queued")?.turnIndex,
+    ).toBe(1);
   });
 
   it("reports messages that no turn has picked up as pending", () => {
@@ -277,31 +299,69 @@ describe("selectTurn", () => {
 });
 
 describe("pendingRequests", () => {
-  it("lists unresolved approvals and questions while T3 reports them pending", () => {
+  it("lists open approvals and questions with what is needed to answer them", () => {
+    const running = { turnId: "turn-2", state: "running" as const, requestedAt: at(5), startedAt: at(5), completedAt: null, assistantMessageId: null };
     const activities = [
-      { kind: "approval.requested", turnId: "turn-1", createdAt: at(1), payload: { requestId: "approval-old", detail: "rm -rf build" } },
-      { kind: "approval.resolved", turnId: "turn-1", createdAt: at(2), payload: { requestId: "approval-old" } },
-      { kind: "approval.requested", turnId: "turn-1", createdAt: at(3), payload: { requestId: "approval-new", requestKind: "command", detail: "git push" } },
+      // A message-mode question from an earlier turn stays open; another was answered.
       {
         kind: "user-input.requested",
         turnId: "turn-1",
-        createdAt: at(4),
-        payload: { requestId: "question", questions: [{ id: "q1", header: "Target", question: "Which branch?", options: [{ label: "main" }, { label: "dev" }] }] },
+        createdAt: at(1),
+        payload: { requestId: "async-open", responseMode: "message", questions: [{ id: "0", header: "Question", question: "Which OAuth apps?", options: [{ label: "Reuse", description: "" }], allowCustomAnswer: true, multiSelect: false }] },
+      },
+      { kind: "user-input.requested", turnId: "turn-1", createdAt: at(2), payload: { requestId: "async-done", responseMode: "message", questions: [{ id: "0", question: "Done?" }] } },
+      { kind: "user-input.resolved", turnId: null, createdAt: at(3), payload: { requestId: "async-done", responseMode: "message" } },
+      { kind: "approval.requested", turnId: "turn-2", createdAt: at(6), payload: { requestId: "approval", requestKind: "command", detail: "git push", options: [{ decision: "accept", label: "Allow" }, { decision: "decline", label: "Deny" }] } },
+      { kind: "approval.requested", turnId: "turn-2", createdAt: at(6), payload: { requestId: "stale-approval", detail: "rm -rf build" } },
+      { kind: "provider.approval.respond.failed", turnId: "turn-2", createdAt: at(7), payload: { requestId: "stale-approval", detail: "Stale pending approval request: stale-approval." } },
+      {
+        kind: "user-input.requested",
+        turnId: "turn-2",
+        createdAt: at(8),
+        payload: { requestId: "question", questions: [{ id: "q1", header: "Target", question: "Which branch?", options: [{ label: "Main", value: "main" }, { label: "Dev" }], multiSelect: true }] },
       },
     ];
 
-    expect(pendingRequests(thread({ activities, hasPendingApprovals: true, hasPendingUserInput: true }))).toEqual([
-      { kind: "approval", requestId: "approval-new", turnId: "turn-1", detail: "git push", questions: [], createdAt: at(3) },
+    expect(pendingRequests(thread({ activities, latestTurn: running }))).toEqual([
+      {
+        kind: "user-input",
+        requestId: "async-open",
+        turnId: "turn-1",
+        responseMode: "message",
+        blocking: false,
+        detail: null,
+        requestKind: null,
+        decisions: [],
+        questions: [{ id: "0", header: "Question", question: "Which OAuth apps?", options: ["Reuse"], choices: [{ label: "Reuse", value: null, description: null }], multiSelect: false, allowCustomAnswer: true }],
+        createdAt: at(1),
+      },
+      {
+        kind: "approval",
+        requestId: "approval",
+        turnId: "turn-2",
+        responseMode: null,
+        blocking: true,
+        detail: "git push",
+        requestKind: "command",
+        decisions: ["accept", "decline"],
+        questions: [],
+        createdAt: at(6),
+      },
       {
         kind: "user-input",
         requestId: "question",
-        turnId: "turn-1",
+        turnId: "turn-2",
+        responseMode: null,
+        blocking: true,
         detail: null,
-        questions: [{ id: "q1", question: "Which branch?", options: ["main", "dev"] }],
-        createdAt: at(4),
+        requestKind: null,
+        decisions: [],
+        questions: [{ id: "q1", header: "Target", question: "Which branch?", options: ["Main", "Dev"], choices: [{ label: "Main", value: "main", description: null }, { label: "Dev", value: null, description: null }], multiSelect: true, allowCustomAnswer: true }],
+        createdAt: at(8),
       },
     ]);
-    expect(pendingRequests(thread({ activities, hasPendingApprovals: false, hasPendingUserInput: false }))).toEqual([]);
+    // The shell snapshot's flags, when present, close a kind of request entirely.
+    expect(pendingRequests(thread({ activities, latestTurn: running, hasPendingApprovals: false, hasPendingUserInput: false }))).toEqual([]);
   });
 
   it("derives pending requests from a running turn when T3 omits its flags", () => {

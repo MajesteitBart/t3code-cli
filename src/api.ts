@@ -222,6 +222,11 @@ export class T3Api {
    * which rejects the turn because the thread does not exist yet.
    */
   async dispatchOverWebSocket(command: unknown): Promise<unknown> {
+    return await this.rpc(DISPATCH_COMMAND_RPC, command, RPC_TIMEOUT_MS);
+  }
+
+  /** Calls a WebSocket-only T3 RPC, such as `server.getConfig`, with a short-lived ticket. */
+  async rpc(tag: string, payload: unknown, timeoutMs = 30_000): Promise<unknown> {
     const issued = (await this.request("POST", "/api/auth/websocket-ticket")) as { ticket?: unknown } | null;
     if (typeof issued?.ticket !== "string" || issued.ticket.length === 0) {
       throw new CliError("T3_AUTH_FAILED", "T3 returned an invalid WebSocket ticket.");
@@ -229,7 +234,7 @@ export class T3Api {
     const url = new URL("/ws", this.runtime.origin);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("wsTicket", issued.ticket);
-    return await rpcRequest(url, DISPATCH_COMMAND_RPC, command, RPC_TIMEOUT_MS);
+    return await rpcRequest(url, tag, payload, timeoutMs);
   }
 }
 
