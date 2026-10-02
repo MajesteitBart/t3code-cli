@@ -316,6 +316,13 @@ describe("thread discovery and messaging", () => {
     expect(settled.filter).toMatchObject({ projectId: "project-1", status: "settled" });
   });
 
+  it("filters by the current folder when --cwd is empty", async () => {
+    const harness = await testHarness([makeThread("active")]);
+
+    // The test runs outside the harness project, so filtering finds no project instead of listing everything.
+    await expect(listThreads(harness.config, { cwd: "" })).rejects.toMatchObject({ code: "PROJECT_NOT_FOUND" });
+  });
+
   it("lists the main checkout's threads from a linked worktree", async () => {
     const harness = await testHarness([makeThread("target")]);
     await runProcess("git", [

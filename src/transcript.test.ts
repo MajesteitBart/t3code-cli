@@ -284,6 +284,9 @@ describe("buildTranscript", () => {
     expect(entry?.text.startsWith("start ")).toBe(true);
     expect(entry?.text.endsWith(" end")).toBe(true);
     expect(entry?.text).toContain("characters omitted");
+    // The omission marker counts toward the limit.
+    expect(entry?.text).toHaveLength(100);
+    expect(clip("x".repeat(500), 10)).toEqual({ text: "x".repeat(10), truncated: true });
     expect(clip("short", 100)).toEqual({ text: "short", truncated: false });
   });
 });

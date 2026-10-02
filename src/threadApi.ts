@@ -244,8 +244,10 @@ function observeTurn(thread: T3Thread, messageId: string | undefined): TurnObser
       return null;
     }
   }
+  // An awaited turn that a later turn followed has ended, even while that later turn runs.
   const session = thread.session?.status;
-  if (thread.latestTurn?.state === "running" || session === "starting" || session === "running") return null;
+  const busy = thread.latestTurn?.state === "running" || session === "starting" || session === "running";
+  if (busy && (messageId === undefined || thread.latestTurn?.turnId === turn?.turnId)) return null;
   if (!turn) return { outcome: "idle", turnIndex: null };
   // A turn that ended by asking a message-mode question waits for a person too.
   const askedBack = requests.some((request) => request.responseMode === "message" && request.turnId === turn.turnId);
@@ -293,13 +295,14 @@ export class T3ThreadApi {
     let candidate: (TurnObservation & { since: number }) | null = null;
     let last: { snapshotSequence: number; thread: T3Thread } | null = null;
     for (;;) {
-      const read = await this.read(threadId).catch((error: unknown) => {
+      // Polls read a bounded window of recent turns; the whole thread is read once the outcome is clear.
+      const read = await this.inspect(threadId).catch((error: unknown) => {
         if (error instanceof CliError && error.code === "THREAD_NOT_FOUND") throw error;
         return null;
       });
       if (read) {
         last = read;
-        const previous: (TurnObservation & { since: number }) | null = candidate;
+        const previous = candidate as (TurnObservation & { since: number }) | null;
         const observed = observeTurn(read.thread, options.messageId);
         // A blocking request or a failed start cannot change by itself. A question the turn ended with
         // still waits out a queue window, because a queued turn may yet claim the awaited message.
@@ -309,20 +312,24 @@ export class T3ThreadApi {
           observed !== null &&
           previous.outcome === observed.outcome &&
           previous.turnIndex === observed.turnIndex;
-        const settled = !observed?.mayBeQueued || (previous !== null && Date.now() - previous.since >= this.queueGraceMs);
-        const confirmed = observed !== null && (final || (repeated && settled));
-        if (observed && confirmed) {
+        const quiet = !observed?.mayBeQueued || (previous !== null && Date.now() - previous.since >= this.queueGraceMs);
+        const confirmed: boolean = observed !== null && (final || (repeated && quiet));
+        const full: { snapshotSequence: number; thread: T3Thread } | null =
+          observed && confirmed ? await this.read(threadId).catch(() => null) : null;
+        // Turn numbers and the reply come from the whole thread, which must still show the same outcome.
+        const whole: TurnObservation | null = full ? observeTurn(full.thread, options.messageId) : null;
+        if (full && whole && whole.outcome === observed?.outcome) {
           return {
-            outcome: observed.outcome,
-            snapshotSequence: read.snapshotSequence,
-            thread: read.thread,
-            turnIndex: observed.turnIndex,
+            outcome: whole.outcome,
+            snapshotSequence: full.snapshotSequence,
+            thread: full.thread,
+            turnIndex: whole.turnIndex,
             waitedMs: Date.now() - startedAt,
-            ...(observed.error === undefined ? {} : { error: observed.error }),
+            ...(whole.error === undefined ? {} : { error: whole.error }),
           };
         }
         const since: number = repeated && previous ? previous.since : Date.now();
-        candidate = observed ? { ...observed, since } : null;
+        candidate = observed && !full ? { ...observed, since } : null;
       }
       if (Date.now() >= deadline) break;
       await sleep(Math.min(this.waitIntervalMs, Math.max(0, deadline - Date.now())));

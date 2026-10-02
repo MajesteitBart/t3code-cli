@@ -127,12 +127,23 @@ function list(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
-/** Keeps the head and tail of long text, where requests, conclusions, and errors usually are. */
+/**
+ * Keeps the head and tail of long text, where requests, conclusions, and errors usually are. The
+ * omission marker counts toward the limit, so clipped text never exceeds it.
+ */
 export function clip(value: string, limit: number | undefined): { text: string; truncated: boolean } {
   if (limit === undefined || value.length <= limit) return { text: value, truncated: false };
-  const marker = `\n… [${value.length - limit} characters omitted] …\n`;
-  const head = Math.ceil(limit * 0.6);
-  return { text: `${value.slice(0, head)}${marker}${value.slice(value.length - (limit - head))}`, truncated: true };
+  // The marker states how much it replaces, and its own length decides that amount.
+  let marker = "";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const next = `\n… [${value.length - (limit - marker.length)} characters omitted] …\n`;
+    if (next.length === marker.length) break;
+    marker = next;
+  }
+  const kept = limit - marker.length;
+  if (kept <= 0) return { text: value.slice(0, limit), truncated: true };
+  const head = Math.ceil(kept * 0.6);
+  return { text: `${value.slice(0, head)}${marker}${value.slice(value.length - (kept - head))}`, truncated: true };
 }
 
 /**
