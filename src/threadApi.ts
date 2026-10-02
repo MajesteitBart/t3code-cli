@@ -493,7 +493,8 @@ export class T3ThreadApi {
     const deadline = Date.now() + this.verificationTimeoutMs;
 
     do {
-      const inspected = await this.inspect(command.threadId).catch(() => null);
+      // A stalled read must not outlast the verification deadline.
+      const inspected = await beforeDeadline(this.inspect(command.threadId).catch(() => null), deadline);
       if (inspected && inspected.snapshotSequence >= sequence) {
         if (messageWasProjected(inspected.thread.messages, command.message.messageId)) {
           return {
@@ -538,7 +539,8 @@ export class T3ThreadApi {
     const deadline = Date.now() + this.verificationTimeoutMs;
 
     do {
-      const inspected = await this.inspect(command.threadId).catch(() => null);
+      // A stalled read must not outlast the verification deadline.
+      const inspected = await beforeDeadline(this.inspect(command.threadId).catch(() => null), deadline);
       if (
         inspected &&
         inspected.snapshotSequence >= sequence &&
