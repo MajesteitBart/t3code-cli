@@ -441,6 +441,25 @@ describe("T3ThreadApi.waitForTurn", () => {
     });
   });
 
+  it("returns a finished message's turn even when a later turn waits for an approval", async () => {
+    const { adapter } = scripted([
+      thread({
+        latestTurn: turn("turn-2", "running", 10, null),
+        session: session("running"),
+        checkpoints: [{ turnId: "turn-1", completedAt: at(2) }],
+        messages: [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)],
+        activities: [{ kind: "approval.requested", turnId: "turn-2", createdAt: at(12), payload: { requestId: "a", detail: "git push" } }],
+      }),
+    ]);
+
+    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
+      outcome: "completed",
+      turnIndex: 1,
+    });
+    // Without a message, the wait reports the approval that holds up the thread.
+    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({ outcome: "needs-attention" });
+  });
+
   it("returns a message's own turn while a later turn runs", async () => {
     // Turn 1 answered prompt-1 and completed; turn 2 runs for a later prompt.
     const { adapter } = scripted([

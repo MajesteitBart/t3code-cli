@@ -225,17 +225,20 @@ function observeTurn(
     const failure = turnStartFailure(thread, messageId);
     if (failure) return { outcome: "error", turnIndex: null, error: failure };
   }
-  // A blocking approval or question holds up the running turn, whichever turn the caller awaits.
+  // A blocking approval or question holds up the running turn, and any message still waiting on it.
   const requests = pendingRequests(thread);
-  if (requests.some((request) => request.blocking)) {
-    return { outcome: "needs-attention", turnIndex: latest?.index ?? null, blocked: true };
-  }
+  const blocked = requests.some((request) => request.blocking);
+  const needsAttention = { outcome: "needs-attention" as const, turnIndex: latest?.index ?? null, blocked: true };
   let turn = latest;
   if (messageId !== undefined) {
     const owner = transcript.messages.find((message) => message.id === messageId);
     turn = owner ? (transcript.turns.find((candidate) => candidate.index === owner.turnIndex) ?? null) : null;
+    // A request raised in a later turn does not hold up a message whose own turn already ended.
+    const ownTurnEnded = turn?.turnId != null && thread.latestTurn?.turnId !== turn.turnId;
+    if (!ownTurnEnded && blocked) return needsAttention;
     if (turn?.turnId == null) return null;
   } else {
+    if (blocked) return needsAttention;
     const pendingTurn = transcript.turns.find((candidate) => candidate.turnId === null);
     if (pendingTurn) {
       // Queued messages will start another turn, unless the provider already refused every one of them.
