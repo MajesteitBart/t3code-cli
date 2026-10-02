@@ -263,6 +263,20 @@ describe("resolveModelChange without descriptors", () => {
     );
   });
 
+  it("keeps saved options when the selection names the model by an alias", () => {
+    const aliased = parseCatalog({
+      providers: [{ instanceId: "codex", driver: "codex", models: [{ slug: "gpt-old", aliases: ["old"], capabilities: null }] }],
+    });
+
+    const next = resolveModelChange(
+      { instanceId: "codex", model: "old", options: [{ id: "contextWindow", value: "1m" }] },
+      { thinkingEffort: "high" },
+      aliased,
+    );
+
+    expect(next.options).toContainEqual({ id: "contextWindow", value: "1m" });
+  });
+
   it("reads saved options stored as an object map", () => {
     const legacy = { instanceId: "codex", model: "gpt-6.1-sol", options: { reasoningEffort: "low" } } as unknown as Parameters<
       typeof resolveModelChange

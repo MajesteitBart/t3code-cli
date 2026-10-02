@@ -446,8 +446,10 @@ export function pendingRequests(thread: T3Thread): PendingRequest[] {
     const turnId = typeof activity.turnId === "string" ? activity.turnId : null;
     const responseMode = kind === "user-input" && payload.responseMode === "message" ? "message" : null;
     const inRunningTurn = runningTurn !== null && turnId === runningTurn;
-    // T3 closes ordinary questions when their turn ends; message-mode questions stay open.
-    if (responseMode === null && !inRunningTurn && flag !== true) return [];
+    // T3 closes ordinary questions when their turn ends and never cleans up approvals, so both count only
+    // while their turn runs. The thread-wide flag cannot say which request it means. Message-mode
+    // questions stay open across turns.
+    if (responseMode === null && !inRunningTurn) return [];
     return [{
       kind,
       requestId,

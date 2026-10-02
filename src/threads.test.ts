@@ -722,6 +722,15 @@ describe("thread controls", () => {
     expect(harness.commands[0]).toMatchObject({ type: "thread.meta.update" });
   });
 
+  it("refuses to send with new settings while a turn runs", async () => {
+    const harness = await testHarness([makeThread("target", running())], { catalog: CATALOG });
+
+    await expect(
+      sendThreadMessage(harness.config, { threadId: "target", prompt: "Switch now", settings: { model: "gpt-6-astra" } }),
+    ).rejects.toMatchObject({ code: "THREAD_BUSY", exitCode: 4 });
+    expect(harness.commands).toEqual([]);
+  });
+
   it("sends a message on a new model and carries the selection on the turn", async () => {
     const harness = await testHarness([makeThread("target")], { catalog: CATALOG });
 

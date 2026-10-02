@@ -197,7 +197,7 @@ printf '%s' "Continue with the migration." \
 
 `--option id=value` sets any other model option, such as Claude's `contextWindow`. The CLI checks every value against T3's model catalog, which `t3code models list` prints. When the model changes, settings the new model supports carry over and the rest are dropped. A T3 server without the catalog gets every effort alias, unchecked.
 
-`--permission` and `--mode build|plan` change the thread's permission and plan mode. A permission change restarts a live provider session, so the CLI refuses it while a turn runs. T3 keeps a started conversation on its provider, so `--provider` only switches between instances of the same driver that share resume state; hand the work over to a new thread to use another provider. Every turn the CLI sends carries the thread's model selection, because that is how T3 applies a change to a live session.
+`--permission` and `--mode build|plan` change the thread's permission and plan mode. A permission change restarts a live provider session, so the CLI refuses it while a turn runs. `send` with new settings also waits for an idle thread, because a message sent mid-turn can join the running turn and keep its old settings. T3 keeps a started conversation on its provider, so `--provider` only switches between instances of the same driver that share resume state; hand the work over to a new thread to use another provider. Every turn the CLI sends carries the thread's model selection, because that is how T3 applies a change to a live session.
 
 ### Interrupt, approve, and answer
 

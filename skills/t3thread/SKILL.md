@@ -124,7 +124,7 @@ t3code threads set --thread <id> --model gpt-6-astra --thinking-effort xhigh
 `threads send` takes the same flags (`--model`, `--thinking-effort`, `--speed standard|fast`, `--option id=value`, `--permission`, `--mode build|plan`) and applies them before the message, which suits "continue on another model". Rules:
 
 - A started thread cannot move to another provider, such as from Codex to Claude. Hand the work over to a new thread instead (see "Get a second opinion").
-- A permission change restarts the provider session, so the CLI refuses it while a turn runs. Wait for the turn first.
+- A permission change restarts the provider session, so the CLI refuses it while a turn runs. `send` with new settings is refused mid-turn too, because the message could join the running turn. Wait for the turn first.
 - Raising the permission level gives the other agent more authority. Do it only when the user asks for that level.
 
 ### Stop the thread

@@ -411,6 +411,19 @@ describe("pendingRequests", () => {
     expect(pendingRequests(thread({ activities, latestTurn: running, hasPendingApprovals: false, hasPendingUserInput: false }))).toEqual([]);
   });
 
+  it("ignores the thread-wide pending flag for requests from an ended turn", () => {
+    const running = { turnId: "turn-2", state: "running" as const, requestedAt: at(5), startedAt: at(5), completedAt: null, assistantMessageId: null };
+    const activities = [
+      { kind: "approval.requested", turnId: "turn-1", createdAt: at(1), payload: { requestId: "stale", detail: "old" } },
+      { kind: "approval.requested", turnId: "turn-2", createdAt: at(6), payload: { requestId: "live", detail: "git status" } },
+    ];
+
+    // The flag says some approval is pending; only the one in the running turn can be answered.
+    expect(
+      pendingRequests(thread({ activities, latestTurn: running, hasPendingApprovals: true })).map((request) => request.requestId),
+    ).toEqual(["live"]);
+  });
+
   it("drops ordinary questions whose turn ended and keeps the request kind as detail", () => {
     const completed = { turnId: "turn-1", state: "completed" as const, requestedAt: at(0), startedAt: at(0), completedAt: at(3), assistantMessageId: null };
     const activities = [

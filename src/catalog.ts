@@ -211,7 +211,8 @@ export function resolveModelChange(current: ModelSelection, change: ModelChange,
     );
   }
 
-  const sameModel = instanceId === current.instanceId && model.slug === current.model;
+  // A saved selection may name the model by one of its aliases.
+  const sameModel = instanceId === current.instanceId && (model.slug === current.model || model.aliases.includes(current.model));
   const descriptors = model.options;
   // Older projections store options as an object map.
   const saved = normalizeProviderOptions(current.options);

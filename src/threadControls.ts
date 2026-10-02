@@ -275,6 +275,14 @@ export async function changeSettingsWithApi(
   thread: T3Thread,
   change: ThreadSettingsChange,
 ): Promise<{ plan: ThreadSettingsPlan; dispatches: unknown[]; thread: T3Thread; sessionRestarted: boolean }> {
+  // A message sent during a running turn may join that turn, which keeps its current model and modes.
+  if (turnRunning(thread)) {
+    throw new CliError(
+      "THREAD_BUSY",
+      `Thread ${thread.id} is running a turn, and a message sent now may join it with the current settings. Wait for the turn, then send with the new settings.`,
+      { exitCode: 4, details: { threadId: thread.id, sessionStatus: thread.session?.status ?? null } },
+    );
+  }
   const plan = planThreadSettings(thread, change, await catalogFor(api, change));
   return { plan, ...(await applyThreadSettings(adapter, thread, plan)) };
 }
