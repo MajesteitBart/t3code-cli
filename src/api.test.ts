@@ -47,7 +47,7 @@ test("POST keeps bearer authentication, JSON payload, and response decoding", as
   try {
     const api = new T3Api({ origin: `http://127.0.0.1:${address.port}`,
       environmentId: "test", serverVersion: "test", stateDir: null,
-      runtimeStatePath: null, settingsPath: null,
+      runtimeStatePath: null, settingsPath: null, capabilities: {},
     }, "fixture-token");
     expect(await api.dispatch({ text: "é😀" })).toEqual({ accepted: "é😀" });
     expect(received).toEqual({ method: "POST", authorization: "Bearer fixture-token",
@@ -70,7 +70,7 @@ test("truncated response bodies become T3_REQUEST_FAILED", async () => {
   const api = new T3Api({
     origin: `http://127.0.0.1:${address.port}`,
     environmentId: "test", serverVersion: "test", stateDir: null,
-    runtimeStatePath: null, settingsPath: null,
+    runtimeStatePath: null, settingsPath: null, capabilities: {},
   }, "fixture-token");
   try {
     await expect(api.request("GET", "/snapshot")).rejects.toMatchObject({ code: "T3_REQUEST_FAILED" });

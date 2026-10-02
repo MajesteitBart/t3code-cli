@@ -3,7 +3,7 @@ export type WorkspaceMode = "repo" | "folder";
 export type OpenMode = "auto" | "desktop" | "browser" | "none";
 export type ThreadEnvMode = "t3" | "local" | "worktree";
 export type EffectiveThreadEnvMode = Exclude<ThreadEnvMode, "t3">;
-export type RuntimeMode = "approval-required" | "auto-accept-edits" | "full-access";
+export type RuntimeMode = "approval-required" | "auto" | "auto-accept-edits" | "full-access";
 export type InteractionMode = "default" | "plan";
 export type SpeedMode = "standard" | "fast";
 
@@ -40,6 +40,10 @@ export interface T3Runtime {
   settingsPath: string | null;
   environmentId: string;
   serverVersion: string;
+  capabilities: {
+    threadSettlement?: boolean;
+    [key: string]: unknown;
+  };
 }
 
 export interface ModelSelection {
@@ -67,7 +71,57 @@ export interface T3Thread {
   id: string;
   projectId: string;
   title: string;
+  modelSelection?: ModelSelection;
+  runtimeMode?: RuntimeMode;
+  interactionMode?: InteractionMode;
+  branch?: string | null;
+  worktreePath?: string | null;
+  latestTurn?: T3LatestTurn | null;
+  session?: T3Session | null;
+  createdAt?: string;
+  updatedAt?: string;
   archivedAt: string | null;
+  settledOverride?: "settled" | "active" | null;
+  settledAt?: string | null;
+  unsettledAt?: string | null;
+  latestUserMessageAt?: string | null;
+  hasPendingApprovals?: boolean;
+  hasPendingUserInput?: boolean;
+  messages?: T3Message[];
+  deletedAt?: string | null;
+  [key: string]: unknown;
+}
+
+export interface T3LatestTurn {
+  turnId: string;
+  state: "running" | "interrupted" | "completed" | "error";
+  requestedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  assistantMessageId: string | null;
+  [key: string]: unknown;
+}
+
+export interface T3Session {
+  threadId: string;
+  status: "idle" | "starting" | "running" | "ready" | "interrupted" | "stopped" | "error";
+  providerName: string | null;
+  providerInstanceId?: string;
+  runtimeMode: RuntimeMode;
+  activeTurnId: string | null;
+  lastError: string | null;
+  updatedAt: string;
+  [key: string]: unknown;
+}
+
+export interface T3Message {
+  id: string;
+  role: "user" | "assistant" | "system";
+  text: string;
+  turnId: string | null;
+  streaming: boolean;
+  createdAt: string;
+  updatedAt: string;
   [key: string]: unknown;
 }
 
@@ -76,6 +130,17 @@ export interface OrchestrationSnapshot {
   projects: T3Project[];
   threads: T3Thread[];
   updatedAt: string;
+}
+
+export interface ThreadDetailSnapshot {
+  snapshotSequence: number;
+  thread: T3Thread;
+  page?: {
+    beforeCursor: string | null;
+    hasMore: boolean;
+    snapshotSequence: number;
+    threadSequence?: number;
+  };
 }
 
 export interface OpenResult {
