@@ -197,6 +197,7 @@ function groupTurns(thread: T3Thread, checkpoints: Map<string, Checkpoint>): Tur
     .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
   const byId = new Map(turns.map((turn) => [turn.turnId, turn]));
   const sorted = [...(thread.messages ?? [])].sort(byCreatedAt);
+  const claimedByQueue = new Set<TurnBuilder>();
   let pending: TurnBuilder | null = null;
 
   const ownerOf = (message: T3Message): TurnBuilder | undefined => {
@@ -209,14 +210,26 @@ function groupTurns(thread: T3Thread, checkpoints: Map<string, Checkpoint>): Tur
     );
     if (!running) return next;
     if (!next || running.endedAt === null) return running;
-    const queuedTurn =
-      Date.parse(next.startedAt) - Date.parse(running.endedAt) <= QUEUED_TURN_GRACE_MS &&
-      // Another message sent while the turn ran was queued too; only a prompt sent after it ended starts the next turn.
-      !sorted.some(
-        (other) =>
-          other.role === "user" && other.createdAt > running.endedAt! && other.createdAt <= next.startedAt,
+    // A provider that queues messages starts one turn for each, back to back, so queued messages claim
+    // successive turns. A turn with a prompt sent after the previous turn ended belongs to that prompt.
+    let previousEnd = running.endedAt;
+    for (let index = turns.indexOf(next); index < turns.length; index += 1) {
+      const candidate = turns[index]!;
+      const end = previousEnd;
+      const startsRightAfter = Date.parse(candidate.startedAt) - Date.parse(end) <= QUEUED_TURN_GRACE_MS;
+      const ownPrompt = sorted.some(
+        (other) => other.role === "user" && other.createdAt > end && other.createdAt <= candidate.startedAt,
       );
-    return queuedTurn ? next : running;
+      if (!startsRightAfter || ownPrompt) break;
+      if (!claimedByQueue.has(candidate)) {
+        claimedByQueue.add(candidate);
+        return candidate;
+      }
+      // The queue has not reached this message yet.
+      if (candidate.endedAt === null) return undefined;
+      previousEnd = candidate.endedAt;
+    }
+    return running;
   };
 
   for (const message of sorted) {

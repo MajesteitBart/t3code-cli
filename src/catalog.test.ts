@@ -140,6 +140,27 @@ describe("resolveModelChange", () => {
     expect(opencode.options).toEqual([{ id: "variant", value: "high" }]);
   });
 
+  it("turns fast mode on only with a tier named for speed", () => {
+    const flexOnly = parseCatalog({
+      providers: [
+        {
+          instanceId: "codex",
+          driver: "codex",
+          models: [
+            {
+              slug: "gpt-x",
+              capabilities: { optionDescriptors: [{ id: "serviceTier", type: "select", options: [{ id: "default", isDefault: true }, { id: "flex" }] }] },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(() => resolveModelChange({ instanceId: "codex", model: "gpt-x" }, { speedMode: "fast" }, flexOnly)).toThrow(
+      expect.objectContaining({ code: "MODEL_OPTION_UNSUPPORTED" }),
+    );
+  });
+
   it("turns fast mode off with the default service tier", () => {
     const standard = resolveModelChange(
       { instanceId: "codex", model: "gpt-6.1-sol", options: [{ id: "serviceTier", value: "priority" }] },

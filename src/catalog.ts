@@ -170,11 +170,8 @@ function setOption(options: ProviderOptionSelection[], id: string, value: string
 /** The value that turns fast mode on or off, for models whose fast mode is a service tier. */
 function serviceTierValue(descriptor: OptionDescriptor, fast: boolean): string | null {
   if (!fast) return descriptor.values.find((value) => value.isDefault || value.id === "default")?.id ?? null;
-  return (
-    descriptor.values.find((value) => value.id === "priority" || value.id === "fast")?.id ??
-    descriptor.values.find((value) => !value.isDefault && value.id !== "default")?.id ??
-    null
-  );
+  // Other tiers, such as `flex`, can be slower, so only a tier named for speed turns fast mode on.
+  return descriptor.values.find((value) => value.id === "priority" || value.id === "fast")?.id ?? null;
 }
 
 /**

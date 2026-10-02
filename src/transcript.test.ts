@@ -225,24 +225,47 @@ describe("buildTranscript", () => {
     expect(transcript.messages.find((entry) => entry.id === "folded")?.turnIndex).toBe(1);
   });
 
-  it("gives every message queued during a turn to the turn that starts right after it", () => {
+  it("gives each message queued during a turn its own queued turn", () => {
     const second = (value: number) => `2026-09-04T10:04:${String(value).padStart(2, "0")}.000Z`;
     const at4 = (base: T3Message, value: number) => ({ ...base, createdAt: second(value), updatedAt: second(value) });
-    const source = thread({
-      latestTurn: { turnId: "turn-2", state: "running", requestedAt: second(11), startedAt: second(11), completedAt: null, assistantMessageId: null },
+    const queuedDuringTurn1 = [
+      at4(message("prompt-1", "user", null, 0), 0),
+      at4(message("progress-1", "assistant", "turn-1", 0), 1),
+      at4(message("queued-a", "user", null, 0), 2),
+      at4(message("queued-b", "user", null, 0), 3),
+      at4(message("answer-1", "assistant", "turn-1", 0), 9),
+    ];
+    const turn = (turnId: string, state: "running" | "completed", requested: number, completed: number | null) => ({
+      turnId,
+      state,
+      requestedAt: second(requested),
+      startedAt: second(requested),
+      completedAt: completed === null ? null : second(completed),
+      assistantMessageId: null,
+    });
+    const owners = (source: T3Thread) =>
+      Object.fromEntries(buildTranscript(source).messages.map((entry) => [entry.id, entry.turnIndex]));
+
+    // The first queued turn runs; the second message waits for its own turn.
+    const firstQueued = thread({
+      latestTurn: turn("turn-2", "running", 11, null),
       checkpoints: [{ turnId: "turn-1", completedAt: second(10) }],
+      messages: [...queuedDuringTurn1, at4(message("progress-2", "assistant", "turn-2", 0), 12)],
+    });
+    expect(owners(firstQueued)).toMatchObject({ "queued-a": 2, "queued-b": 3, "answer-1": 1 });
+    expect(buildTranscript(firstQueued).turns.at(-1)).toMatchObject({ index: 3, state: "pending" });
+
+    // Both queued turns ran back to back.
+    const bothQueued = thread({
+      latestTurn: turn("turn-3", "completed", 14, 16),
+      checkpoints: [{ turnId: "turn-1", completedAt: second(10) }, { turnId: "turn-2", completedAt: second(13) }],
       messages: [
-        at4(message("prompt-1", "user", null, 0), 0),
-        at4(message("progress-1", "assistant", "turn-1", 0), 1),
-        at4(message("queued-a", "user", null, 0), 2),
-        at4(message("queued-b", "user", null, 0), 3),
-        at4(message("answer-1", "assistant", "turn-1", 0), 9),
-        at4(message("progress-2", "assistant", "turn-2", 0), 12),
+        ...queuedDuringTurn1,
+        at4(message("answer-2", "assistant", "turn-2", 0), 12),
+        at4(message("answer-3", "assistant", "turn-3", 0), 15),
       ],
     });
-
-    const owners = Object.fromEntries(buildTranscript(source).messages.map((entry) => [entry.id, entry.turnIndex]));
-    expect(owners).toMatchObject({ "queued-a": 2, "queued-b": 2, "answer-1": 1 });
+    expect(owners(bothQueued)).toMatchObject({ "queued-a": 2, "queued-b": 3 });
   });
 
   it("gives a queued message to the turn that starts right after its turn ends", () => {
