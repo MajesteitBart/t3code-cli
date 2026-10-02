@@ -11,6 +11,7 @@ import { discoverRuntime } from "./runtime.js";
 import { T3ThreadApi, type ThreadSettlementState } from "./threadApi.js";
 import {
   changeSettingsWithApi,
+  busyState,
   hasSettingsChange,
   settingsSummary,
   type ThreadSettingsChange,
@@ -85,6 +86,11 @@ export interface ThreadSendOptions {
   wait?: ThreadWaitOptions;
   /** Change the thread's model, effort, speed, or modes before the message starts its turn. */
   settings?: ThreadSettingsChange;
+  /**
+   * What to do when the thread is busy: `reject` (the default) refuses to send; `inject` sends into the
+   * running turn, where the provider folds the message in or queues it.
+   */
+  ifBusy?: "reject" | "inject";
 }
 
 interface EffectiveT3Settings {
@@ -532,6 +538,23 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
           details: { threadId },
         });
       }
+    }
+
+    const busy = busyState(thread);
+    if (busy && (options.ifBusy ?? "reject") === "reject") {
+      throw new CliError(
+        "THREAD_BUSY",
+        `Thread ${threadId} ${busy.turnRunning ? "is running a turn" : "has a message waiting for its turn"}. Wait for it with threads wait, or pass --if-busy inject to send into the running turn.`,
+        {
+          exitCode: 4,
+          details: {
+            threadId,
+            ...busy,
+            sessionStatus: thread.session?.status ?? null,
+            latestTurnState: thread.latestTurn?.state ?? null,
+          },
+        },
+      );
     }
 
     const settings = hasSettingsChange(options.settings)

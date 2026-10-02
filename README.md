@@ -154,6 +154,8 @@ printf '%s' "New findings that require more work..." \
 
 The send command does not report success from the HTTP response alone. It waits until the exact message is visible in T3's thread projection. Archived threads are rejected.
 
+By default, `send` refuses a busy thread with `THREAD_BUSY` and dispatches nothing. A thread is busy while a turn runs or while an earlier message still waits for its turn; `error.details` says which. Wait with `threads wait` and send again, or pass `--if-busy inject` to send into the running turn. The provider then folds the message into that turn or queues it, which `--wait` follows either way. The busy check is a snapshot, not a lock, so callers that send to the same thread at once must take turns themselves.
+
 Add `--wait` to wait for the turn that handles the message and print its reply:
 
 ```bash

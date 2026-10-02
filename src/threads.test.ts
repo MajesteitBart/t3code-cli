@@ -742,6 +742,38 @@ describe("thread controls", () => {
     expect(harness.commands[0]).toMatchObject({ type: "thread.meta.update" });
   });
 
+  it("refuses to send into a busy thread unless the caller injects", async () => {
+    const harness = await testHarness([makeThread("target", running())]);
+
+    await expect(sendThreadMessage(harness.config, { threadId: "target", prompt: "Also check the docs" })).rejects.toMatchObject({
+      code: "THREAD_BUSY",
+      exitCode: 4,
+      details: { turnRunning: true, queuedMessages: 0 },
+    });
+    expect(harness.commands).toEqual([]);
+
+    const injected = await sendThreadMessage(harness.config, { threadId: "target", prompt: "Also check the docs", ifBusy: "inject" });
+
+    expect(harness.commands).toEqual([expect.objectContaining({ type: "thread.turn.start", threadId: "target" })]);
+    expect(injected.verification).toMatchObject({ accepted: true });
+  });
+
+  it("counts a message waiting for its turn as busy", async () => {
+    const harness = await testHarness([makeThread("target", {
+      latestTurn: { turnId: "turn-1", state: "completed", requestedAt: at(0), startedAt: at(0), completedAt: at(2), assistantMessageId: null },
+      messages: [
+        ...running().messages,
+        { id: "answer", role: "assistant", text: "Done", turnId: "turn-1", streaming: false, createdAt: at(1), updatedAt: at(1) },
+        { id: "queued", role: "user", text: "Next", turnId: null, streaming: false, createdAt: at(5), updatedAt: at(5) },
+      ],
+    })]);
+
+    await expect(sendThreadMessage(harness.config, { threadId: "target", prompt: "And then this" })).rejects.toMatchObject({
+      code: "THREAD_BUSY",
+      details: { turnRunning: false, queuedMessages: 1 },
+    });
+  });
+
   it("refuses to send with new settings while a turn runs", async () => {
     const harness = await testHarness([makeThread("target", running())], { catalog: CATALOG });
 

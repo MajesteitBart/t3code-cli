@@ -89,7 +89,7 @@ printf '%s' "$THREAD_MESSAGE" \
   | t3code --json threads send --thread "$TARGET_THREAD_ID" --stdin
 ```
 
-Sending is an external state change. Keep the target and message within the caller's authorization. A settled thread requires interactive confirmation or `--wake-settled`; JSON and stdin workflows are non-interactive, so use that override only when waking the inspected target is authorized. Archived threads cannot receive a turn.
+Sending is an external state change. Keep the target and message within the caller's authorization. A settled thread requires interactive confirmation or `--wake-settled`; JSON and stdin workflows are non-interactive, so use that override only when waking the inspected target is authorized. Archived threads cannot receive a turn. A busy thread, with a running turn or a message waiting for its turn, gets `THREAD_BUSY` unless you pass `--if-busy inject` to send into the running turn.
 
 Add `--wait` to get the reply. Give the shell call a longer timeout than `--timeout`:
 
