@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -29,6 +29,8 @@ beforeAll(async () => {
   directory = await mkdtemp(path.resolve(".http-test-"));
   build = path.join(directory, "dist");
   await exec(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "tsconfig.json", "--outDir", build]);
+  // The CLI reads its version from ../package.json relative to the build output.
+  await copyFile("package.json", path.join(directory, "package.json"));
 }, 20_000);
 afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
 
