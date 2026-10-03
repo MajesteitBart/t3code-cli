@@ -571,3 +571,19 @@ git push --follow-tags
 ```
 
 Then publish a GitHub Release for the new `v<package-version>` tag. The workflow verifies that the tag matches `package.json`, installs from the frozen lockfile, runs the complete `prepublishOnly` check, and publishes the public scoped package to npm.
+
+A GitHub Release marked as a prerelease skips npm. Use one for a beta. `npm pack` does not build the package, so build it first:
+
+```bash
+npm version 0.3.0-beta.1
+pnpm install --frozen-lockfile
+pnpm check
+npm pack
+git push --follow-tags
+```
+
+Attach the tarball to a prerelease for the `v0.3.0-beta.1` tag, then install it from the release URL:
+
+```bash
+npm install --global https://github.com/MajesteitBart/t3code-cli/releases/download/v0.3.0-beta.1/bvdm-t3code-cli-0.3.0-beta.1.tgz
+```

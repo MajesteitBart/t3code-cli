@@ -16,6 +16,8 @@ concurrency:
 jobs:
   publish:
     name: Publish release
+    # A GitHub prerelease is a beta for testing, so it stays off npm.
+    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
