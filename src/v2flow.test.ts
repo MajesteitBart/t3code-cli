@@ -22,7 +22,7 @@ describe("orchestrator V2 flow", () => {
     fake.addProject();
 
     const handover = await createHandoverThread(fake.config, { prompt: "Start here", cwd: fake.root, threadEnvMode: "local" });
-    expect(handover.thread.launch.workspaceStrategy).toEqual({ type: "root" });
+    expect(handover.thread.launch.workspaceStrategy).toEqual({ type: "root", branch: "main" });
     const threadId = handover.thread.id;
     const firstRun = fake.projection(threadId).runs[0]!;
     fake.completeRun(threadId, firstRun.id, "Done with the start");

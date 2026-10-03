@@ -733,9 +733,23 @@ export async function unsettleThread(config: CliConfig, threadId: string) {
 }
 
 type WorkspaceStrategy =
-  | { type: "root" }
-  | { type: "existing_worktree"; worktreePath: string }
+  | { type: "root"; branch?: string }
+  | { type: "existing_worktree"; worktreePath: string; branch?: string }
   | { type: "worktree"; baseRef: string; branch: string; startFromOrigin: boolean };
+
+// T3's own pattern for the branch names it renames once a thread has a title.
+const TEMPORARY_BRANCH = /^t3code\/(?:[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u;
+
+/**
+ * The branch T3 records on a thread that works in an existing checkout, as T3's own client sends it. T3 renames a
+ * temporary branch even in an existing worktree, which would pull it from under the thread that created it, so the
+ * CLI leaves that one out.
+ */
+function checkoutBranch(branch: string | null, inWorktree: boolean): { branch?: string } {
+  if (branch === null) return {};
+  if (inWorktree && TEMPORARY_BRANCH.test(branch.trim().toLowerCase())) return {};
+  return { branch };
+}
 
 export async function createHandoverThread(config: CliConfig, options: ThreadCreateOptions) {
   const prompt = options.prompt.trim();
@@ -788,8 +802,8 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
             startFromOrigin: settings.newWorktreesStartFromOrigin,
           }
         : currentWorktreePath
-          ? { type: "existing_worktree", worktreePath: currentWorktreePath }
-          : { type: "root" };
+          ? { type: "existing_worktree", worktreePath: currentWorktreePath, ...checkoutBranch(workspace.branch, true) }
+          : { type: "root", ...checkoutBranch(workspace.branch, false) };
     const threadId = randomUUID();
     const messageId = randomUUID();
     const launch = {

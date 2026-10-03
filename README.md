@@ -66,9 +66,14 @@ PowerShell:
 'Continue from this handover...' | t3code handover --stdin
 ```
 
+PowerShell 7.3 and later pass prompts intact as arguments and on stdin, unless `$PSNativeCommandArgumentPassing` is `Legacy`. Older versions drop double quotes from arguments, so send the prompt on stdin there. Windows PowerShell 5.1 also sends stdin as ASCII, so `café` arrives as `caf?`. In 5.1, run `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` before piping, or write the prompt to a UTF-8 file and pass `--prompt-file`.
+
+Git Bash rewrites an argument that starts with a slash into a Windows path, so `--prompt "/compact"` arrives as `C:/Program Files/Git/compact`. Send such prompts on stdin, or set `MSYS_NO_PATHCONV=1`.
+
 The default behavior is:
 
 - resolve the Git repository root (`workspaceMode: "repo"`); a linked worktree, such as one T3 created for another thread, resolves to the main checkout's project, and a `current` checkout handover keeps the new thread in that worktree;
+- record the checkout's branch on the new thread, as T3's own client does. A worktree still on a temporary `t3code/<8 hex>` branch is the exception: T3 would rename that branch under the thread that created it, so the CLI leaves it out;
 - create a missing T3 project (`projectPolicy: "create"`);
 - resolve T3's checkout preference in the same order as the app: project setting, checked-in `t3.json`, then the global setting;
 - use the project's saved model selection, including provider options, or T3's own default model when the project has none;

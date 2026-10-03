@@ -113,7 +113,7 @@ describe("createHandoverThread", () => {
       modelSelection: model,
       runtimeMode: "full-access",
       interactionMode: "default",
-      workspaceStrategy: { type: "root" },
+      workspaceStrategy: { type: "root", branch: "main" },
       initialMessage: { messageId: result.thread.messageId, text: prompt, attachments: [] },
     });
     expect(result.thread.title).toHaveLength(80);
@@ -246,8 +246,19 @@ describe("createHandoverThread", () => {
     expect(resolved.project?.id).toBe("project-main");
     expect(resolved.workspace).toMatchObject({ workspaceRoot: worktree, mainWorktreeRoot: await realpath(fake.root), branch: "feature/linked" });
     expect(result.project.id).toBe("project-main");
+    expect(result.thread.launch.workspaceStrategy).toEqual({ type: "existing_worktree", worktreePath: worktree, branch: "feature/linked" });
+    // Without the branch, T3 records the thread with none, and its pull request and branch views lose it.
+    expect(fake.projection(result.thread.id).thread).toMatchObject({ worktreePath: worktree, branch: "feature/linked" });
+  });
+
+  it("leaves out a worktree's temporary branch, which T3 would rename under the thread that created it", async () => {
+    const fake = await fakeT3();
+    await addRootProject(fake);
+    const worktree = await addLinkedWorktree(fake.root, "t3code/1a2b3c4d");
+
+    const result = await createHandoverThread(fake.config, { cwd: worktree, prompt: "Handover", threadEnvMode: "local", dryRun: true });
+
     expect(result.thread.launch.workspaceStrategy).toEqual({ type: "existing_worktree", worktreePath: worktree });
-    expect(fake.projection(result.thread.id).thread.worktreePath).toBe(worktree);
   });
 
   it("starts a new worktree from the current branch on a temporary branch", async () => {
@@ -299,7 +310,7 @@ describe("createHandoverThread", () => {
     const result = await createHandoverThread(fake.config, { cwd: fake.root, prompt: "Handover", dryRun: true });
 
     expect(result.settings).toMatchObject({ effectiveThreadEnvMode: "local", threadEnvModeSource: "project", projectFileDefaultThreadEnvMode: "worktree" });
-    expect(result.thread.launch.workspaceStrategy).toEqual({ type: "root" });
+    expect(result.thread.launch.workspaceStrategy).toEqual({ type: "root", branch: "main" });
   });
 
   it("prefers t3.json's checkout setting over the global setting", async () => {
@@ -311,7 +322,7 @@ describe("createHandoverThread", () => {
     const result = await createHandoverThread(fake.config, { cwd: fake.root, prompt: "Handover", dryRun: true });
 
     expect(result.settings).toMatchObject({ effectiveThreadEnvMode: "local", threadEnvModeSource: "t3.json" });
-    expect(result.thread.launch.workspaceStrategy).toEqual({ type: "root" });
+    expect(result.thread.launch.workspaceStrategy).toEqual({ type: "root", branch: "main" });
   });
 
   it("uses the global checkout setting when the project and t3.json do not set one", async () => {

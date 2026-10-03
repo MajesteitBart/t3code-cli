@@ -535,7 +535,8 @@ export async function startFakeT3(options: FakeT3Options = {}): Promise<FakeT3> 
         runtimeMode: payload.runtimeMode as NonNullable<T3ThreadProjection["thread"]["runtimeMode"]>,
         interactionMode: payload.interactionMode as NonNullable<T3ThreadProjection["thread"]["interactionMode"]>,
         worktreePath: strategy.type === "existing_worktree" ? strategy.worktreePath! : strategy.type === "worktree" ? path.join(root, "worktree") : null,
-        branch: strategy.branch ?? "main",
+        // T3 records the branch the launch names, or none.
+        branch: strategy.branch ?? null,
       });
       const initial = payload.initialMessage as { messageId?: string; text: string } | undefined;
       if (initial) fake.startRun(threadId, initial.text, initial.messageId ? { messageId: initial.messageId } : {});
