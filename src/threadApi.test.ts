@@ -1,674 +1,475 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
-import type { T3Api } from "./api.js";
+import { T3Api } from "./api.js";
 import { CliError } from "./errors.js";
-import { T3ThreadApi } from "./threadApi.js";
-import type { OrchestrationSnapshot, T3Message, T3Thread, ThreadDetailSnapshot } from "./types.js";
+import { discoverRuntime } from "./runtime.js";
+import { startFakeT3, type FakeT3, type FakeT3Options } from "./testing/fakeT3.js";
+import { createdBy, observeRun, runForMessage, T3ThreadApi } from "./threadApi.js";
+import {
+  TERMINAL_RUN_STATUSES,
+  type RunStatus,
+  type T3Message,
+  type T3Run,
+  type T3RuntimeRequest,
+  type T3ThreadProjection,
+  type T3TurnItem,
+} from "./types.js";
 
-function thread(overrides: Partial<T3Thread> = {}): T3Thread {
+const fakes: FakeT3[] = [];
+afterEach(async () => {
+  await Promise.all(fakes.splice(0).map((fake) => fake.close()));
+});
+
+function at(minute: number): string {
+  return `2026-10-01T10:${String(minute).padStart(2, "0")}:00.000Z`;
+}
+
+function run(ordinal: number, status: RunStatus, overrides: Partial<T3Run> = {}): T3Run {
   return {
-    id: "thread-1",
-    projectId: "project-1",
-    title: "Implementation",
-    modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
-    runtimeMode: "full-access",
-    interactionMode: "default",
-    branch: "main",
-    worktreePath: null,
-    latestTurn: null,
-    session: null,
-    createdAt: "2026-09-04T10:00:00.000Z",
-    updatedAt: "2026-09-04T10:00:00.000Z",
-    archivedAt: null,
-    settledAt: null,
+    id: `run-${ordinal}`,
+    threadId: "thread-1",
+    ordinal,
+    userMessageId: `prompt-${ordinal}`,
+    status,
+    queuePosition: null,
+    requestedAt: at(ordinal),
+    startedAt: status === "queued" ? null : at(ordinal),
+    completedAt: TERMINAL_RUN_STATUSES.includes(status) ? at(ordinal + 1) : null,
+    ...overrides,
+  };
+}
+
+function message(id: string, role: T3Message["role"], runId: string | null, minute = 0): T3Message {
+  return { id, role, runId, text: id, streaming: false, createdAt: at(minute), updatedAt: at(minute) };
+}
+
+function projection(parts: Partial<T3ThreadProjection> = {}): T3ThreadProjection {
+  return {
+    thread: { id: "thread-1", projectId: "project-1", title: "Work", archivedAt: null },
+    runs: [],
+    runtimeRequests: [],
     messages: [],
-    deletedAt: null,
-    ...overrides,
+    turnItems: [],
+    ...parts,
   };
 }
 
-function snapshot(threads: T3Thread[], snapshotSequence = 1): OrchestrationSnapshot {
-  return {
-    snapshotSequence,
-    projects: [{
-      id: "project-1",
-      title: "Project",
-      workspaceRoot: "/project",
-      defaultModelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
-      deletedAt: null,
-    }],
-    threads,
-    updatedAt: "2026-09-04T10:00:00.000Z",
+function pending(id: string, runId: string, capability: T3RuntimeRequest["responseCapability"]["type"]) {
+  const request: T3RuntimeRequest = {
+    id,
+    kind: capability === "message" ? "user_input" : "command",
+    status: "pending",
+    responseCapability: { type: capability },
+    createdAt: at(1),
+    resolvedAt: null,
   };
+  const item: T3TurnItem = {
+    id: `item:${id}`,
+    type: capability === "message" ? "user_input_request" : "approval_request",
+    runId,
+    requestId: id,
+    questions: [],
+  };
+  return { request, item };
 }
 
-function mockApi(overrides: Partial<T3Api> = {}): T3Api {
-  return {
-    shellSnapshot: async () => snapshot([thread()]),
-    snapshot: async () => snapshot([thread()]),
-    request: async () => ({ snapshotSequence: 1, thread: thread() } satisfies ThreadDetailSnapshot),
-    dispatch: async () => ({ sequence: 2 }),
-    ...overrides,
-  } as unknown as T3Api;
+describe("observeRun", () => {
+  it("reports an idle thread without runs", () => {
+    expect(observeRun(projection())).toEqual({ outcome: "idle", run: null });
+  });
+
+  it.each([
+    ["completed", "completed"],
+    ["interrupted", "interrupted"],
+    ["cancelled", "interrupted"],
+    ["rolled_back", "ended"],
+  ] as const)("reports a %s run as %s", (status, outcome) => {
+    const source = projection({ runs: [run(1, status)], messages: [message("prompt-1", "user", "run-1")] });
+
+    expect(observeRun(source)).toEqual({ outcome, run: source.runs[0] });
+    expect(observeRun(source, "prompt-1")).toEqual({ outcome, run: source.runs[0] });
+  });
+
+  it("reports a failed run with the failure from its error item", () => {
+    const source = projection({
+      runs: [run(1, "failed")],
+      turnItems: [
+        { id: "early", type: "error", runId: "run-1", failure: { message: "Retrying" } },
+        { id: "late", type: "error", runId: "run-1", failure: { message: "Usage limit reached" } },
+      ],
+    });
+
+    expect(observeRun(source)).toMatchObject({ outcome: "error", error: "Usage limit reached" });
+    // Without an error item the reason is unknown.
+    expect(observeRun(projection({ runs: [run(1, "failed")] }))).toMatchObject({
+      outcome: "error",
+      error: "The provider could not complete the turn.",
+    });
+  });
+
+  it.each(["preparing", "starting", "running", "waiting"] as const)("keeps waiting while a run is %s", (status) => {
+    expect(observeRun(projection({ runs: [run(1, status)] }))).toBeNull();
+  });
+
+  it("stops for a request on the awaited run or one that holds up the active run", () => {
+    const own = pending("approval", "run-1", "live");
+    const onAwaited = projection({ runs: [run(1, "running")], runtimeRequests: [own.request], turnItems: [own.item] });
+    expect(observeRun(onAwaited)).toMatchObject({ outcome: "needs-attention", run: { id: "run-1" } });
+
+    // A blocking request without a timeline item still holds up the run that works.
+    const bare = projection({ runs: [run(1, "running")], runtimeRequests: [own.request] });
+    expect(observeRun(bare)).toMatchObject({ outcome: "needs-attention" });
+  });
+
+  it("ignores an earlier run's message-mode question once the awaited run finished", () => {
+    const old = pending("question", "run-1", "message");
+    const source = projection({
+      runs: [run(1, "completed"), run(2, "completed")],
+      runtimeRequests: [old.request],
+      turnItems: [old.item],
+      messages: [message("prompt-1", "user", "run-1"), message("prompt-2", "user", "run-2")],
+    });
+
+    expect(observeRun(source, "prompt-2")).toMatchObject({ outcome: "completed", run: { id: "run-2" } });
+    // The run that asked does need a person.
+    expect(observeRun(source, "prompt-1")).toMatchObject({ outcome: "needs-attention", run: { id: "run-1" } });
+  });
+
+  it("follows a queued message until its run starts and finishes, unless the queue is held", () => {
+    const queued = projection({
+      runs: [run(1, "running"), run(2, "queued", { queuePosition: 1 })],
+      messages: [message("prompt-2", "user", "run-2")],
+    });
+    expect(observeRun(queued, "prompt-2")).toBeNull();
+
+    const held = projection({ runs: [run(1, "completed"), run(2, "queued", { queuePosition: 1, queueHeld: true })] });
+    expect(observeRun(held, "prompt-2")).toMatchObject({ outcome: "queue-held", run: { id: "run-2" } });
+    expect(observeRun(held)).toMatchObject({ outcome: "queue-held", run: { id: "run-2" } });
+  });
+
+  it("stops for a queued message when the run ahead of it waits for a person", () => {
+    const approval = pending("approval", "run-1", "live");
+    const source = projection({
+      runs: [run(1, "running"), run(2, "queued", { queuePosition: 1 })],
+      runtimeRequests: [approval.request],
+      turnItems: [approval.item],
+      messages: [message("prompt-2", "user", "run-2")],
+    });
+    expect(observeRun(source, "prompt-2")).toMatchObject({ outcome: "needs-attention", run: { id: "run-2" } });
+  });
+
+  it("waits on the thread until its queue drains", () => {
+    expect(observeRun(projection({ runs: [run(1, "completed"), run(2, "queued", { queuePosition: 1 })] }))).toBeNull();
+    expect(observeRun(projection({ runs: [run(1, "completed"), run(2, "running")] }))).toBeNull();
+    expect(observeRun(projection({ runs: [run(1, "completed"), run(2, "completed")] }))).toMatchObject({
+      outcome: "completed",
+      run: { id: "run-2" },
+    });
+  });
+
+  it("finds the run of a steered message and waits for a message T3 has not recorded yet", () => {
+    const source = projection({
+      runs: [run(1, "completed")],
+      messages: [message("prompt-1", "user", "run-1"), message("steer", "user", "run-1", 1)],
+    });
+
+    expect(runForMessage(source, "steer")?.id).toBe("run-1");
+    expect(observeRun(source, "steer")).toMatchObject({ outcome: "completed", run: { id: "run-1" } });
+    expect(observeRun(source, "unknown")).toBeNull();
+    expect(runForMessage(source, "unknown")).toBeNull();
+  });
+});
+
+async function connect(options: FakeT3Options = {}) {
+  const fake = await startFakeT3({ runBehavior: "hold", gitRepo: false, ...options });
+  fakes.push(fake);
+  fake.addProject();
+  const api = new T3Api(await discoverRuntime(fake.config, { startDesktopIfNeeded: false }), "mock-token");
+  const adapter = new T3ThreadApi(api, {
+    verificationTimeoutMs: 1_000,
+    verificationIntervalMs: 5,
+    waitIntervalMs: 5,
+    controlTimeoutMs: 1_000,
+  });
+  return { fake, api, adapter };
 }
 
-describe("T3ThreadApi", () => {
-  it("uses the unwindowed detail endpoint for a complete read", async () => {
-    const paths: string[] = [];
-    const adapter = new T3ThreadApi(mockApi({
-      request: async (_method, requestPath) => {
-        paths.push(requestPath);
-        return { snapshotSequence: 1, thread: thread() } satisfies ThreadDetailSnapshot;
-      },
-    }));
+/** Resolves once a waiter has polled the thread again, so it has seen the state the test set up. */
+async function nextPoll(fake: FakeT3, threadId: string): Promise<void> {
+  const polls = () => fake.httpRequests.filter((request) => request.url === `/api/orchestration/threads/${threadId}/bounded`).length;
+  const before = polls();
+  while (polls() <= before) await new Promise((resolve) => setTimeout(resolve, 2));
+}
 
-    await adapter.read("thread-1");
+function stalledApi(): T3Api {
+  return { threadDetail: () => new Promise(() => undefined) } as unknown as T3Api;
+}
 
-    expect(paths).toEqual(["/api/orchestration/threads/thread-1"]);
+function dispatchMessage(threadId: string, messageId: string, dispatchMode: Record<string, unknown>) {
+  return { type: "message.dispatch", threadId, messageId, text: messageId, attachments: [], ...createdBy(), dispatchMode };
+}
+
+describe("T3ThreadApi reads and commands", () => {
+  it("reads the whole thread and polls a bounded window", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread({ turns: 1 });
+
+    const read = await adapter.read(thread.id);
+    const inspected = await adapter.inspect(thread.id);
+
+    expect(read.projection.runs).toHaveLength(1);
+    expect(read.snapshotSequence).toBe(fake.sequence);
+    expect(inspected.projection.thread.id).toBe(thread.id);
+    expect(fake.httpRequests.map((request) => request.url).filter((url) => url.startsWith("/api/orchestration/"))).toEqual([
+      `/api/orchestration/threads/${thread.id}`,
+      `/api/orchestration/threads/${thread.id}/bounded`,
+    ]);
   });
 
-  it("keeps inspect bounded to recent turns", async () => {
-    const paths: string[] = [];
-    const adapter = new T3ThreadApi(mockApi({
-      request: async (_method, requestPath) => {
-        paths.push(requestPath);
-        return { snapshotSequence: 1, thread: thread() } satisfies ThreadDetailSnapshot;
-      },
-    }));
-
-    await adapter.inspect("thread-1");
-
-    expect(paths).toEqual(["/api/orchestration/threads/thread-1?turnLimit=10"]);
-  });
-
-  it("builds the existing-thread turn payload with the saved model but no creation fields", () => {
-    const adapter = new T3ThreadApi(mockApi());
-    const command = adapter.buildTurnStart(thread(), "Review findings");
-
-    expect(command).toMatchObject({
-      type: "thread.turn.start",
-      threadId: "thread-1",
-      message: { role: "user", text: "Review findings", attachments: [] },
-      runtimeMode: "full-access",
-      interactionMode: "default",
+  it("names the command T3 rejected", async () => {
+    const { fake, adapter } = await connect({
+      onCommand: (command) => (command.type === "thread.settle" ? "Thread has active work." : undefined),
     });
-    expect(command).not.toHaveProperty("bootstrap");
-    expect(command).not.toHaveProperty("titleSeed");
-    // The saved selection rides on every turn, so a changed model or effort reaches a live session.
-    expect(command.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.6-sol" });
+    const { thread } = fake.addThread();
+
+    const failure = await adapter.dispatch({ type: "thread.settle", threadId: thread.id }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: "THREAD_COMMAND_REJECTED",
+      exitCode: 4,
+      message: `T3 rejected thread.settle for thread ${thread.id}: Thread has active work.`,
+      details: { type: "thread.settle", threadId: thread.id },
+      cause: { code: "T3_RPC_FAILED" },
+    });
+    expect(fake.commands).toEqual([]);
   });
 
-  it("preserves a saved auto runtime mode", () => {
-    const adapter = new T3ThreadApi(mockApi());
+  it("gives each command an id unless the caller chose one", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
 
-    const command = adapter.buildTurnStart(thread({ runtimeMode: "auto" }), "Review findings");
+    const first = await adapter.dispatch({ type: "thread.pin", threadId: thread.id });
+    await adapter.dispatch({ type: "thread.unpin", commandId: "chosen-id", threadId: thread.id });
 
-    expect(command.runtimeMode).toBe("auto");
+    expect(first.sequence).toBe(fake.sequence - 1);
+    expect(fake.commands[0]?.commandId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(fake.commands[1]?.commandId).toBe("chosen-id");
   });
 
-  it("builds the installed settlement command payloads", () => {
-    const adapter = new T3ThreadApi(mockApi());
+  it("passes on failures that are not command rejections", async () => {
+    const timeout = new CliError("T3_RPC_TIMEOUT", "T3 did not answer.");
+    const adapter = new T3ThreadApi({ dispatchCommand: async () => Promise.reject(timeout) } as unknown as T3Api);
 
-    expect(adapter.buildSettlement("thread-1", "settled")).toMatchObject({
-      type: "thread.settle",
-      threadId: "thread-1",
-    });
-    expect(adapter.buildSettlement("thread-1", "active")).toMatchObject({
-      type: "thread.unsettle",
-      threadId: "thread-1",
-      reason: "user",
-    });
+    await expect(adapter.dispatch({ type: "thread.pin", threadId: "thread-1" })).rejects.toBe(timeout);
   });
 
-  it("verifies acceptance by the exact projected message id", async () => {
-    let projected: T3Thread = thread();
-    const api = mockApi({
-      dispatch: async (value: unknown) => {
-        const command = value as ReturnType<T3ThreadApi["buildTurnStart"]>;
-        projected = thread({
-          updatedAt: command.createdAt,
-          messages: [{
-            id: command.message.messageId,
-            role: "user",
-            text: command.message.text,
-            turnId: null,
-            streaming: false,
-            createdAt: command.createdAt,
-            updatedAt: command.createdAt,
-          }],
-        });
-        return { sequence: 2 };
-      },
-      request: async () => ({ snapshotSequence: 2, thread: projected }),
-    });
-    const adapter = new T3ThreadApi(api);
-    const command = adapter.buildTurnStart(thread(), "Review findings");
+  it("verifies a message by its id and names the run that handles it", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
 
-    const result = await adapter.dispatchTurn(command);
+    const started = await adapter.dispatch(dispatchMessage(thread.id, "message-1", { type: "start_immediately" }));
+    const verified = await adapter.verifyMessage(thread.id, "message-1", started.sequence);
+    const steered = await adapter.dispatch(dispatchMessage(thread.id, "steer-1", { type: "steer_active", targetRunId: verified.runId }));
 
-    expect(result.verification).toEqual({
+    expect(verified).toEqual({
       accepted: true,
       method: "message-id",
-      snapshotSequence: 2,
-      messageId: command.message.messageId,
+      messageId: "message-1",
+      dispatchSequence: started.sequence,
+      runId: fake.projection(thread.id).runs[0]!.id,
+      runStatus: "running",
     });
+    expect(await adapter.verifyMessage(thread.id, "steer-1", steered.sequence)).toMatchObject({ runId: verified.runId, runStatus: "running" });
   });
 
-  it("does not report success when dispatch returns before the target projection changes", async () => {
-    const adapter = new T3ThreadApi(mockApi({
-      request: async () => ({ snapshotSequence: 2, thread: thread() }),
-    }), {
-      verificationTimeoutMs: 1,
-      verificationIntervalMs: 0,
-    });
-    const command = adapter.buildTurnStart(thread(), "Review findings");
+  it("fails verification when T3 never records the message", async () => {
+    const { fake, api } = await connect();
+    const { thread } = fake.addThread();
+    const adapter = new T3ThreadApi(api, { verificationTimeoutMs: 50, verificationIntervalMs: 5 });
 
-    await expect(adapter.dispatchTurn(command)).rejects.toMatchObject({
+    await expect(adapter.verifyMessage(thread.id, "missing", 7)).rejects.toMatchObject({
       code: "THREAD_TURN_NOT_VERIFIED",
       exitCode: 5,
-      details: {
-        threadId: "thread-1",
-        messageId: command.message.messageId,
-        dispatchSequence: 2,
-      },
-    } satisfies Partial<CliError>);
+      details: { threadId: thread.id, messageId: "missing", dispatchSequence: 7 },
+    });
   });
 
-  it("ends turn verification at its deadline when a read stalls", async () => {
-    const adapter = new T3ThreadApi(mockApi({ request: () => new Promise(() => undefined) }), {
-      verificationTimeoutMs: 50,
-      verificationIntervalMs: 0,
-    });
+  it("ends verification at its deadline when a read stalls", async () => {
+    const adapter = new T3ThreadApi(stalledApi(), { verificationTimeoutMs: 50, verificationIntervalMs: 0 });
     const started = Date.now();
 
-    await expect(adapter.dispatchTurn(adapter.buildTurnStart(thread(), "Review findings"))).rejects.toMatchObject({
-      code: "THREAD_TURN_NOT_VERIFIED",
-    });
+    await expect(adapter.verifyMessage("thread-1", "message-1", 1)).rejects.toMatchObject({ code: "THREAD_TURN_NOT_VERIFIED" });
     expect(Date.now() - started).toBeLessThan(1_000);
   });
 
-  it("does not accept a projection watermark without the exact message id", async () => {
-    let projected = thread();
-    const adapter = new T3ThreadApi(mockApi({
-      dispatch: async (value: unknown) => {
-        const command = value as ReturnType<T3ThreadApi["buildTurnStart"]>;
-        projected = thread({
-          updatedAt: command.createdAt,
-          latestUserMessageAt: command.createdAt,
-          messages: [],
-        });
-        return { sequence: 2 };
-      },
-      request: async () => ({ snapshotSequence: 2, thread: projected }),
-    }), {
-      verificationTimeoutMs: 1,
-      verificationIntervalMs: 0,
-    });
-    const command = adapter.buildTurnStart(thread(), "Review findings");
+  it("polls until a check passes and returns the last projection when it never does", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread({ title: "Polled" });
 
-    await expect(adapter.dispatchTurn(command)).rejects.toMatchObject({
-      code: "THREAD_TURN_NOT_VERIFIED",
-      exitCode: 5,
-      details: {
-        threadId: "thread-1",
-        messageId: command.message.messageId,
-        dispatchSequence: 2,
-      },
-    } satisfies Partial<CliError>);
-  });
+    const found = await adapter.poll(thread.id, (candidate) => candidate.thread.title, 200);
+    const missed = await adapter.poll(thread.id, () => null, 30);
 
-  it("verifies settlement against the projected lifecycle state", async () => {
-    let projected = thread();
-    const adapter = new T3ThreadApi(mockApi({
-      dispatch: async () => {
-        projected = thread({
-          settledOverride: "settled",
-          settledAt: "2026-09-04T12:00:00.000Z",
-          updatedAt: "2026-09-04T12:00:00.000Z",
-        });
-        return { sequence: 2 };
-      },
-      request: async () => ({ snapshotSequence: 2, thread: projected }),
-    }));
-
-    const result = await adapter.dispatchSettlement(
-      adapter.buildSettlement("thread-1", "settled"),
-      "2026-09-04T10:00:00.000Z",
-    );
-
-    expect(result.verification).toEqual({
-      accepted: true,
-      state: "settled",
-      snapshotSequence: 2,
-      settledAt: "2026-09-04T12:00:00.000Z",
-      unsettledAt: null,
-    });
-  });
-
-  it("falls back to the full snapshot when the detail endpoint is unavailable", async () => {
-    const expected = thread();
-    const adapter = new T3ThreadApi(mockApi({
-      request: async () => {
-        throw new CliError("T3_API_ERROR", "not found", { details: { status: 404 } });
-      },
-      snapshot: async () => snapshot([expected], 7),
-    }));
-
-    await expect(adapter.inspect("thread-1")).resolves.toEqual({
-      snapshotSequence: 7,
-      thread: expected,
-    });
+    expect(found.value).toBe("Polled");
+    expect(missed.value).toBeNull();
+    expect(missed.projection?.thread.id).toBe(thread.id);
   });
 });
 
 describe("T3ThreadApi.waitForTurn", () => {
-  const at = (minute: number) => `2026-09-04T10:${String(minute).padStart(2, "0")}:00.000Z`;
-  const message = (id: string, role: T3Message["role"], turnId: string | null, minute: number): T3Message => ({
-    id,
-    role,
-    text: id,
-    turnId,
-    streaming: false,
-    createdAt: at(minute),
-    updatedAt: at(minute),
-  });
-  const turn = (turnId: string, state: "running" | "completed", requested: number, completed: number | null) => ({
-    turnId,
-    state,
-    requestedAt: at(requested),
-    startedAt: at(requested),
-    completedAt: completed === null ? null : at(completed),
-    assistantMessageId: null,
-  });
-  const session = (status: "running" | "ready") => ({
-    threadId: "thread-1",
-    status,
-    providerName: "codex",
-    runtimeMode: "full-access" as const,
-    activeTurnId: null,
-    lastError: null,
-    updatedAt: at(0),
-  });
-  const firstTurn = [message("prompt-1", "user", null, 0), message("answer-1", "assistant", "turn-1", 1)];
+  it("waits for the run that handles a message and returns its turn", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread({ turns: 1 });
+    const second = fake.startRun(thread.id, "Second", { messageId: "message-2" });
 
-  /** Serves the given thread states in order and repeats the last one. */
-  function scripted(states: T3Thread[]) {
-    let reads = 0;
-    const paths: string[] = [];
-    const adapter = new T3ThreadApi(
-      mockApi({
-        request: async (_method, requestPath) => {
-          paths.push(requestPath);
-          return { snapshotSequence: reads, thread: states[Math.min(reads++, states.length - 1)]! };
-        },
-      }),
-      { waitIntervalMs: 0, queueGraceMs: 30 },
+    const waiting = adapter.waitForTurn(thread.id, { messageId: "message-2", timeoutMs: 5_000 });
+    await nextPoll(fake, thread.id);
+    fake.completeRun(thread.id, second.id, "Second answer");
+    const waited = await waiting;
+
+    expect(waited).toMatchObject({ outcome: "completed", runId: second.id, turnIndex: 2, snapshotSequence: fake.sequence });
+    expect(waited).not.toHaveProperty("error");
+    expect(waited.waitedMs).toBeGreaterThanOrEqual(0);
+    expect(waited.projection.messages.map((entry) => entry.text)).toContain("Second answer");
+    // The wait ends with one read of the whole thread.
+    expect(fake.httpRequests.at(-1)?.url).toBe(`/api/orchestration/threads/${thread.id}`);
+  });
+
+  it.each(["interrupted", "cancelled"] as const)("reports a %s run as interrupted", async (status) => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+    const running = fake.startRun(thread.id, "Go", { messageId: "message-1" });
+
+    const waiting = adapter.waitForTurn(thread.id, { messageId: "message-1", timeoutMs: 5_000 });
+    await nextPoll(fake, thread.id);
+    fake.completeRun(thread.id, running.id, "Stopped", status);
+
+    await expect(waiting).resolves.toMatchObject({ outcome: "interrupted", runId: running.id, turnIndex: 1 });
+  });
+
+  it("reports why the provider could not run the turn", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+    const running = fake.startRun(thread.id, "Go");
+
+    const waiting = adapter.waitForTurn(thread.id, { timeoutMs: 5_000 });
+    await nextPoll(fake, thread.id);
+    fake.projection(thread.id).turnItems.push({ id: "error-1", type: "error", runId: running.id, failure: { message: "Usage limit reached" } });
+    fake.completeRun(thread.id, running.id, "", "failed");
+
+    await expect(waiting).resolves.toMatchObject({ outcome: "error", error: "Usage limit reached", runId: running.id });
+  });
+
+  it("stops when the running turn asks for an approval", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+    const running = fake.startRun(thread.id, "Go", { messageId: "message-1" });
+
+    const waiting = adapter.waitForTurn(thread.id, { messageId: "message-1", timeoutMs: 5_000 });
+    await nextPoll(fake, thread.id);
+    fake.addApproval(thread.id, running.id);
+
+    await expect(waiting).resolves.toMatchObject({ outcome: "needs-attention", runId: running.id });
+  });
+
+  it("reports a message that waits in a held queue", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread({ turns: 1 });
+    fake.startRun(thread.id, "Next", { messageId: "message-2", status: "queued" }).queueHeld = true;
+
+    await expect(adapter.waitForTurn(thread.id, { messageId: "message-2", timeoutMs: 5_000 })).resolves.toMatchObject({
+      outcome: "queue-held",
+      turnIndex: 2,
+    });
+    await expect(adapter.waitForTurn(thread.id, { timeoutMs: 5_000 })).resolves.toMatchObject({ outcome: "queue-held" });
+  });
+
+  it("reports a thread that has no turns", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+
+    await expect(adapter.waitForTurn(thread.id, { timeoutMs: 5_000 })).resolves.toMatchObject({
+      outcome: "idle",
+      runId: null,
+      turnIndex: null,
+    });
+  });
+
+  it("waits on the thread until its queue drains", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+    const first = fake.startRun(thread.id, "First");
+    const second = fake.startRun(thread.id, "Second", { status: "queued" });
+
+    const waiting = adapter.waitForTurn(thread.id, { timeoutMs: 5_000 });
+    await nextPoll(fake, thread.id);
+    // The queued run starts as soon as the first one ends.
+    fake.completeRun(thread.id, first.id, "First answer");
+    expect(fake.projection(thread.id).runs[1]?.status).toBe("running");
+    await nextPoll(fake, thread.id);
+    fake.completeRun(thread.id, second.id, "Second answer");
+
+    await expect(waiting).resolves.toMatchObject({ outcome: "completed", runId: second.id, turnIndex: 2 });
+  });
+
+  it("waits for the run a steered message joined", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+    const running = fake.startRun(thread.id, "First");
+    await adapter.dispatch(dispatchMessage(thread.id, "steer-1", { type: "steer_active", targetRunId: running.id }));
+
+    const waiting = adapter.waitForTurn(thread.id, { messageId: "steer-1", timeoutMs: 5_000 });
+    await nextPoll(fake, thread.id);
+    fake.completeRun(thread.id, running.id, "Done, with the steer");
+
+    await expect(waiting).resolves.toMatchObject({ outcome: "completed", runId: running.id, turnIndex: 1 });
+  });
+
+  it("times out with the state it saw last", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+    const running = fake.startRun(thread.id, "First", { messageId: "message-1" });
+    fake.startRun(thread.id, "Second", { status: "queued" });
+
+    const failure = await adapter.waitForTurn(thread.id, { messageId: "message-1", timeoutMs: 50 }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CliError);
+    expect(failure).toMatchObject({
+      code: "THREAD_WAIT_TIMEOUT",
+      exitCode: 6,
+      details: { threadId: thread.id, messageId: "message-1", activeRunId: running.id, activeRunStatus: "running", queuedRuns: 1 },
+    });
+    await expect(adapter.waitForTurn(thread.id, { timeoutMs: 20 })).rejects.toSatisfy(
+      (error: unknown) => error instanceof CliError && !Object.hasOwn(error.details as object, "messageId"),
     );
-    return { adapter, reads: () => reads, paths };
-  }
-
-  it("waits for the turn that handles the sent message and confirms it finished", async () => {
-    const sent = message("sent", "user", null, 10);
-    const { adapter, reads } = scripted([
-      thread({ latestTurn: turn("turn-1", "completed", 0, 2), session: session("ready"), messages: [...firstTurn, sent] }),
-      thread({
-        latestTurn: turn("turn-2", "running", 10, null),
-        session: session("running"),
-        messages: [...firstTurn, sent, message("progress-2", "assistant", "turn-2", 11)],
-      }),
-      thread({
-        latestTurn: turn("turn-2", "completed", 10, 12),
-        session: session("ready"),
-        messages: [...firstTurn, sent, message("answer-2", "assistant", "turn-2", 12)],
-      }),
-    ]);
-
-    const result = await adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 });
-
-    expect(result).toMatchObject({ outcome: "completed", turnIndex: 2 });
-    // Four bounded polls, then one read of the whole thread.
-    expect(reads()).toBe(5);
-  });
-
-  it("keeps waiting while a queued turn has not started yet", async () => {
-    // Seconds matter here: a queued turn starts right after the running one ends.
-    const second = (value: number) => `2026-09-04T10:05:${String(value).padStart(2, "0")}.000Z`;
-    const atSecond = (base: T3Message, value: number) => ({ ...base, createdAt: second(value), updatedAt: second(value) });
-    const sent = atSecond(message("sent", "user", null, 0), 5);
-    const turnAt = (turnId: string, state: "running" | "completed", requested: number, completed: number | null) => ({
-      ...turn(turnId, state, 0, null),
-      requestedAt: second(requested),
-      startedAt: second(requested),
-      completedAt: completed === null ? null : second(completed),
-    });
-    const gap = thread({ latestTurn: turnAt("turn-1", "completed", 0, 6), session: session("ready"), messages: [...firstTurn, sent] });
-    const { adapter } = scripted([
-      thread({ latestTurn: turnAt("turn-1", "running", 0, null), session: session("running"), messages: [...firstTurn, sent] }),
-      // The running turn finished; the queued turn starts several polls later.
-      gap,
-      gap,
-      gap,
-      thread({
-        latestTurn: turnAt("turn-2", "running", 7, null),
-        session: session("running"),
-        messages: [...firstTurn, sent, atSecond(message("progress-2", "assistant", "turn-2", 0), 8)],
-      }),
-      thread({
-        latestTurn: turnAt("turn-2", "completed", 7, 9),
-        session: session("ready"),
-        messages: [...firstTurn, sent, atSecond(message("answer-2", "assistant", "turn-2", 0), 9)],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
-      outcome: "completed",
-      turnIndex: 2,
-    });
-  });
-
-  it("returns the turn a message was folded into once no queued turn appears", async () => {
-    const sent = message("sent", "user", null, 1);
-    const { adapter, reads } = scripted([
-      thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: [...firstTurn, sent] }),
-      thread({
-        latestTurn: turn("turn-1", "completed", 0, 3),
-        session: session("ready"),
-        messages: [...firstTurn, sent, message("answer-after", "assistant", "turn-1", 2)],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
-      outcome: "completed",
-      turnIndex: 1,
-    });
-    // The quiet period after the turn ended took more than two polls.
-    expect(reads()).toBeGreaterThan(2);
-  });
-
-  it("reports a start failure while waiting without a message id", async () => {
-    const { adapter } = scripted([
-      thread({
-        latestTurn: turn("turn-1", "completed", 0, 2),
-        session: session("ready"),
-        messages: [...firstTurn, message("failed", "user", null, 10)],
-        activities: [{ kind: "provider.turn.start.failed", createdAt: at(10), payload: { requestId: "failed", detail: "Model unavailable" } }],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "error",
-      error: "Model unavailable",
-    });
-  });
-
-  it("does not let an older start failure override later work", async () => {
-    const { adapter } = scripted([
-      thread({
-        latestTurn: turn("turn-2", "completed", 10, 12),
-        session: session("ready"),
-        messages: [
-          ...firstTurn,
-          message("failed", "user", null, 5),
-          message("prompt-2", "user", null, 10),
-          message("answer-2", "assistant", "turn-2", 11),
-        ],
-        activities: [{ kind: "provider.turn.start.failed", createdAt: at(5), payload: { requestId: "failed", detail: "Model unavailable" } }],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "completed",
-      turnIndex: 2,
-    });
-  });
-
-  it("polls a bounded window and reads the whole thread once at the end", async () => {
-    const { adapter, paths } = scripted([
-      thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: firstTurn }),
-      thread({ latestTurn: turn("turn-1", "completed", 0, 2), session: session("ready"), messages: firstTurn }),
-    ]);
-
-    await adapter.waitForTurn("thread-1", { timeoutMs: 1_000 });
-
-    expect(paths.slice(0, -1).every((requestPath) => requestPath.endsWith("?turnLimit=10"))).toBe(true);
-    expect(paths.at(-1)).toBe("/api/orchestration/threads/thread-1");
-  });
-
-  it("reports a completion it saw before a later turn replaced it", async () => {
-    const laterTurn = [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)];
-    const { adapter } = scripted([
-      thread({ latestTurn: turn("turn-1", "completed", 0, 2), session: session("ready"), messages: firstTurn }),
-      thread({ latestTurn: turn("turn-2", "running", 10, null), session: session("running"), messages: laterTurn }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "completed",
-      turnIndex: 1,
-    });
-  });
-
-  it("reads the whole thread when the awaited message falls outside the poll window", async () => {
-    const whole = thread({ latestTurn: turn("turn-2", "completed", 10, 12), session: session("ready"), messages: [...firstTurn, message("prompt-2", "user", null, 10), message("answer-2", "assistant", "turn-2", 11)] });
-    // The bounded window only holds turn 2.
-    const windowed = thread({ ...whole, messages: whole.messages!.slice(2) });
-    const adapter = new T3ThreadApi(
-      mockApi({ request: async (_method, requestPath) => ({ snapshotSequence: 1, thread: requestPath.includes("turnLimit") ? windowed : whole }) }),
-      { waitIntervalMs: 0 },
-    );
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "ended",
-      turnIndex: 1,
-    });
-  });
-
-  it("keeps an interrupted turn interrupted after a later turn becomes the latest", async () => {
-    const interrupted = { ...turn("turn-1", "completed", 0, 2), state: "interrupted" as const };
-    const laterTurn = [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)];
-    const { adapter } = scripted([
-      thread({ latestTurn: interrupted, session: session("ready"), messages: firstTurn }),
-      // A queued turn starts before the wait confirms; T3 now reports only turn 2's state.
-      thread({
-        latestTurn: turn("turn-2", "running", 10, null),
-        session: session("running"),
-        checkpoints: [{ turnId: "turn-1", completedAt: at(2) }],
-        messages: laterTurn,
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "interrupted",
-      turnIndex: 1,
-    });
-  });
-
-  it("returns a finished message's turn even when a later turn waits for an approval", async () => {
-    const { adapter } = scripted([
-      thread({
-        latestTurn: turn("turn-2", "running", 10, null),
-        session: session("running"),
-        checkpoints: [{ turnId: "turn-1", completedAt: at(2) }],
-        messages: [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)],
-        activities: [{ kind: "approval.requested", turnId: "turn-2", createdAt: at(12), payload: { requestId: "a", detail: "git push" } }],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
-      // The wait never saw turn 1 as the latest turn, so it cannot say how turn 1 ended.
-      outcome: "ended",
-      turnIndex: 1,
-    });
-    // Without a message, the wait reports the approval that holds up the thread.
-    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({ outcome: "needs-attention" });
-  });
-
-  it("returns a message's own turn while a later turn runs", async () => {
-    // Turn 1 answered prompt-1 and completed; turn 2 runs for a later prompt.
-    const { adapter } = scripted([
-      thread({
-        latestTurn: turn("turn-2", "running", 10, null),
-        session: session("running"),
-        checkpoints: [{ turnId: "turn-1", completedAt: at(2) }],
-        messages: [...firstTurn, message("prompt-2", "user", null, 10), message("progress-2", "assistant", "turn-2", 11)],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 1_000 })).resolves.toMatchObject({
-      // The wait never saw turn 1 as the latest turn, so it cannot say how turn 1 ended.
-      outcome: "ended",
-      turnIndex: 1,
-    });
-  });
-
-  it("reports a provider that could not start the turn", async () => {
-    const { adapter } = scripted([
-      thread({
-        latestTurn: turn("turn-1", "completed", 0, 2),
-        session: session("ready"),
-        messages: [...firstTurn, message("sent", "user", null, 10)],
-        activities: [{ kind: "provider.turn.start.failed", createdAt: at(10), payload: { requestId: "sent", detail: "Model unavailable" } }],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "error",
-      error: "Model unavailable",
-    });
-  });
-
-  it("stops when the running turn asks a question", async () => {
-    const { adapter, reads } = scripted([
-      thread({
-        latestTurn: turn("turn-1", "running", 0, null),
-        session: session("running"),
-        messages: firstTurn,
-        activities: [{ kind: "user-input.requested", turnId: "turn-1", createdAt: at(1), payload: { requestId: "q", questions: [{ id: "q1", question: "Which branch?" }] } }],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "needs-attention",
-      turnIndex: 1,
-    });
-    expect(reads()).toBe(2);
-  });
-
-  it("notices an approval request in the running turn without T3's pending flags", async () => {
-    const { adapter } = scripted([
-      thread({
-        latestTurn: turn("turn-1", "running", 0, null),
-        session: session("running"),
-        messages: firstTurn,
-        activities: [{ kind: "approval.requested", turnId: "turn-1", createdAt: at(1), payload: { requestId: "r1", requestKind: "command", detail: "git status" } }],
-      }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({ outcome: "needs-attention" });
-  });
-
-  it("follows a queued turn even when the previous turn ended with a question", async () => {
-    const second = (value: number) => `2026-09-04T10:05:${String(value).padStart(2, "0")}.000Z`;
-    const atSecond = (base: T3Message, value: number) => ({ ...base, createdAt: second(value), updatedAt: second(value) });
-    const turnAt = (turnId: string, state: "running" | "completed", requested: number, completed: number | null) => ({
-      ...turn(turnId, state, 0, null),
-      requestedAt: second(requested),
-      startedAt: second(requested),
-      completedAt: completed === null ? null : second(completed),
-    });
-    const sent = atSecond(message("sent", "user", null, 0), 5);
-    // Turn 1 ends by asking a message-mode question just after the message arrived mid-turn.
-    const question = {
-      kind: "user-input.requested",
-      turnId: "turn-1",
-      createdAt: second(6),
-      payload: { requestId: "async-1", responseMode: "message", questions: [{ id: "0", question: "Which apps?" }] },
-    };
-    const gap = thread({
-      latestTurn: turnAt("turn-1", "completed", 0, 6),
-      session: session("ready"),
-      messages: [...firstTurn, sent],
-      activities: [question],
-    });
-    const queued = scripted([
-      thread({ latestTurn: turnAt("turn-1", "running", 0, null), session: session("running"), messages: [...firstTurn, sent] }),
-      gap,
-      thread({
-        latestTurn: turnAt("turn-2", "completed", 7, 9),
-        session: session("ready"),
-        messages: [...firstTurn, sent, atSecond(message("answer-2", "assistant", "turn-2", 0), 8)],
-        activities: [question],
-      }),
-    ]);
-
-    await expect(queued.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
-      outcome: "completed",
-      turnIndex: 2,
-    });
-
-    // Without a queued turn, the question the awaited turn ended with needs a person.
-    const folded = scripted([gap]);
-    await expect(folded.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 5_000 })).resolves.toMatchObject({
-      outcome: "needs-attention",
-      turnIndex: 1,
-    });
-    expect(folded.reads()).toBeGreaterThan(2);
-  });
-
-  it("ignores an old message-mode question but reports one the awaited turn asks", async () => {
-    const asked = (turnId: string, minute: number) => ({
-      kind: "user-input.requested",
-      turnId,
-      createdAt: at(minute),
-      payload: { requestId: `async-${turnId}`, responseMode: "message", questions: [{ id: "0", question: "Which apps?" }] },
-    });
-    const sent = message("sent", "user", null, 10);
-    const answered = [...firstTurn, sent, message("answer-2", "assistant", "turn-2", 11)];
-    const old = scripted([
-      thread({ latestTurn: turn("turn-2", "completed", 10, 12), session: session("ready"), messages: answered, activities: [asked("turn-1", 1)] }),
-    ]);
-    await expect(old.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "completed",
-      turnIndex: 2,
-    });
-
-    const fresh = scripted([
-      thread({ latestTurn: turn("turn-2", "completed", 10, 12), session: session("ready"), messages: answered, activities: [asked("turn-2", 12)] }),
-    ]);
-    await expect(fresh.adapter.waitForTurn("thread-1", { messageId: "sent", timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "needs-attention",
-      turnIndex: 2,
-    });
-  });
-
-  it("waits for the latest turn when no message is given", async () => {
-    const { adapter } = scripted([
-      thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: firstTurn }),
-      thread({ latestTurn: turn("turn-1", "completed", 0, 2), session: session("ready"), messages: firstTurn }),
-    ]);
-
-    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 1_000 })).resolves.toMatchObject({
-      outcome: "completed",
-      turnIndex: 1,
-    });
   });
 
   it("keeps to the timeout when a read stalls", async () => {
-    const adapter = new T3ThreadApi(mockApi({ request: () => new Promise(() => undefined) }), { waitIntervalMs: 0 });
+    const adapter = new T3ThreadApi(stalledApi(), { waitIntervalMs: 0 });
     const started = Date.now();
 
-    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 50 })).rejects.toMatchObject({ code: "THREAD_WAIT_TIMEOUT" });
+    await expect(adapter.waitForTurn("thread-1", { timeoutMs: 50 })).rejects.toMatchObject({
+      code: "THREAD_WAIT_TIMEOUT",
+      details: { activeRunId: null, activeRunStatus: null, queuedRuns: null },
+    });
     expect(Date.now() - started).toBeLessThan(1_000);
   });
 
-  it("times out with the last observed state", async () => {
-    const { adapter } = scripted([
-      thread({ latestTurn: turn("turn-1", "running", 0, null), session: session("running"), messages: firstTurn }),
-    ]);
+  it("stops when the thread is deleted while it waits", async () => {
+    const { fake, adapter } = await connect();
+    const { thread } = fake.addThread();
+    fake.startRun(thread.id, "Go");
 
-    await expect(adapter.waitForTurn("thread-1", { messageId: "prompt-1", timeoutMs: 20 })).rejects.toMatchObject({
-      code: "THREAD_WAIT_TIMEOUT",
-      exitCode: 6,
-      details: { threadId: "thread-1", messageId: "prompt-1", sessionStatus: "running", latestTurn: { state: "running" } },
-    } satisfies Partial<CliError>);
+    const waiting = adapter.waitForTurn(thread.id, { timeoutMs: 5_000 });
+    await nextPoll(fake, thread.id);
+    fake.projection(thread.id).thread.deletedAt = new Date().toISOString();
+
+    await expect(waiting).rejects.toMatchObject({ code: "THREAD_NOT_FOUND", exitCode: 3 });
+
+    const tombstone = projection({ thread: { id: "thread-1", projectId: "project-1", title: "Gone", archivedAt: null, deletedAt: at(9) } });
+    const adapterForTombstone = new T3ThreadApi({ threadDetail: async () => ({ snapshotSequence: 1, projection: tombstone }) } as unknown as T3Api);
+    await expect(adapterForTombstone.waitForTurn("thread-1", { timeoutMs: 1_000 })).rejects.toMatchObject({
+      code: "THREAD_NOT_FOUND",
+      message: "Thread thread-1 was deleted while waiting.",
+    });
   });
 });

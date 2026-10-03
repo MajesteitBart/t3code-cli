@@ -7,6 +7,11 @@ export type RuntimeMode = "approval-required" | "auto" | "auto-accept-edits" | "
 export type InteractionMode = "default" | "plan";
 export type SpeedMode = "standard" | "fast";
 
+/** The orchestration protocol this CLI speaks. T3 builds before orchestrator V2 speak protocol 1. */
+export const ORCHESTRATION_PROTOCOL_VERSION = 2;
+export const ORCHESTRATION_PROTOCOL_HEADER = "x-t3-orchestration-protocol";
+export const ORCHESTRATION_PROTOCOL_QUERY_PARAM = "orchestrationProtocol";
+
 export interface CliConfig {
   projectPolicy: ProjectPolicy;
   workspaceMode: WorkspaceMode;
@@ -40,6 +45,8 @@ export interface T3Runtime {
   settingsPath: string | null;
   environmentId: string;
   serverVersion: string;
+  /** Null when the server does not report it; T3 builds before orchestrator V2 report 1. */
+  orchestrationProtocolVersion: number | null;
   capabilities: {
     threadSettlement?: boolean;
     [key: string]: unknown;
@@ -67,7 +74,30 @@ export interface T3Project {
   [key: string]: unknown;
 }
 
-export interface T3Thread {
+/** Orchestrator V2 run lifecycle. One run is one counted turn of a thread. */
+export type RunStatus =
+  | "preparing"
+  | "queued"
+  | "starting"
+  | "running"
+  | "waiting"
+  | "completed"
+  | "interrupted"
+  | "failed"
+  | "cancelled"
+  | "rolled_back";
+
+export const ACTIVE_RUN_STATUSES: readonly RunStatus[] = ["preparing", "starting", "running", "waiting"];
+export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
+  "completed",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "rolled_back",
+];
+
+/** A thread as the V2 shell snapshot lists it: settings, lifecycle, and a summary of its live work. */
+export interface T3ThreadShell {
   id: string;
   projectId: string;
   title: string;
@@ -76,72 +106,127 @@ export interface T3Thread {
   interactionMode?: InteractionMode;
   branch?: string | null;
   worktreePath?: string | null;
-  latestTurn?: T3LatestTurn | null;
-  session?: T3Session | null;
+  status?: "idle" | RunStatus;
+  activeRunId?: string | null;
+  latestRunId?: string | null;
+  lastError?: string | null;
+  pendingRuntimeRequest?: { id: string; kind: string; createdAt: string } | null;
   createdAt?: string;
   updatedAt?: string;
   archivedAt: string | null;
   settledOverride?: "settled" | "active" | null;
   settledAt?: string | null;
   unsettledAt?: string | null;
+  snoozedUntil?: string | null;
+  pinnedAt?: string | null;
   latestUserMessageAt?: string | null;
-  hasPendingApprovals?: boolean;
-  hasPendingUserInput?: boolean;
-  messages?: T3Message[];
   deletedAt?: string | null;
   [key: string]: unknown;
 }
 
-export interface T3LatestTurn {
-  turnId: string;
-  state: "running" | "interrupted" | "completed" | "error";
-  requestedAt: string;
-  startedAt: string | null;
-  completedAt: string | null;
-  assistantMessageId: string | null;
+export interface T3ShellSnapshot {
+  snapshotSequence: number;
+  projects: T3Project[];
+  threads: T3ThreadShell[];
+  archivedThreads: T3ThreadShell[];
+}
+
+/** The thread record inside a V2 thread projection. */
+export interface T3AppThread {
+  id: string;
+  projectId: string;
+  title: string;
+  modelSelection?: ModelSelection;
+  runtimeMode?: RuntimeMode;
+  interactionMode?: InteractionMode;
+  branch?: string | null;
+  worktreePath?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  archivedAt: string | null;
+  settledOverride?: "settled" | "active" | null;
+  settledAt?: string | null;
+  unsettledAt?: string | null;
+  snoozedUntil?: string | null;
+  pinnedAt?: string | null;
+  deletedAt?: string | null;
+  forkedFrom?: { type: string; threadId?: string; runId?: string; [key: string]: unknown } | null;
+  lineage?: { parentThreadId?: string | null; relationshipToParent?: string | null; [key: string]: unknown };
   [key: string]: unknown;
 }
 
-export interface T3Session {
+export interface T3Run {
+  id: string;
   threadId: string;
-  status: "idle" | "starting" | "running" | "ready" | "interrupted" | "stopped" | "error";
-  providerName: string | null;
+  ordinal: number;
   providerInstanceId?: string;
-  runtimeMode: RuntimeMode;
-  activeTurnId: string | null;
-  lastError: string | null;
-  updatedAt: string;
+  modelSelection?: ModelSelection;
+  userMessageId: string;
+  rootNodeId?: string | null;
+  status: RunStatus;
+  queuePosition?: number | null;
+  queueHeld?: boolean;
+  requestedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  checkpointId?: string | null;
+  [key: string]: unknown;
+}
+
+export interface T3RuntimeRequest {
+  id: string;
+  nodeId?: string | null;
+  kind: string;
+  status: "pending" | "resolved" | "expired" | "cancelled";
+  responseCapability: { type: "live" | "message" | "not_resumable"; reason?: string; [key: string]: unknown };
+  createdAt: string;
+  resolvedAt: string | null;
+  decision?: string;
+  answers?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
 export interface T3Message {
   id: string;
-  /** T3 reports reasoning summaries as `system` unless the client opts into `reasoning`. */
+  /** The run that handled the message; null for history imported from orchestrator V1. */
+  runId: string | null;
   role: "user" | "assistant" | "system" | "reasoning";
   text: string;
-  turnId: string | null;
   streaming: boolean;
   createdAt: string;
   updatedAt: string;
   [key: string]: unknown;
 }
 
-export interface OrchestrationSnapshot {
-  snapshotSequence: number;
-  projects: T3Project[];
-  threads: T3Thread[];
-  updatedAt: string;
+/** One entry of a V2 run's timeline: a message, tool call, request, plan, notice, or checkpoint. */
+export interface T3TurnItem {
+  id: string;
+  type: string;
+  runId: string | null;
+  status?: string;
+  title?: string | null;
+  ordinal?: number;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
+export interface T3ThreadProjection {
+  thread: T3AppThread;
+  runs: T3Run[];
+  runtimeRequests: T3RuntimeRequest[];
+  messages: T3Message[];
+  turnItems: T3TurnItem[];
+  plans?: unknown[];
+  checkpoints?: unknown[];
+  updatedAt?: string;
+  [key: string]: unknown;
 }
 
 export interface ThreadDetailSnapshot {
   snapshotSequence: number;
-  thread: T3Thread;
-  page?: {
-    beforeCursor: string | null;
-    hasMore: boolean;
-    snapshotSequence: number;
-    threadSequence?: number;
-  };
+  projection: T3ThreadProjection;
 }
 
 export interface OpenResult {

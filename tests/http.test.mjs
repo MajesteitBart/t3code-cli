@@ -47,7 +47,7 @@ for (const mode of ["large", "truncated", "http-error"]) {
     let authorized = false;
     const server = createServer((req, res) => {
       if (req.url === "/.well-known/t3/environment") {
-        res.end(JSON.stringify({ environmentId: "test", serverVersion: "test" }));
+        res.end(JSON.stringify({ environmentId: "test", serverVersion: "test", orchestrationProtocolVersion: 2 }));
         return;
       }
       authorized = req.headers.authorization === "Bearer fixture-token";

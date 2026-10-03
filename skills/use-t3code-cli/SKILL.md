@@ -1,25 +1,35 @@
 ---
 name: use-t3code-cli
-description: Operate the t3code CLI to resolve folders or Git repositories into T3 Code projects, create missing projects according to policy, start new handover threads with prompts, inspect project state, and diagnose the local T3 connection. Use when an agent needs to hand current work to T3 Code or automate T3 project/thread creation from a terminal or application. Also use when an agent needs to discover, inspect, message, settle, or unsettle an existing T3 Code thread.
+description: Operate the t3code CLI to hand work to T3 Code from outside T3, and to discover, read, message, wait for, steer, fork, organize, or schedule T3 Code threads. Use when an agent outside T3 needs to start a T3 thread or coordinate existing ones, when an agent inside a T3 thread needs something its own t3-code MCP tools do not offer (other projects, turn-sliced transcripts, waiting for a reply, refusing to send into a busy thread), or when a user asks to approve, decline, or change another thread's permission or plan mode.
 ---
 
 # Use T3 Code CLI
 
 Use `t3code` as the supported interface. Do not read T3 credentials or construct bearer tokens directly.
 
-## Verify readiness
+## CLI or MCP tools
 
-Run:
+If you run inside a T3 thread, you have T3's own `t3-code` MCP tools. Prefer them for your own project: `t3_thread_launch` or `delegate_task` to start work, `t3_thread_send`, `t3_thread_wait`, `t3_thread_read`, `t3_thread_fork`. Use this CLI for what they leave out:
+
+- threads in other projects;
+- transcripts sliced by turn (`threads read --turns`, `--first-turn`, `--detail`);
+- a reply in one call (`threads send --wait`, `handover --wait`);
+- refusing to send into a busy thread (the default `--if-busy refuse`);
+- dismissing a question whose session is gone.
+
+Outside T3, as in a terminal agent, a script, or an app backend, the CLI is the way in.
+
+Approving or declining another thread's requests and changing its permission or plan mode act with the user's authority. Run them only on the user's explicit instruction, never on your own judgment.
+
+## Verify readiness
 
 ```bash
 t3code --json doctor
 ```
 
-Treat `data.ok: false` as a blocker. Ask the user to start T3 Code when `t3Server.ok` is false.
+Treat `data.ok: false` as a blocker. Ask the user to start T3 Code when `checks.t3Server.ok` is false. `checks.orchestrationProtocol.ok: false` means the T3 build predates orchestrator V2; this CLI version cannot drive it, and `@bvdm/t3code-cli@0.2` can.
 
 ## Resolve before writing
-
-Inspect the current workspace and matching project:
 
 ```bash
 t3code --json projects resolve --cwd .
@@ -29,7 +39,7 @@ The default `workspaceMode` is `repo`, which resolves nested folders to their Gi
 
 A linked Git worktree, such as the one T3 created for your own thread, resolves to the main checkout's project; `data.workspace.mainWorktreeRoot` shows that checkout. With `--checkout current`, the new thread works in the same linked worktree. With `--checkout worktree`, T3 prepares a new worktree from the linked worktree's current branch.
 
-## Create a handover thread
+## Hand work to a new thread
 
 Pass prompts over stdin to avoid shell quoting and command-length problems:
 
@@ -43,32 +53,25 @@ On PowerShell:
 $handoverPrompt | t3code --json handover --stdin
 ```
 
-`--cwd` defaults to the process's current working directory. Select thread controls when needed with `--provider`, `--model`, `--speed`, `--thinking-effort`, `--permission`, `--mode build|plan`, and `--checkout current|worktree`.
+`--cwd` defaults to the current working directory. Select thread controls with `--provider`, `--model`, `--speed`, `--thinking-effort`, `--permission`, `--mode build|plan`, and `--checkout current|worktree`. Without overrides, the thread uses the project's saved model selection, or T3's default model when the project has none. The permission default is `full-access`.
 
-Unless command flags or CLI config explicitly override it, a new thread inherits the T3 project's complete saved model selection, including provider-specific options. For a missing project, the CLI uses the detected T3 version's default model (`gpt-5.4` on 0.0.28 and `gpt-5.6-sol` on 0.0.29 and later).
+Add `--wait --timeout <seconds>` to wait for the first turn and get its reply in `data.reply`, which turns a handover into a one-shot task for another model. Give the shell call a longer timeout than `--timeout`.
 
-The permission default is full access (`full-access`). The CLI sends it on the new thread, the first turn, and the atomic worktree bootstrap. An explicit `--permission` or `runtimeMode` CLI setting remains authoritative.
-
-With the default `--checkout t3`, resolve the checkout mode in the same order as T3 Code:
-
-1. the project's `defaultThreadEnvMode` setting;
-2. the checked-in workspace `t3.json` value;
-3. the current installation's global `defaultThreadEnvMode` setting.
-
-Use `--project-policy existing` when creating a project is not authorized. The default is `create`.
-
-Use `--dry-run --open none` to inspect the proposed project and thread commands without changing T3 state.
+With the default `--checkout t3`, the checkout mode follows T3: the project's `defaultThreadEnvMode`, then the workspace's `t3.json`, then T3's global setting. Use `--project-policy existing` when creating a project is not authorized. Use `--dry-run --open none` to inspect the launch without changing T3 state.
 
 ## Work with existing threads
 
-Discover candidate threads in the relevant project, then inspect the exact target id before changing it:
+Thread ids are UUIDs or start with `thread:`. Discover candidates, then inspect the exact target before changing it:
 
 ```bash
 t3code --json threads list --cwd . --status all
+t3code --json threads search --query "migration plan"
 t3code --json threads inspect --thread "$TARGET_THREAD_ID"
 ```
 
-Use `read` for the conversation. Without `--json` it prints a Markdown transcript grouped by turn, which is the cheapest form to read. Ask only for what the task needs:
+Do not pick a target by title alone; titles are not unique.
+
+Read only what the task needs. Without `--json`, `read` prints a Markdown transcript grouped by turn:
 
 ```bash
 t3code threads read --thread "$TARGET_THREAD_ID" --detail answers --turns 3 --first-turn
@@ -76,83 +79,85 @@ t3code threads read --thread "$TARGET_THREAD_ID" --detail messages --last-turn
 t3code threads read --thread "$TARGET_THREAD_ID" --detail full --turns 2 --max-chars 1500
 ```
 
-`answers` keeps each turn's prompts and final answer. `messages`, the default, adds progress messages but leaves out reasoning summaries and tool calls. `full` adds reasoning, tool calls, changed files, and proposed plans. `--first-turn` keeps the original request when `--turns` would cut it off. `--max-chars` clips long entries at their start and end; without it, nothing is shortened.
+`answers` keeps each turn's prompts and final answer. `messages`, the default, adds progress messages. `full` adds reasoning, tool calls, approvals, questions, and changed files. Each turn is one T3 run. Turns marked `imported` predate orchestrator V2 and lost their tool calls.
 
-In JSON, `data.thread.messages` is in turn order and each message carries `turnIndex`. `data.thread.turns` gives each turn's state and `finalMessageId`, and `data.thread.view` says how many turns were left out. User messages have a null `turnId` in T3, so use `turnIndex` to group them.
-
-Use `--project <project-id>` instead of `--cwd` when the caller provides an exact project id. Filter with `--status active` or `--status settled` when useful. Do not select a target from its title alone because titles are not unique.
-
-Pass messages over stdin:
+### Send and wait
 
 ```bash
 printf '%s' "$THREAD_MESSAGE" \
-  | t3code --json threads send --thread "$TARGET_THREAD_ID" --stdin
+  | t3code --json threads send --thread "$TARGET_THREAD_ID" --stdin --wait --timeout 540
 ```
 
-Sending is an external state change. Keep the target and message within the caller's authorization. A settled thread requires interactive confirmation or `--wake-settled`; JSON and stdin workflows are non-interactive, so use that override only when waking the inspected target is authorized. Archived threads cannot receive a turn. A busy thread, with a running turn or a message waiting for its turn, gets `THREAD_BUSY` unless you pass `--if-busy inject` to send into the running turn.
+Sending changes T3 state; keep the target and message within the caller's authorization. A settled thread needs interactive confirmation or `--wake-settled`, because T3 wakes it. Archived threads cannot receive messages.
 
-Add `--wait` to get the reply. Give the shell call a longer timeout than `--timeout`:
+A busy thread, with a running turn or queued messages, gets `THREAD_BUSY` by default and nothing is sent. Choose `--if-busy queue` to wait in T3's queue, `steer` to join the running turn, or `restart` to stop it and start over. Use `steer` and `restart` only when the user wants to redirect the running work.
 
-```bash
-printf '%s' "$THREAD_MESSAGE"   | t3code --json threads send --thread "$TARGET_THREAD_ID" --stdin --wait --timeout 540
-```
+Read `data.wait.outcome`:
 
-Read `data.wait.outcome`. On `completed` or `interrupted`, `data.reply` holds the turn that handled the message. `needs-attention` means the thread waits for an approval or answer, listed in `data.pendingRequests`; a person must answer it in T3 Code. `error` means the provider could not start the turn, with the reason in `data.wait.error`. To wait without sending, for example after a handover, run `t3code threads wait --thread "$TARGET_THREAD_ID" --timeout 540`.
+- `completed` or `interrupted`: the reply is in `data.reply`, without your own message.
+- `needs-attention`: the thread waits for an approval or answer, listed in `data.pendingRequests`.
+- `error`: the provider could not run the turn; see `data.wait.error`.
+- `queue-held`: T3 holds the queue after a restart; `threads queue resume` releases it.
+- `ended`: the turn was rolled back.
 
-Change an existing thread's settings with `threads set`, or pass the same flags to `threads send` to apply them before the message:
+`THREAD_WAIT_TIMEOUT` (exit code 6) means the message was sent (`error.details.sent: true`). Never resend it; continue with `t3code threads wait --thread "$TARGET_THREAD_ID" --timeout 540`, which waits for the running turn and the queue.
+
+### Change settings
 
 ```bash
 t3code --json models list --provider codex
-t3code --json threads set --thread "$TARGET_THREAD_ID" --model gpt-6-astra --thinking-effort xhigh --speed fast --dry-run
-t3code --json threads set --thread "$TARGET_THREAD_ID" --permission auto-accept-edits --mode plan
+t3code --json threads set --thread "$TARGET_THREAD_ID" --model gpt-6-astra --thinking-effort xhigh --dry-run
+t3code --json threads set --thread "$TARGET_THREAD_ID" --provider claudeAgent --model claude-opus-5-5
 ```
 
-The CLI maps `--thinking-effort` and `--speed` to the option ids each model uses and checks values against T3's catalog; `--option id=value` sets other options such as `contextWindow`. It refuses a permission change while a turn runs, because T3 restarts the session, and a provider switch on a started thread, because T3 cannot move the conversation. Read `data.changes` for what changed and `data.changes.catalogUsed` for whether the values were checked.
+The CLI checks values against T3's catalog. A model on another provider instance goes through T3's provider switch, which hands the conversation over with recent history. Provider switches and permission changes are refused while a turn runs. `threads send` takes the same flags and applies them before the message.
 
-Stop a running turn, or respond to what the thread waits for:
+### Interrupt, approve, answer
 
 ```bash
 t3code --json threads interrupt --thread "$TARGET_THREAD_ID"
 t3code --json threads approve --thread "$TARGET_THREAD_ID" --request "$REQUEST_ID" --wait --timeout 540
 t3code --json threads decline --thread "$TARGET_THREAD_ID" --request "$REQUEST_ID"
 t3code --json threads answer --thread "$TARGET_THREAD_ID" --answer "$ANSWER" --wait --timeout 540
+t3code --json threads answer --thread "$TARGET_THREAD_ID" --dismiss
 ```
 
-Approvals and answers act with the user's authority: send them only on the caller's explicit instruction. `approve --scope always` works only when the request offers it. Take request ids from `data.pendingRequests` in `inspect` or `send --wait` results. `THREAD_REQUEST_AMBIGUOUS` means several requests are pending; pass `--request`.
+Take request ids from `data.pendingRequests`. `THREAD_REQUEST_AMBIGUOUS` means several are pending; pass `--request`. `approve --scope always` works only when the request offers it. `REQUEST_NOT_ANSWERABLE` means the provider session that asked is gone; dismiss a question like that instead.
 
-The `t3thread` skill builds on these commands for `$t3thread <thread-id> <instruction>` requests.
+### Forks, queue, organization, schedules
 
-Manage lifecycle state without sending a message:
+```bash
+t3code --json threads fork --thread "$TARGET_THREAD_ID" --title "Try the other approach"
+t3code --json threads merge-back --thread "$FORK_THREAD_ID"
+t3code --json threads queue list --thread "$TARGET_THREAD_ID"
+t3code --json threads queue resume --thread "$TARGET_THREAD_ID"
+t3code --json threads rename --thread "$TARGET_THREAD_ID" --title "Billing migration"
+t3code --json threads pin --thread "$TARGET_THREAD_ID"
+t3code --json threads snooze --thread "$TARGET_THREAD_ID" --until 2h
+t3code --json schedules list --cwd .
+```
+
+A fork copies the conversation into a new thread; `merge-back` sends what the fork learned back to its source. Queue commands edit, cancel, move, or promote queued messages. `schedules` creates recurring prompts that T3 runs on an interval or at a fixed time; create them only on the user's instruction, because they keep running.
+
+### Settle or reopen
 
 ```bash
 t3code --json threads settle --thread "$TARGET_THREAD_ID"
 t3code --json threads unsettle --thread "$TARGET_THREAD_ID"
 ```
 
-Settle only after the caller authorizes that lifecycle change. T3 refuses settlement while a session is starting/running or the thread has a blocking approval or user-input request. Unsettling marks the thread manually active; it does not start a turn or provider session.
-
-## Optional front-end integration
-
-The CLI can be called from a trusted application backend to power a **Send to T3 Code** button. This pattern was initially built for the [Delano viewer](https://github.com/MajesteitBart/delano). The optional `integrations/` example in this repository includes a React split button and Node bridge; it is not required to install or operate the CLI.
-
-Keep the repository root server-owned, pass CLI options as process arguments, and send the prompt over stdin. A browser should call the protected backend endpoint rather than attempt to launch the local CLI itself.
+Settle only on the caller's authorization. T3 refuses settlement while a turn runs, messages are queued, or a request is pending. T3 also settles idle threads by itself.
 
 ## Interpret results
 
-Read `data.project.id`, `data.thread.id`, `data.projectCreated`, and `data.opened`. A successful current stable desktop reveal can report `opened.exactThread: false`; the thread is still created in the resolved project.
+Read `data.project.id`, `data.thread.id`, `data.projectCreated`, and `data.opened` after a handover. `opened.exactThread: false` is normal: T3's desktop app can be revealed but not pointed at one thread yet.
 
-For existing-thread writes, require `data.verification.accepted: true`. Record `data.thread.id` and, for sends, `data.message.messageId` when reporting the result. The CLI verifies the requested projection state rather than treating HTTP submission as success.
+For writes, the CLI verifies T3's result before it reports success. Record `data.thread.id` and, for sends, `data.message.messageId`.
 
-On `{ "ok": false }`, report `error.code`, `error.message`, and `error.cause` when present. The cause carries T3's own reason, for example why it rejected a worktree bootstrap. Read the whole envelope instead of filtering it with `grep`, and do not retry write commands blindly. Each handover attempt creates a new thread id. `THREAD_START_FAILED` already attempts to delete the newly-created thread; `error.details.cleanup` reports `deleted`, `not-created`, or `server-managed`.
-
-`THREAD_TURN_NOT_VERIFIED` or `THREAD_SETTLEMENT_NOT_VERIFIED` means dispatch returned but projection verification timed out. Do not retry automatically because the first operation may still appear later.
-
-`THREAD_WAIT_TIMEOUT` (exit code 6) after `send --wait` means the message was sent and `error.details.sent` is `true`. Never resend it; continue with `threads wait`.
-
-## Current compatibility boundary
-
-T3 0.0.28 and later support new-worktree handovers through the atomic bootstrap contract. Worktree creation follows the current installation's explicit `newWorktreesStartFromOrigin` setting. When it is absent, use the installed version's default: `false` on 0.0.28 and `true` on 0.0.29 and later. `WORKTREE_REQUIRES_BRANCH` means the selected folder is not a Git repository on a branch; retry with `--checkout current` only with explicit user or caller authority.
-
-Thread settlement commands require a T3 server that exposes the `threadSettlement` capability. Existing-thread sends preserve the target's saved model, runtime mode, and interaction mode.
+On `{ "ok": false }`, report `error.code`, `error.message`, and `error.cause` when present; the message carries T3's own reason. Read the whole envelope instead of filtering it. Do not retry write commands blindly: each handover attempt starts a new thread. `THREAD_START_FAILED` reports `cleanup: "server-managed"`, because T3 finishes or cleans up its own launches. Exit code 5 (`*_NOT_VERIFIED`) means the command was dispatched but T3 did not show the result in time; read the thread before acting again.
 
 Use `t3code --json request get <path>` only as a read-only escape hatch. Write the path without its leading slash, for example `api/orchestration/shell`: Git Bash rewrites `/api/...` into a Windows file path before the CLI sees it.
+
+## Optional front-end integration
+
+The CLI can power a **Send to T3 Code** button from a trusted application backend; the `integrations/` folder has a React split button and Node bridge. Keep the repository root server-owned, pass CLI options as process arguments, and send the prompt over stdin. A browser should call the protected backend endpoint rather than launch the CLI itself.

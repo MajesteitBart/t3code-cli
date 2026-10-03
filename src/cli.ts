@@ -1,24 +1,30 @@
 #!/usr/bin/env node
-import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
-import path from "node:path";
 import { stdin as input, stderr as errorOutput } from "node:process";
 import { createInterface } from "node:readline/promises";
 
-import { Command, CommanderError, InvalidArgumentError, Option } from "commander";
+import { Command, CommanderError, Option } from "commander";
 
-import {
-  CONFIG_KEYS,
-  expandHome,
-  loadConfig,
-  saveConfig,
-  setConfigValue,
-  type ConfigKey,
-} from "./config.js";
 import { renderCatalog } from "./catalog.js";
+import {
+  action,
+  addPromptOptions,
+  addReplyOptions,
+  collect,
+  commandContext,
+  describeSelection,
+  jsonRequested,
+  positiveInteger,
+  program,
+  resolvePrompt,
+  renderWait,
+  waitOptions,
+  withReply,
+  type ThreadWaitCommandOptions,
+} from "./cliShared.js";
+import { registerV2Commands } from "./cliV2.js";
+import { CONFIG_KEYS, saveConfig, setConfigValue, type ConfigKey } from "./config.js";
 import { doctor } from "./doctor.js";
 import { CliError } from "./errors.js";
-import { normalizeProviderOptions } from "./modelSelection.js";
 import { writeError, writeSuccess } from "./output.js";
 import { READ_DETAILS, renderPendingRequests, renderTranscript, type ReadDetail } from "./transcript.js";
 import {
@@ -32,12 +38,11 @@ import {
   resolveProject,
   sendThreadMessage,
   settleThread,
+  type IfBusy,
   type ThreadCreateOptions,
   type ThreadListStatus,
   unsettleThread,
   waitForThread,
-  type ThreadWaitOptions,
-  type ThreadWaitView,
 } from "./service.js";
 import {
   answerThread,
@@ -48,7 +53,6 @@ import {
   type ThreadSettingsChange,
 } from "./threadControls.js";
 import type {
-  CliConfig,
   InteractionMode,
   ModelSelection,
   OpenMode,
@@ -58,54 +62,8 @@ import type {
   SpeedMode,
   ThreadEnvMode,
   T3Project,
-  T3Thread,
   WorkspaceMode,
 } from "./types.js";
-
-const packageJson = createRequire(import.meta.url)("../package.json") as { version: string };
-
-const program = new Command();
-const jsonRequested = process.argv.slice(2).includes("--json");
-program
-  .name("t3code")
-  .description("Manage T3 Code projects, handover threads, and cross-thread messages.")
-  .version(packageJson.version)
-  .option("--json", "Emit stable JSON envelopes.")
-  .option("--config <path>", "Use a specific config file.")
-  .option("--t3-home <path>", "Override T3CODE_HOME for this command.")
-  .option("--origin <url>", "Override the running T3 server origin.");
-program.configureOutput({ outputError: () => undefined }).exitOverride();
-
-interface GlobalOptions {
-  json?: boolean;
-  config?: string;
-  t3Home?: string;
-  origin?: string;
-}
-
-async function commandContext(): Promise<{
-  config: CliConfig;
-  configPath: string;
-  configExists: boolean;
-  json: boolean;
-}> {
-  const global = program.opts<GlobalOptions>();
-  const loaded = await loadConfig(global.config);
-  const config = { ...loaded.config };
-  if (global.t3Home) config.t3Home = path.resolve(expandHome(global.t3Home));
-  if (global.origin) config.origin = new URL(global.origin).origin;
-  return { config, configPath: loaded.path, configExists: loaded.exists, json: global.json ?? false };
-}
-
-async function action(run: () => Promise<void>): Promise<void> {
-  try {
-    await run();
-  } catch (error) {
-    const global = program.opts<GlobalOptions>();
-    const cliError = writeError(error, { json: global.json ?? false });
-    process.exitCode = cliError.exitCode;
-  }
-}
 
 function addWorkspaceOptions(command: Command): Command {
   return command
@@ -123,31 +81,32 @@ function addProjectPolicyOption(command: Command): Command {
 }
 
 function addThreadOptions(command: Command): Command {
-  return addProjectPolicyOption(addWorkspaceOptions(command))
-    .option("--prompt <text>", "Handover prompt.")
-    .option("--prompt-file <path>", "Read the handover prompt from a UTF-8 file.")
-    .option("--stdin", "Read the handover prompt from stdin.")
-    .addOption(new Option("--open <mode>").choices(["auto", "desktop", "browser", "none"]))
-    .option("--provider <instance-id>", "T3 provider instance id (for example codex or claudeAgent).")
-    .option("--model <slug>", "Provider model slug.")
-    .addOption(
-      new Option("--speed, --speed-mode <mode>", "Model speed mode.")
-        .choices(["standard", "fast"]),
-    )
-    .option("--thinking-effort <effort>", "Model-specific reasoning/thinking effort.")
-    .addOption(
-      new Option("--checkout, --env-mode <mode>", "Use the current checkout or create a new worktree.")
-        .choices(["t3", "local", "current", "worktree"]),
-    )
-    .addOption(
-      new Option("--permission, --runtime-mode <mode>", "Permission/access level.")
-        .choices(["approval-required", "auto-accept-edits", "full-access"]),
-    )
-    .addOption(
-      new Option("--mode, --interaction-mode <mode>", "Build/default or Plan mode.")
-        .choices(["default", "build", "plan"]),
-    )
-    .option("--dry-run", "Resolve and print commands without dispatching them.");
+  return addReplyOptions(
+    addPromptOptions(addProjectPolicyOption(addWorkspaceOptions(command)), "handover prompt")
+      .addOption(new Option("--open <mode>").choices(["auto", "desktop", "browser", "none"]))
+      .option("--provider <instance-id>", "T3 provider instance id (for example codex or claudeAgent).")
+      .option("--model <slug>", "Provider model slug.")
+      .addOption(new Option("--speed, --speed-mode <mode>", "Model speed mode.").choices(["standard", "fast"]))
+      .option("--thinking-effort <effort>", "Model-specific reasoning/thinking effort.")
+      .addOption(
+        new Option("--checkout, --env-mode <mode>", "Use the current checkout or create a new worktree.").choices([
+          "t3",
+          "local",
+          "current",
+          "worktree",
+        ]),
+      )
+      .addOption(
+        new Option("--permission, --runtime-mode <mode>", "Permission/access level.").choices([
+          "approval-required",
+          "auto-accept-edits",
+          "full-access",
+        ]),
+      )
+      .addOption(new Option("--mode, --interaction-mode <mode>", "Build/default or Plan mode.").choices(["default", "build", "plan"]))
+      .option("--wait", "Wait for the first turn to finish and print its reply.")
+      .option("--dry-run", "Resolve and print the launch without starting it."),
+  );
 }
 
 interface WorkspaceCommandOptions {
@@ -157,7 +116,7 @@ interface WorkspaceCommandOptions {
   dryRun?: boolean;
 }
 
-interface ThreadCommandOptions extends WorkspaceCommandOptions {
+interface ThreadCommandOptions extends WorkspaceCommandOptions, ThreadWaitCommandOptions {
   prompt?: string;
   promptFile?: string;
   stdin?: boolean;
@@ -169,24 +128,12 @@ interface ThreadCommandOptions extends WorkspaceCommandOptions {
   model?: string;
   speedMode?: SpeedMode;
   thinkingEffort?: string;
-}
-
-interface PromptOptions {
-  prompt?: string;
-  promptFile?: string;
-  stdin?: boolean;
+  wait?: boolean;
 }
 
 interface ThreadListCommandOptions extends WorkspaceCommandOptions {
   project?: string;
   status?: ThreadListStatus;
-}
-
-interface ThreadWaitCommandOptions {
-  thread: string;
-  timeout?: number;
-  detail?: ReadDetail;
-  maxChars?: number;
 }
 
 interface SettingsCommandOptions {
@@ -199,27 +146,26 @@ interface SettingsCommandOptions {
   interactionMode?: InteractionMode | "build";
 }
 
-interface ThreadSendCommandOptions extends PromptOptions, ThreadWaitCommandOptions, SettingsCommandOptions {
+interface ThreadSendCommandOptions extends ThreadWaitCommandOptions, SettingsCommandOptions {
+  thread: string;
+  prompt?: string;
+  promptFile?: string;
+  stdin?: boolean;
   wakeSettled?: boolean;
   wait?: boolean;
-  ifBusy: "reject" | "inject";
+  ifBusy: IfBusy;
 }
 
 interface ThreadRequestCommandOptions extends ThreadWaitCommandOptions {
+  thread: string;
   request?: string;
   wait?: boolean;
-}
-
-const DEFAULT_WAIT_TIMEOUT_SECONDS = 600;
-
-function collect(value: string, previous: string[] = []): string[] {
-  return [...previous, value];
 }
 
 /** Flags that change an existing thread's settings, shared by `threads set` and `threads send`. */
 function addSettingsOptions(command: Command): Command {
   return command
-    .option("--provider <instance-id>", "Switch to another provider instance of the same driver (needs --model).")
+    .option("--provider <instance-id>", "Switch to another provider instance; T3 hands the conversation over (needs --model).")
     .option("--model <slug>", "Switch the thread's model.")
     .option("--thinking-effort <effort>", "Reasoning effort, such as low, medium, high, xhigh, or max.")
     .addOption(new Option("--speed, --speed-mode <mode>", "Turn fast mode on or off.").choices(["standard", "fast"]))
@@ -232,19 +178,7 @@ function addSettingsOptions(command: Command): Command {
         "full-access",
       ]),
     )
-    .addOption(
-      new Option("--mode, --interaction-mode <mode>", "Build/default or Plan mode.").choices(["default", "build", "plan"]),
-    );
-}
-
-/** Flags that control how long to wait for a turn and how much of it to print. */
-function addReplyOptions(command: Command): Command {
-  return command
-    .option("--timeout <seconds>", "Stop waiting after <seconds> (default 600).", positiveInteger)
-    .addOption(
-      new Option("--detail <level>", "Turn detail: answers, messages, or full (default answers).").choices(READ_DETAILS),
-    )
-    .option("--max-chars <count>", "Clip each message and tool entry to <count> characters.", positiveInteger);
+    .addOption(new Option("--mode, --interaction-mode <mode>", "Build/default or Plan mode.").choices(["default", "build", "plan"]));
 }
 
 function parseModelOption(raw: string): ProviderOptionSelection {
@@ -269,51 +203,19 @@ function settingsChange(options: SettingsCommandOptions): ThreadSettingsChange {
   };
 }
 
-function describeSelection(selection: ModelSelection | null | undefined): string {
-  if (!selection) return "unknown";
-  // Older projections store options as an object map.
-  const options = normalizeProviderOptions(selection.options).map((option) => `${option.id}=${String(option.value)}`).join(", ");
-  return `${selection.instanceId}/${selection.model}${options ? ` (${options})` : ""}`;
-}
-
 function describeChanges(changes: {
   modelSelection: ModelSelection | null;
+  providerSwitch?: boolean;
   runtimeMode: RuntimeMode | null;
   interactionMode: InteractionMode | null;
 }): string {
   return [
-    ...(changes.modelSelection ? [`model ${describeSelection(changes.modelSelection)}`] : []),
+    ...(changes.modelSelection
+      ? [`${changes.providerSwitch ? "provider and model" : "model"} ${describeSelection(changes.modelSelection)}`]
+      : []),
     ...(changes.runtimeMode ? [`permission ${changes.runtimeMode}`] : []),
     ...(changes.interactionMode ? [`${changes.interactionMode === "plan" ? "plan" : "build"} mode`] : []),
   ].join(", ");
-}
-
-function withReply(text: string, result: Partial<ThreadWaitView>): string {
-  const { wait, pendingRequests, reply } = result;
-  return wait && pendingRequests && reply ? `${text}\n${renderWait({ wait, pendingRequests, reply })}` : text;
-}
-
-function waitOptions(options: ThreadWaitCommandOptions): ThreadWaitOptions {
-  return {
-    timeoutMs: (options.timeout ?? DEFAULT_WAIT_TIMEOUT_SECONDS) * 1000,
-    ...(options.detail ? { detail: options.detail } : {}),
-    ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
-  };
-}
-
-function renderWait(result: ThreadWaitView): string {
-  const { wait } = result;
-  const seconds = Math.round(wait.waitedMs / 1000);
-  const headline =
-    wait.error !== undefined
-      ? `T3 could not start the turn: ${wait.error}`
-      : wait.outcome === "needs-attention"
-        ? `The thread is waiting for a person (waited ${seconds}s):\n${renderPendingRequests(result.pendingRequests) || "- a pending approval or question"}`
-        : wait.outcome === "idle"
-          ? "The thread has no turns yet."
-          : `Turn ${wait.turnIndex} ${wait.outcome} (waited ${seconds}s); the thread is now ${wait.statusAfter}.`;
-  const transcript = renderTranscript(result.reply);
-  return transcript ? `${headline}\n\n${transcript}` : headline;
 }
 
 interface ThreadReadCommandOptions {
@@ -325,32 +227,10 @@ interface ThreadReadCommandOptions {
   maxChars?: number;
 }
 
-function positiveInteger(value: string): number {
-  const parsed = Number(value);
-  if (!/^\d+$/u.test(value.trim()) || !Number.isSafeInteger(parsed) || parsed < 1) {
-    throw new InvalidArgumentError("Expected a positive whole number.");
-  }
-  return parsed;
-}
-
-async function readStdin(): Promise<string> {
-  input.setEncoding("utf8");
-  let value = "";
-  for await (const chunk of input) value += chunk;
-  return value;
-}
-
-async function resolvePrompt(options: PromptOptions): Promise<string> {
-  const sources = [options.prompt !== undefined, options.promptFile !== undefined, options.stdin === true].filter(Boolean);
-  if (sources.length !== 1) {
-    throw new CliError("PROMPT_SOURCE_REQUIRED", "Use exactly one of --prompt, --prompt-file, or --stdin.");
-  }
-  if (options.prompt !== undefined) return options.prompt;
-  if (options.promptFile !== undefined) return await readFile(path.resolve(options.promptFile), "utf8");
-  return await readStdin();
-}
-
-async function confirmSettledThread(thread: T3Thread, project: T3Project | null): Promise<boolean> {
+async function confirmSettledThread(
+  thread: { id: string; title: string; settledAt?: string | null },
+  project: T3Project | null,
+): Promise<boolean> {
   if (!input.isTTY || !errorOutput.isTTY) {
     throw new CliError(
       "SETTLED_THREAD_CONFIRMATION_REQUIRED",
@@ -361,9 +241,7 @@ async function confirmSettledThread(thread: T3Thread, project: T3Project | null)
   const readline = createInterface({ input, output: errorOutput });
   try {
     const projectLabel = project ? ` in ${project.title}` : "";
-    const answer = await readline.question(
-      `Thread “${thread.title}”${projectLabel} is settled. Send this message and wake it? [y/N] `,
-    );
+    const answer = await readline.question(`Thread “${thread.title}”${projectLabel} is settled. Send this message and wake it? [y/N] `);
     return /^(?:y|yes)$/iu.test(answer.trim());
   } finally {
     readline.close();
@@ -387,10 +265,11 @@ function threadCreateOptions(options: ThreadCommandOptions, prompt: string): Thr
     ...(options.speedMode ? { speedMode: options.speedMode } : {}),
     ...(options.thinkingEffort ? { thinkingEffort: options.thinkingEffort } : {}),
     ...(options.dryRun ? { dryRun: true } : {}),
+    ...(options.wait ? { wait: waitOptions(options) } : {}),
   };
 }
 
-program.command("doctor").description("Check T3 discovery, auth tooling, and desktop integration.").action(() =>
+program.command("doctor").description("Check T3 discovery, protocol, auth tooling, and desktop integration.").action(() =>
   action(async () => {
     const context = await commandContext();
     const result = await doctor(context.config, context.configPath, context.configExists);
@@ -454,7 +333,7 @@ addWorkspaceOptions(projects.command("resolve"))
   );
 addProjectPolicyOption(addWorkspaceOptions(projects.command("ensure")))
   .description("Resolve a project and create it when policy permits.")
-  .option("--dry-run", "Do not dispatch project.create.")
+  .option("--dry-run", "Do not create the project.")
   .action((options: WorkspaceCommandOptions) =>
     action(async () => {
       const context = await commandContext();
@@ -462,22 +341,19 @@ addProjectPolicyOption(addWorkspaceOptions(projects.command("ensure")))
       writeSuccess(
         result,
         context,
-        `${result.created ? "Created" : "Resolved"} ${result.project.id} (${result.project.title}) at ${result.project.workspaceRoot}.`,
+        `${result.created ? (options.dryRun ? "Would create" : "Created") : "Resolved"} ${result.project.id} (${result.project.title}) at ${result.project.workspaceRoot}.`,
       );
     }),
   );
 
-const threads = program.command("threads").description("Create, inspect, and message T3 Code threads.");
-threads.command("list")
+const threads = program.command("threads").description("Create, inspect, message, and organize T3 Code threads.");
+threads
+  .command("list")
   .description("List active and settled threads.")
   .option("--cwd <path>", "Filter by the T3 project resolved from this folder.")
   .addOption(new Option("--workspace-mode <mode>").choices(["repo", "folder"]))
   .option("--project <project-id>", "Filter by an exact T3 project id.")
-  .addOption(
-    new Option("--status <status>", "Filter by thread lifecycle status.")
-      .choices(["active", "settled", "all"])
-      .default("all"),
-  )
+  .addOption(new Option("--status <status>", "Filter by thread lifecycle status.").choices(["active", "settled", "all"]).default("all"))
   .action((options: ThreadListCommandOptions) =>
     action(async () => {
       const context = await commandContext();
@@ -487,6 +363,7 @@ threads.command("list")
         const project = projectById.get(thread.projectId);
         return [
           thread.status,
+          thread.runStatus,
           thread.id,
           project?.title ?? thread.projectId,
           thread.title,
@@ -507,12 +384,9 @@ threads
       const context = await commandContext();
       const result = await inspectThread(context.config, options.thread);
       const thread = result.thread;
-      const latestTurn = thread.latestTurn;
       const requests = thread.pendingRequests;
-      const blocked = [
-        ...(thread.hasPendingApprovals || requests.some((request) => request.kind === "approval") ? ["approval"] : []),
-        ...(thread.hasPendingUserInput || requests.some((request) => request.kind === "user-input") ? ["user input"] : []),
-      ];
+      const kinds = [...new Set(requests.map((request) => (request.kind === "approval" ? "approval" : "user input")))];
+      const run = thread.activeRun ?? thread.latestRun;
       writeSuccess(
         result,
         context,
@@ -524,14 +398,13 @@ threads
           `Status: ${thread.status}`,
           `Model: ${describeSelection(thread.modelSelection)}`,
           `Settings: permission ${thread.runtimeMode ?? "unknown"}, ${thread.interactionMode === "plan" ? "plan" : "build"} mode`,
-          `Session: ${thread.session?.status ?? "none"}`,
           `Turns: ${thread.turnCount} (${thread.messageCount} messages)`,
-          `Latest turn: ${latestTurn ? `${latestTurn.state} (${latestTurn.turnId})` : "none"}`,
-          ...(blocked.length > 0 ? [`Waiting for: ${blocked.join(" and ")}`] : []),
-          ...(requests.length > 0 ? [renderPendingRequests(requests)] : []),
-          ...(thread.contextWindow
-            ? [`Context: ${thread.contextWindow.usedTokens} tokens${thread.contextWindow.maxTokens ? ` of ${thread.contextWindow.maxTokens}` : ""}`]
+          `${thread.activeRun ? "Running turn" : "Latest turn"}: ${run ? `${run.status} (${run.runId})` : "none"}`,
+          ...(thread.queue.length > 0
+            ? [`Queue: ${thread.queue.length} message${thread.queue.length === 1 ? "" : "s"}${thread.queue.some((entry) => entry.held) ? " (held until resumed)" : ""}`]
             : []),
+          ...(kinds.length > 0 ? [`Waiting for: ${kinds.join(" and ")}`] : []),
+          ...(requests.length > 0 ? [renderPendingRequests(requests)] : []),
           `Updated: ${thread.updatedAt ?? "unknown"}`,
         ].join("\n"),
       );
@@ -565,7 +438,7 @@ threads
         ...(options.maxChars === undefined ? {} : { maxChars: options.maxChars }),
       });
       const thread = result.thread;
-      const shown = thread.turns.filter((turn) => turn.turnId !== null).map((turn) => turn.index);
+      const shown = thread.turns.filter((turn) => turn.state !== "pending").map((turn) => turn.index);
       const range = shown.length === thread.view.totalTurns ? "all" : shown.join(", ") || "none";
       writeSuccess(
         result,
@@ -574,7 +447,7 @@ threads
           `Thread: ${thread.id}`,
           `Title: ${thread.title}`,
           `Project: ${result.project?.title ?? thread.projectId}`,
-          `Status: ${thread.status}${thread.latestTurn ? `, latest turn ${thread.latestTurn.state}` : ""}`,
+          `Status: ${thread.status}, ${thread.activeRun ? `running turn ${thread.activeRun.status}` : `latest turn ${thread.latestRun?.status ?? "none"}`}`,
           `View: ${thread.view.detail}, turns ${range} of ${thread.view.totalTurns}`,
           "",
           renderTranscript(thread) || "No messages.",
@@ -585,19 +458,21 @@ threads
 
 addReplyOptions(
   addSettingsOptions(
-    threads
-      .command("send")
-      .description("Start a new turn on an existing thread, optionally changing its model or modes first.")
-      .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
-      .option("--prompt <text>", "Message text.")
-      .option("--prompt-file <path>", "Read the message from a UTF-8 file.")
-      .option("--stdin", "Read the message from stdin.")
+    addPromptOptions(
+      threads
+        .command("send")
+        .description("Send a message to an existing thread, optionally changing its model or modes first.")
+        .requiredOption("--thread <thread-id>", "Exact T3 thread id."),
+    )
       .option("--wake-settled", "Explicitly allow this message to wake a settled thread.")
       .option("--wait", "Wait for the turn that handles the message and print its reply.")
       .addOption(
-        new Option("--if-busy <mode>", "reject: refuse while a turn runs or a message waits; inject: send into the running turn.")
-          .choices(["reject", "inject"])
-          .default("reject"),
+        new Option(
+          "--if-busy <mode>",
+          "When a turn runs or messages wait: refuse sends nothing; queue waits its turn; steer joins the running turn; restart stops it and starts over.",
+        )
+          .choices(["refuse", "queue", "steer", "restart", "reject", "inject"])
+          .default("refuse"),
       ),
   ),
 ).action((options: ThreadSendCommandOptions) =>
@@ -614,7 +489,15 @@ addReplyOptions(
       ifBusy: options.ifBusy,
     });
     const changed = result.settings ? describeChanges(result.settings) : "";
-    const sent = `${changed ? `Changed ${changed}. ` : ""}Sent message ${result.message.messageId} to thread ${result.thread.id}; T3 accepted and projected the turn.`;
+    const delivery =
+      result.message.delivery === "start_immediately"
+        ? "it starts a new turn"
+        : result.message.delivery === "queue_after_active"
+          ? "it waits in the queue"
+          : result.message.delivery === "steer_active"
+            ? "it joins the running turn"
+            : "it restarts the running turn";
+    const sent = `${changed ? `Changed ${changed}. ` : ""}Sent message ${result.message.messageId} to thread ${result.thread.id}; ${delivery}.`;
     writeSuccess(result, context, withReply(sent, result));
   }),
 );
@@ -622,9 +505,9 @@ addReplyOptions(
 addReplyOptions(
   threads
     .command("wait")
-    .description("Wait until a thread's current turn finishes or needs a person, then print that turn.")
+    .description("Wait until a thread's current turn and queue finish or need a person, then print the turn.")
     .requiredOption("--thread <thread-id>", "Exact T3 thread id."),
-).action((options: ThreadWaitCommandOptions) =>
+).action((options: ThreadWaitCommandOptions & { thread: string }) =>
   action(async () => {
     const context = await commandContext();
     const result = await waitForThread(context.config, options.thread, waitOptions(options));
@@ -635,7 +518,7 @@ addReplyOptions(
 addSettingsOptions(
   threads
     .command("set")
-    .description("Change a thread's model, reasoning effort, fast mode, permission, or plan mode without sending a message.")
+    .description("Change a thread's model, provider, reasoning effort, fast mode, permission, or plan mode without sending a message.")
     .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
     .option("--dry-run", "Check the change and print its commands without dispatching them."),
 ).action((options: SettingsCommandOptions & { thread: string; dryRun?: boolean }) =>
@@ -647,7 +530,9 @@ addSettingsOptions(
       ...(options.dryRun ? { dryRun: true } : {}),
     });
     const notes = [
-      ...(result.sessionRestart && !result.dryRun ? ["T3 restarted the provider session to apply the permission mode."] : []),
+      ...(result.changes.providerSwitch && !result.dryRun
+        ? ["T3 hands the conversation to the new provider with its recent history."]
+        : []),
       ...(result.changes.modelSelection && !result.changes.catalogUsed
         ? ["T3 did not return its model catalog, so the options were not checked."]
         : []),
@@ -670,11 +555,7 @@ threads
     action(async () => {
       const context = await commandContext();
       const result = await interruptThread(context.config, options.thread);
-      writeSuccess(
-        result,
-        context,
-        `Interrupted thread ${result.thread.id}: its latest turn is ${result.latestTurn?.state ?? "unknown"} and the session is ${result.sessionStatus ?? "gone"}.${result.providerError ? ` The provider reported: ${result.providerError}` : ""}`,
-      );
+      writeSuccess(result, context, `Interrupted thread ${result.thread.id}: its turn is now ${result.runStatus}.`);
     }),
   );
 
@@ -734,12 +615,8 @@ addReplyOptions(
     .description("Answer, or dismiss, a question the thread asked.")
     .requiredOption("--thread <thread-id>", "Exact T3 thread id.")
     .option("--request <request-id>", "The question to answer when several are pending.")
-    .option(
-      "--answer <answer>",
-      "An answer, or <question>=<answer> with the question's number when it asks several (repeatable).",
-      collect,
-    )
-    .option("--dismiss", "Dismiss a question that outlived its turn instead of answering it.")
+    .option("--answer <answer>", "An answer, or <question>=<answer> with the question's number when it asks several (repeatable).", collect)
+    .option("--dismiss", "Dismiss a question that no running turn waits on, instead of answering it.")
     .option("--wait", "Then wait for the turn that continues with the answer, and print it."),
 ).action((options: ThreadRequestCommandOptions & { answer?: string[]; dismiss?: boolean }) =>
   action(async () => {
@@ -753,7 +630,7 @@ addReplyOptions(
     });
     const text = result.dismissed
       ? `Dismissed question ${result.request.requestId} on thread ${result.thread.id}.`
-      : `Answered question ${result.request.requestId} on thread ${result.thread.id}.${result.answerMessageId ? " T3 sends the answer to the thread as a new message." : ""}`;
+      : `Answered question ${result.request.requestId} on thread ${result.thread.id}.${result.startsTurn ? " T3 sends the answer to the thread as a new turn." : ""}`;
     writeSuccess(result, context, withReply(text, result));
   }),
 );
@@ -766,11 +643,7 @@ threads
     action(async () => {
       const context = await commandContext();
       const result = await settleThread(context.config, options.thread);
-      writeSuccess(
-        result,
-        context,
-        `Settled thread ${result.thread.id}; T3 projected the lifecycle change.`,
-      );
+      writeSuccess(result, context, `Settled thread ${result.thread.id}; T3 shows the lifecycle change.`);
     }),
   );
 
@@ -782,13 +655,14 @@ threads
     action(async () => {
       const context = await commandContext();
       const result = await unsettleThread(context.config, options.thread);
-      writeSuccess(
-        result,
-        context,
-        `Marked thread ${result.thread.id} active; T3 projected the lifecycle change.`,
-      );
+      writeSuccess(result, context, `Marked thread ${result.thread.id} active; T3 shows the lifecycle change.`);
     }),
   );
+
+function handoverText(result: Awaited<ReturnType<typeof createHandoverThread>>, verb: string): string {
+  const head = `${result.dryRun ? `Would ${verb}` : verb === "create" ? "Created" : "Handed over to"} thread ${result.thread.id} in ${result.project.title}.`;
+  return withReply(head, result);
+}
 
 addThreadOptions(threads.command("create"))
   .description("Create a new project thread and start its first turn.")
@@ -797,11 +671,7 @@ addThreadOptions(threads.command("create"))
       const context = await commandContext();
       const prompt = await resolvePrompt(options);
       const result = await createHandoverThread(context.config, threadCreateOptions(options, prompt));
-      writeSuccess(
-        result,
-        context,
-        `${result.dryRun ? "Would create" : "Created"} thread ${result.thread.id} in ${result.project.title}.`,
-      );
+      writeSuccess(result, context, handoverText(result, "create"));
     }),
   );
 
@@ -812,11 +682,7 @@ addThreadOptions(program.command("handover"))
       const context = await commandContext();
       const prompt = await resolvePrompt(options);
       const result = await createHandoverThread(context.config, threadCreateOptions(options, prompt));
-      writeSuccess(
-        result,
-        context,
-        `${result.dryRun ? "Would hand over to" : "Handed over to"} thread ${result.thread.id} in ${result.project.title}.`,
-      );
+      writeSuccess(result, context, handoverText(result, "hand over to"));
     }),
   );
 
@@ -846,6 +712,8 @@ program
       writeSuccess(result, context);
     }),
   );
+
+registerV2Commands(program, threads);
 
 try {
   await program.parseAsync(process.argv);

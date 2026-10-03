@@ -3,19 +3,14 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { withT3Api, type T3Api } from "./api.js";
+import { fetchCatalog } from "./catalog.js";
 import { CliError } from "./errors.js";
 import { readLocalProjects } from "./localProjects.js";
 import { applyModelOverrides } from "./modelSelection.js";
 import { openThread } from "./open.js";
 import { discoverRuntime } from "./runtime.js";
-import { T3ThreadApi, type ThreadSettlementState } from "./threadApi.js";
-import {
-  changeSettingsWithApi,
-  busyState,
-  hasSettingsChange,
-  settingsSummary,
-  type ThreadSettingsChange,
-} from "./threadControls.js";
+import { createdBy, T3ThreadApi, type ThreadRead } from "./threadApi.js";
+import { changeSettingsWithApi, hasSettingsChange, settingsSummary, type ThreadSettingsChange } from "./threadControls.js";
 import {
   configForWait,
   projectById,
@@ -25,7 +20,16 @@ import {
   type ThreadLifecycleStatus,
   type ThreadWaitOptions,
 } from "./threadSupport.js";
-import { buildTranscript, pendingRequests, queuedMessages, type TranscriptOptions } from "./transcript.js";
+import {
+  activeRun,
+  buildTranscript,
+  busyState,
+  clip,
+  pendingRequests,
+  queuedRuns,
+  runMessage,
+  type TranscriptOptions,
+} from "./transcript.js";
 import type {
   CliConfig,
   EffectiveThreadEnvMode,
@@ -36,19 +40,20 @@ import type {
   RuntimeMode,
   SpeedMode,
   T3Project,
-  T3Thread,
+  T3Run,
+  T3ThreadProjection,
+  T3ThreadShell,
   ThreadEnvMode,
   WorkspaceMode,
   WorkspaceResolution,
 } from "./types.js";
 import { pathsEqual, resolveWorkspace } from "./workspace.js";
 
-const LEGACY_DEFAULT_MODEL_SELECTION: ModelSelection = { instanceId: "codex", model: "gpt-5.4" };
-const CURRENT_DEFAULT_MODEL_SELECTION: ModelSelection = { instanceId: "codex", model: "gpt-5.6-sol" };
-const MINIMUM_WORKTREE_BOOTSTRAP_VERSION = "0.0.28";
-const MODERN_DEFAULTS_VERSION = "0.0.29";
+/** Used only when neither the project, the CLI config, nor T3's catalog names a model. */
+const FALLBACK_MODEL_SELECTION: ModelSelection = { instanceId: "codex", model: "gpt-5.6-sol" };
 const INSPECT_RECENT_MESSAGE_LIMIT = 6;
 const INSPECT_MESSAGE_TEXT_LIMIT = 2_000;
+const QUEUE_PREVIEW_LIMIT = 200;
 
 export interface WorkspaceOptions {
   cwd?: string;
@@ -67,6 +72,8 @@ export interface ThreadCreateOptions extends WorkspaceOptions {
   speedMode?: SpeedMode;
   thinkingEffort?: string;
   dryRun?: boolean;
+  /** Wait for the first turn to finish and return its reply. */
+  wait?: ThreadWaitOptions;
 }
 
 export type ThreadListStatus = ThreadLifecycleStatus | "all";
@@ -77,20 +84,23 @@ export interface ThreadListOptions extends WorkspaceOptions {
   status?: ThreadListStatus;
 }
 
+/**
+ * What to do when the thread is busy. `refuse` (the default; `reject` is the old name) sends nothing.
+ * `queue` waits for the running turn, `steer` joins it (`inject` is the old name), and `restart`
+ * stops it and starts over with this message.
+ */
+export type IfBusy = "refuse" | "reject" | "queue" | "steer" | "inject" | "restart";
+
 export interface ThreadSendOptions {
   threadId: string;
   prompt: string;
   wakeSettled?: boolean;
-  confirmSettled?: (thread: T3Thread, project: T3Project | null) => Promise<boolean>;
+  confirmSettled?: (thread: { id: string; title: string; settledAt?: string | null }, project: T3Project | null) => Promise<boolean>;
   /** Wait for the turn that handles the message and return its reply. */
   wait?: ThreadWaitOptions;
   /** Change the thread's model, effort, speed, or modes before the message starts its turn. */
   settings?: ThreadSettingsChange;
-  /**
-   * What to do when the thread is busy: `reject` (the default) refuses to send; `inject` sends into the
-   * running turn, where the provider folds the message in or queues it.
-   */
-  ifBusy?: "reject" | "inject";
+  ifBusy?: IfBusy;
 }
 
 interface EffectiveT3Settings {
@@ -102,45 +112,13 @@ interface T3ProjectFileSettings {
   defaultThreadEnvMode: EffectiveThreadEnvMode | null;
 }
 
-function parseVersion(version: string): readonly [number, number, number] | null {
-  const values = version.match(/^v?(\d+)\.(\d+)\.(\d+)/u)?.slice(1).map(Number);
-  if (!values || values.length !== 3 || values.some((value) => !Number.isInteger(value))) return null;
-  return [values[0]!, values[1]!, values[2]!];
-}
-
-function versionAtLeast(version: string, minimum: string): boolean {
-  const actual = parseVersion(version);
-  const required = parseVersion(minimum);
-  if (!actual || !required) return false;
-  for (let index = 0; index < actual.length; index += 1) {
-    if (actual[index]! > required[index]!) return true;
-    if (actual[index]! < required[index]!) return false;
-  }
-  return true;
-}
-
-function defaultModelSelectionForVersion(version: string): ModelSelection {
-  return versionAtLeast(version, MODERN_DEFAULTS_VERSION)
-    ? CURRENT_DEFAULT_MODEL_SELECTION
-    : LEGACY_DEFAULT_MODEL_SELECTION;
-}
-
-function defaultStartFromOriginForVersion(version: string): boolean {
-  return versionAtLeast(version, MODERN_DEFAULTS_VERSION);
-}
-
 function asEffectiveThreadEnvMode(value: unknown): EffectiveThreadEnvMode | null {
   return value === "local" || value === "worktree" ? value : null;
 }
 
-async function readT3Settings(
-  settingsPath: string | null,
-  serverVersion: string,
-): Promise<EffectiveT3Settings> {
-  const defaults: EffectiveT3Settings = {
-    defaultThreadEnvMode: "local",
-    newWorktreesStartFromOrigin: defaultStartFromOriginForVersion(serverVersion),
-  };
+async function readT3Settings(settingsPath: string | null): Promise<EffectiveT3Settings> {
+  // Orchestrator V2 builds start new worktrees from origin unless the setting turns it off.
+  const defaults: EffectiveT3Settings = { defaultThreadEnvMode: "local", newWorktreesStartFromOrigin: true };
   if (!settingsPath) return defaults;
   try {
     const raw = JSON.parse(await readFile(settingsPath, "utf8")) as Record<string, unknown>;
@@ -169,41 +147,72 @@ function activeProjects(projects: readonly T3Project[]): T3Project[] {
   return projects.filter((project) => project.deletedAt == null);
 }
 
-function nonArchivedThread(thread: T3Thread): boolean {
-  return thread.archivedAt == null && thread.deletedAt == null;
+function runSummary(run: T3Run | null) {
+  return run
+    ? {
+        runId: run.id,
+        ordinal: run.ordinal,
+        status: run.status,
+        requestedAt: run.requestedAt,
+        startedAt: run.startedAt,
+        completedAt: run.completedAt,
+      }
+    : null;
 }
 
-function threadSummary(thread: T3Thread) {
-  const summary = { ...thread };
-  delete summary.messages;
-  delete summary.activities;
-  delete summary.checkpoints;
-  delete summary.proposedPlans;
-  return { ...summary, status: threadStatus(thread) };
+/** A shell thread for list output. `status` stays the lifecycle status; the run status is `runStatus`. */
+function shellSummary(thread: T3ThreadShell) {
+  return { ...thread, status: threadStatus(thread), runStatus: thread.status ?? "idle" };
 }
 
-/** The latest context-window report, so callers can see how full the target's context is. */
-function contextWindow(thread: T3Thread): { usedTokens: number; maxTokens: number | null } | null {
-  const activities = Array.isArray(thread.activities) ? (thread.activities as Array<Record<string, unknown>>) : [];
-  const latest = activities.findLast((activity) => activity?.kind === "context-window.updated");
-  const payload = latest?.payload as Record<string, unknown> | undefined;
-  if (typeof payload?.usedTokens !== "number") return null;
-  return { usedTokens: payload.usedTokens, maxTokens: typeof payload.maxTokens === "number" ? payload.maxTokens : null };
+function latestRun(projection: T3ThreadProjection): T3Run | null {
+  return projection.runs.reduce<T3Run | null>(
+    (latest, run) => (latest === null || run.ordinal > latest.ordinal ? run : latest),
+    null,
+  );
 }
 
-function threadInspectionView(thread: T3Thread) {
-  const messages = thread.messages ?? [];
-  const transcript = buildTranscript(thread, { detail: "answers" });
+function queueView(projection: T3ThreadProjection) {
+  return queuedRuns(projection).map((run) => {
+    const text = runMessage(projection, run)?.text ?? "";
+    const preview = clip(text, QUEUE_PREVIEW_LIMIT);
+    return {
+      runId: run.id,
+      position: run.queuePosition ?? null,
+      held: run.queueHeld === true,
+      text: preview.text,
+      textTruncated: preview.truncated,
+      requestedAt: run.requestedAt,
+    };
+  });
+}
+
+/** Thread settings and state without its timeline, which `threads read` returns. */
+function threadSummary(projection: T3ThreadProjection) {
+  const active = activeRun(projection);
+  const latest = latestRun(projection);
   return {
-    ...threadSummary(thread),
+    ...projection.thread,
+    status: threadStatus(projection.thread),
+    runStatus: active?.status ?? latest?.status ?? "idle",
+    activeRun: runSummary(active),
+    latestRun: runSummary(latest),
+    queue: queueView(projection),
+  };
+}
+
+function threadInspectionView(projection: T3ThreadProjection) {
+  const transcript = buildTranscript(projection, { detail: "answers" });
+  const messages = [...projection.messages].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  return {
+    ...threadSummary(projection),
     messageCount: messages.length,
     turnCount: transcript.view.totalTurns,
-    contextWindow: contextWindow(thread),
-    pendingRequests: pendingRequests(thread),
+    pendingRequests: pendingRequests(projection),
     recentMessages: messages.slice(-INSPECT_RECENT_MESSAGE_LIMIT).map((message) => ({
       id: message.id,
       role: message.role,
-      turnId: message.turnId,
+      turnId: message.runId,
       text:
         message.text.length <= INSPECT_MESSAGE_TEXT_LIMIT
           ? message.text
@@ -215,10 +224,10 @@ function threadInspectionView(thread: T3Thread) {
   };
 }
 
-function threadReadView(thread: T3Thread, options: TranscriptOptions) {
-  const transcript = buildTranscript(thread, options);
+function threadReadView(projection: T3ThreadProjection, options: TranscriptOptions) {
+  const transcript = buildTranscript(projection, options);
   return {
-    ...threadSummary(thread),
+    ...threadSummary(projection),
     messageCount: transcript.messages.length,
     ...transcript,
   };
@@ -245,16 +254,6 @@ function temporaryWorktreeBranch(): string {
   return `t3code/${randomBytes(4).toString("hex")}`;
 }
 
-async function projectsFromApi(api: T3Api): Promise<T3Project[]> {
-  const shell = await api.shellSnapshot().catch(() => null);
-  if (shell && Array.isArray(shell.projects)) return activeProjects(shell.projects);
-  const snapshot = await api.snapshot();
-  if (!Array.isArray(snapshot.projects)) {
-    throw new CliError("T3_INVALID_SNAPSHOT", "T3 returned a snapshot without projects.");
-  }
-  return activeProjects(snapshot.projects);
-}
-
 function projectTitle(workspaceRoot: string): string {
   return path.basename(workspaceRoot) || "project";
 }
@@ -279,8 +278,13 @@ function effectiveEnvMode(
   return { mode: settings.defaultThreadEnvMode, source: "global" };
 }
 
-function supportsWorktreeBootstrap(version: string): boolean {
-  return versionAtLeast(version, MINIMUM_WORKTREE_BOOTSTRAP_VERSION);
+/** T3's own default model, from its catalog: the Codex default, else the first enabled provider's. */
+async function catalogDefaultModel(api: T3Api): Promise<ModelSelection> {
+  const catalog = await fetchCatalog(api).catch(() => null);
+  const providers = (catalog?.providers ?? []).filter((provider) => provider.enabled && provider.models.length > 0);
+  const provider = providers.find((candidate) => candidate.instanceId === "codex") ?? providers[0];
+  const model = provider?.models.find((candidate) => candidate.isDefault) ?? provider?.models[0];
+  return provider && model ? { instanceId: provider.instanceId, model: model.slug } : FALLBACK_MODEL_SELECTION;
 }
 
 function resolveModelSelection(
@@ -300,26 +304,8 @@ function resolveModelSelection(
   );
 }
 
-function buildProjectCreateCommand(
-  workspaceRoot: string,
-  title: string,
-  createdAt: string,
-  defaultModelSelection: ModelSelection,
-) {
-  const projectId = randomUUID();
-  return {
-    projectId,
-    command: {
-      type: "project.create",
-      commandId: randomUUID(),
-      projectId,
-      title,
-      workspaceRoot,
-      createWorkspaceRootIfMissing: false,
-      defaultModelSelection,
-      createdAt,
-    },
-  } as const;
+async function projectsFromApi(api: T3Api): Promise<T3Project[]> {
+  return activeProjects(await api.projects());
 }
 
 async function ensureProjectWithApi(
@@ -328,7 +314,6 @@ async function ensureProjectWithApi(
   workspace: WorkspaceResolution,
   policy: ProjectPolicy,
   dryRun: boolean,
-  defaultModelSelection: ModelSelection,
 ): Promise<{ project: T3Project; created: boolean; command: unknown | null; dispatch: unknown | null }> {
   const projects = initialProjects ?? (await projectsFromApi(api));
   const existing = projectForWorkspace(projects, workspace);
@@ -344,22 +329,27 @@ async function ensureProjectWithApi(
     });
   }
 
-  const createdAt = new Date().toISOString();
-  const create = buildProjectCreateCommand(
-    workspaceRoot,
-    projectTitle(workspaceRoot),
-    createdAt,
-    defaultModelSelection,
-  );
-  const project: T3Project = {
-    id: create.projectId,
+  const projectId = randomUUID();
+  const command = {
+    type: "project.create",
+    commandId: randomUUID(),
+    projectId,
     title: projectTitle(workspaceRoot),
     workspaceRoot,
-    defaultModelSelection,
+    createWorkspaceRootIfMissing: false,
+  };
+  const planned: T3Project = {
+    id: projectId,
+    title: command.title,
+    workspaceRoot,
+    defaultModelSelection: null,
     deletedAt: null,
   };
-  const dispatch = dryRun ? null : await api.dispatch(create.command);
-  return { project, created: true, command: create.command, dispatch };
+  if (dryRun) return { project: planned, created: true, command, dispatch: null };
+  const dispatch = await api.mutateProject(command);
+  const returned = dispatch as Partial<T3Project> | null;
+  const project = returned && typeof returned.id === "string" ? ({ ...planned, ...returned } as T3Project) : planned;
+  return { project, created: true, command, dispatch };
 }
 
 export async function listProjects(config: CliConfig) {
@@ -403,7 +393,6 @@ export async function ensureProject(config: CliConfig, options: WorkspaceOptions
       workspace,
       options.projectPolicy ?? config.projectPolicy,
       options.dryRun ?? false,
-      defaultModelSelectionForVersion(runtime.serverVersion),
     )),
   }));
 }
@@ -424,8 +413,8 @@ export async function listThreads(config: CliConfig, options: ThreadListOptions 
   }
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, config, async (api, invocation) => {
-    const catalog = await new T3ThreadApi(api).catalog();
-    const projects = activeProjects(catalog.projects);
+    const shell = await api.shellSnapshot();
+    const projects = activeProjects(shell.projects);
     let project: T3Project | null = null;
     let workspace = null;
 
@@ -447,18 +436,17 @@ export async function listThreads(config: CliConfig, options: ThreadListOptions 
     }
 
     const requestedStatus = options.status ?? "all";
-    const threads = catalog.threads
-      .filter(nonArchivedThread)
+    const threads = shell.threads
+      .filter((thread) => thread.archivedAt == null && thread.deletedAt == null)
       .filter((thread) => project === null || thread.projectId === project.id)
       .filter((thread) => requestedStatus === "all" || threadStatus(thread) === requestedStatus)
       .sort((left, right) => (right.updatedAt ?? "").localeCompare(left.updatedAt ?? ""))
-      // The snapshot fallback carries whole transcripts; the list returns thread summaries only.
-      .map(threadSummary);
+      .map(shellSummary);
 
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
-      snapshotSequence: catalog.snapshotSequence,
+      snapshotSequence: shell.snapshotSequence,
       filter: {
         status: requestedStatus,
         projectId: project?.id ?? null,
@@ -474,15 +462,15 @@ export async function inspectThread(config: CliConfig, rawThreadId: string) {
   const threadId = requireThreadId(rawThreadId);
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, config, async (api, invocation) => {
-    // A turn window would understate the turn and message counts of a long thread.
+    // A bounded window would understate the message count of a long thread.
     const inspected = await new T3ThreadApi(api).read(threadId);
-    const project = await projectById(api, inspected.thread.projectId);
+    const project = await projectById(api, inspected.projection.thread.projectId);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
       snapshotSequence: inspected.snapshotSequence,
       project,
-      thread: threadInspectionView(inspected.thread),
+      thread: threadInspectionView(inspected.projection),
     };
   });
 }
@@ -491,17 +479,81 @@ export async function readThread(config: CliConfig, rawThreadId: string, options
   const threadId = requireThreadId(rawThreadId);
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, config, async (api, invocation) => {
-    // Turn windows are applied locally: numbering, the first turn, and prompt grouping need the whole thread.
+    // Turn windows are applied locally: numbering and the first turn need the whole thread.
     const read = await new T3ThreadApi(api).read(threadId);
-    const project = await projectById(api, read.thread.projectId);
+    const project = await projectById(api, read.projection.thread.projectId);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
       snapshotSequence: read.snapshotSequence,
       project,
-      thread: threadReadView(read.thread, options),
+      thread: threadReadView(read.projection, options),
     };
   });
+}
+
+function requireWritable(read: ThreadRead, action: string): void {
+  const thread = read.projection.thread;
+  if (thread.deletedAt != null) {
+    throw new CliError("THREAD_NOT_FOUND", `No T3 Code thread exists with id ${thread.id}.`, {
+      exitCode: 3,
+      details: { threadId: thread.id },
+    });
+  }
+  if (thread.archivedAt != null) {
+    throw new CliError("THREAD_ARCHIVED", `Thread ${thread.id} is archived and cannot ${action}.`, {
+      exitCode: 4,
+      details: { threadId: thread.id, archivedAt: thread.archivedAt },
+    });
+  }
+}
+
+type DispatchMode =
+  | { type: "start_immediately" }
+  | { type: "queue_after_active" }
+  | { type: "steer_active"; targetRunId: string }
+  | { type: "restart_active"; targetRunId: string };
+
+function dispatchModeFor(projection: T3ThreadProjection, ifBusy: IfBusy): DispatchMode {
+  const busy = busyState(projection);
+  if (!busy) return { type: "start_immediately" };
+  const choice = ifBusy === "reject" ? "refuse" : ifBusy === "inject" ? "steer" : ifBusy;
+  if (choice === "refuse") {
+    throw new CliError(
+      "THREAD_BUSY",
+      `Thread ${projection.thread.id} ${busy.runRunning ? "is running a turn" : "has queued messages waiting for their turn"}. Wait for it with threads wait, or pass --if-busy queue, steer, or restart.`,
+      { exitCode: 4, details: { threadId: projection.thread.id, ...busy } },
+    );
+  }
+  if (choice === "queue") return { type: "queue_after_active" };
+  // Steering and restarting act on the run that works now; with only a queue, the message queues too.
+  if (!busy.activeRunId) return { type: "queue_after_active" };
+  return choice === "steer"
+    ? { type: "steer_active", targetRunId: busy.activeRunId }
+    : { type: "restart_active", targetRunId: busy.activeRunId };
+}
+
+async function confirmWake(
+  read: ThreadRead,
+  project: T3Project | null,
+  options: Pick<ThreadSendOptions, "wakeSettled" | "confirmSettled">,
+): Promise<void> {
+  const thread = read.projection.thread;
+  if (threadStatus(thread) !== "settled" || options.wakeSettled) return;
+  // T3 wakes a settled thread on any new message; the CLI asks first.
+  if (!options.confirmSettled) {
+    throw new CliError(
+      "SETTLED_THREAD_CONFIRMATION_REQUIRED",
+      `Thread ${thread.id} is settled. Re-run with --wake-settled to send and wake it.`,
+      { exitCode: 4, details: { threadId: thread.id, settledAt: thread.settledAt } },
+    );
+  }
+  if (!(await options.confirmSettled(thread, project))) {
+    throw new CliError("SETTLED_THREAD_DECLINED", `Did not send a message to settled thread ${thread.id}.`, {
+      exitCode: 4,
+      details: { threadId: thread.id },
+    });
+  }
 }
 
 export async function sendThreadMessage(config: CliConfig, options: ThreadSendOptions) {
@@ -514,56 +566,32 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
   return await withT3Api(runtime, configForWait(config, options.wait), async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
-    const inspected = await adapter.inspect(threadId);
-    const thread = inspected.thread;
-    if (thread.archivedAt != null) {
-      throw new CliError("THREAD_ARCHIVED", `Thread ${threadId} is archived and cannot receive a new turn.`, {
-        exitCode: 4,
-        details: { threadId, archivedAt: thread.archivedAt },
-      });
-    }
-
+    let read = await adapter.inspect(threadId);
+    requireWritable(read, "receive a new message");
+    const thread = read.projection.thread;
     const project = await projectById(api, thread.projectId);
-    if (threadStatus(thread) === "settled" && !options.wakeSettled) {
-      if (!options.confirmSettled) {
-        throw new CliError(
-          "SETTLED_THREAD_CONFIRMATION_REQUIRED",
-          `Thread ${threadId} is settled. Re-run with --wake-settled to send and wake it.`,
-          { exitCode: 4, details: { threadId, settledAt: thread.settledAt } },
-        );
-      }
-      if (!(await options.confirmSettled(thread, project))) {
-        throw new CliError("SETTLED_THREAD_DECLINED", `Did not send a message to settled thread ${threadId}.`, {
-          exitCode: 4,
-          details: { threadId },
-        });
-      }
-    }
+    await confirmWake(read, project, options);
 
-    const busy = busyState(thread);
-    if (busy && (options.ifBusy ?? "reject") === "reject") {
-      throw new CliError(
-        "THREAD_BUSY",
-        `Thread ${threadId} ${busy.turnRunning ? "is running a turn" : "has a message waiting for its turn"}. Wait for it with threads wait, or pass --if-busy inject to send into the running turn.`,
-        {
-          exitCode: 4,
-          details: {
-            threadId,
-            ...busy,
-            sessionStatus: thread.session?.status ?? null,
-            latestTurnState: thread.latestTurn?.state ?? null,
-          },
-        },
-      );
-    }
-
+    // A refused send must change nothing, so check it before any settings change.
+    dispatchModeFor(read.projection, options.ifBusy ?? "refuse");
     const settings = hasSettingsChange(options.settings)
-      ? await changeSettingsWithApi(api, adapter, thread, options.settings)
+      ? await changeSettingsWithApi(api, adapter, read.projection, options.settings)
       : null;
-    // The settings change leaves the new selection on the thread, and the turn carries it to the session.
-    const command = adapter.buildTurnStart(settings?.thread ?? thread, prompt);
-    const sent = await adapter.dispatchTurn(command);
-    const messageId = command.message.messageId;
+    if (settings) read = { ...read, projection: settings.projection };
+    const dispatchMode = dispatchModeFor(read.projection, options.ifBusy ?? "refuse");
+    const messageId = randomUUID();
+    const command = {
+      type: "message.dispatch",
+      commandId: randomUUID(),
+      threadId,
+      messageId,
+      text: prompt,
+      attachments: [],
+      ...createdBy(),
+      dispatchMode,
+    };
+    const dispatch = await adapter.dispatch(command);
+    const verification = await adapter.verifyMessage(threadId, messageId, dispatch.sequence);
     const waited = options.wait
       ? await adapter.waitForTurn(threadId, { messageId, timeoutMs: options.wait.timeoutMs }).catch((cause: unknown) => {
           if (!(cause instanceof CliError) || cause.code !== "THREAD_WAIT_TIMEOUT") throw cause;
@@ -584,22 +612,19 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
         title: thread.title,
         statusBeforeSend: threadStatus(thread),
       },
-      message: {
-        messageId,
-        textLength: command.message.text.length,
-      },
-      ...(settings ? { settings: { ...settingsSummary(settings.plan), sessionRestarted: settings.sessionRestarted, commands: settings.plan.commands, dispatches: settings.dispatches } } : {}),
-      command: {
-        type: command.type,
-        commandId: command.commandId,
-        threadId: command.threadId,
-        ...(command.modelSelection ? { modelSelection: command.modelSelection } : {}),
-        runtimeMode: command.runtimeMode,
-        interactionMode: command.interactionMode,
-        createdAt: command.createdAt,
-      },
-      dispatch: sent.dispatch,
-      verification: sent.verification,
+      message: { messageId, textLength: prompt.length, delivery: dispatchMode.type },
+      ...(settings
+        ? {
+            settings: {
+              ...settingsSummary(settings.plan),
+              commands: settings.plan.commands,
+              dispatches: settings.dispatches,
+            },
+          }
+        : {}),
+      command: { type: command.type, commandId: command.commandId, threadId, dispatchMode },
+      dispatch,
+      verification,
       ...(waited && options.wait ? waitView(waited, options.wait, [messageId]) : {}),
     };
   });
@@ -610,76 +635,70 @@ export async function waitForThread(config: CliConfig, rawThreadId: string, opti
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, configForWait(config, options), async (api, invocation) => {
     const waited = await new T3ThreadApi(api).waitForTurn(threadId, { timeoutMs: options.timeoutMs });
-    const project = await projectById(api, waited.thread.projectId);
+    const thread = waited.projection.thread;
+    const project = await projectById(api, thread.projectId);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
       project,
-      thread: { id: waited.thread.id, projectId: waited.thread.projectId, title: waited.thread.title },
+      thread: { id: thread.id, projectId: thread.projectId, title: thread.title },
       ...waitView(waited, options),
     };
   });
 }
 
-async function changeThreadSettlement(
-  config: CliConfig,
-  rawThreadId: string,
-  state: ThreadSettlementState,
-) {
+type ThreadSettlementState = "active" | "settled";
+
+async function changeThreadSettlement(config: CliConfig, rawThreadId: string, state: ThreadSettlementState) {
   const threadId = requireThreadId(rawThreadId);
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
   if (runtime.capabilities.threadSettlement !== true) {
-    throw new CliError(
-      "THREAD_SETTLEMENT_UNSUPPORTED",
-      "This T3 Code server does not advertise thread settlement support.",
-      {
-        exitCode: 4,
-        details: { capability: "threadSettlement", serverVersion: runtime.serverVersion },
-      },
-    );
+    throw new CliError("THREAD_SETTLEMENT_UNSUPPORTED", "This T3 Code server does not advertise thread settlement support.", {
+      exitCode: 4,
+      details: { capability: "threadSettlement", serverVersion: runtime.serverVersion },
+    });
   }
   return await withT3Api(runtime, config, async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
-    const inspected = await adapter.inspect(threadId);
-    const thread = inspected.thread;
-    if (thread.archivedAt != null) {
-      throw new CliError("THREAD_ARCHIVED", `Thread ${threadId} is archived and cannot change settlement state.`, {
-        exitCode: 4,
-        details: { threadId, archivedAt: thread.archivedAt },
-      });
-    }
-    // The thread detail omits T3's pending flags, so derive them from the request activities too.
-    const requests = pendingRequests(thread);
-    const hasPendingApprovals = thread.hasPendingApprovals === true || requests.some((request) => request.kind === "approval");
-    const hasPendingUserInput =
-      thread.hasPendingUserInput === true || requests.some((request) => request.kind === "user-input");
-    // A message queued between turns is submitted work, even while the session looks ready.
-    const queued = queuedMessages(thread);
-    if (
-      state === "settled" &&
-      (thread.session?.status === "starting" ||
-        thread.session?.status === "running" ||
-        thread.latestTurn?.state === "running" ||
-        hasPendingApprovals ||
-        hasPendingUserInput ||
-        queued.length > 0)
-    ) {
+    const read = await adapter.inspect(threadId);
+    requireWritable(read, "change its settlement");
+    const projection = read.projection;
+    const thread = projection.thread;
+    const busy = busyState(projection);
+    const requests = pendingRequests(projection);
+    if (state === "settled" && (busy || requests.length > 0)) {
       throw new CliError("THREAD_SETTLE_BLOCKED", `Thread ${threadId} still has active or blocked work.`, {
         exitCode: 4,
         details: {
           threadId,
-          sessionStatus: thread.session?.status ?? null,
-          latestTurnState: thread.latestTurn?.state ?? null,
-          hasPendingApprovals,
-          hasPendingUserInput,
-          queuedMessages: queued.length,
+          activeRunId: busy?.activeRunId ?? null,
+          queuedRuns: busy?.queuedRuns ?? 0,
+          pendingRequests: requests.map((request) => request.requestId),
         },
       });
     }
 
     const project = await projectById(api, thread.projectId);
-    const command = adapter.buildSettlement(threadId, state);
-    const changed = await adapter.dispatchSettlement(command, thread.updatedAt);
+    const command =
+      state === "settled"
+        ? { type: "thread.settle", commandId: randomUUID(), threadId }
+        : { type: "thread.unsettle", commandId: randomUUID(), threadId, reason: "user" as const };
+    const dispatch = await adapter.dispatch(command);
+    const previousUpdatedAt = thread.updatedAt;
+    const changed = await adapter.poll(threadId, (candidate) => {
+      const next = candidate.thread;
+      if (state === "settled") return next.settledAt != null ? candidate : null;
+      if (next.settledAt != null) return null;
+      return next.settledOverride === "active" || (next.updatedAt ?? "") > (previousUpdatedAt ?? "") ? candidate : null;
+    });
+    if (!changed.value) {
+      throw new CliError(
+        "THREAD_SETTLEMENT_NOT_VERIFIED",
+        `T3 did not show thread ${threadId} as ${state}.`,
+        { exitCode: 5, details: { threadId, state, dispatchSequence: dispatch.sequence } },
+      );
+    }
+    const after = changed.value.thread;
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
@@ -689,11 +708,17 @@ async function changeThreadSettlement(
         projectId: thread.projectId,
         title: thread.title,
         statusBefore: threadStatus(thread),
-        statusAfter: threadStatus(changed.thread),
+        statusAfter: threadStatus(after),
       },
       command,
-      dispatch: changed.dispatch,
-      verification: changed.verification,
+      dispatch,
+      verification: {
+        accepted: true,
+        state,
+        dispatchSequence: dispatch.sequence,
+        settledAt: after.settledAt ?? null,
+        unsettledAt: after.unsettledAt ?? null,
+      },
     };
   });
 }
@@ -706,6 +731,11 @@ export async function unsettleThread(config: CliConfig, threadId: string) {
   return await changeThreadSettlement(config, threadId, "active");
 }
 
+type WorkspaceStrategy =
+  | { type: "root" }
+  | { type: "existing_worktree"; worktreePath: string }
+  | { type: "worktree"; baseRef: string; branch: string; startFromOrigin: boolean };
+
 export async function createHandoverThread(config: CliConfig, options: ThreadCreateOptions) {
   const prompt = options.prompt.trim();
   if (!prompt) throw new CliError("PROMPT_REQUIRED", "A non-empty handover prompt is required.");
@@ -713,18 +743,16 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
   const workspace = await resolveWorkspace(options.cwd ?? process.cwd(), options.workspaceMode ?? config.workspaceMode);
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
   const localProjects = readLocalProjects(runtime);
-  const settings = await readT3Settings(runtime.settingsPath, runtime.serverVersion);
+  const settings = await readT3Settings(runtime.settingsPath);
   const projectFile = await readT3ProjectFile(workspace.workspaceRoot);
-  const installedDefaultModelSelection = defaultModelSelectionForVersion(runtime.serverVersion);
 
-  const result = await withT3Api(runtime, config, async (api, invocation) => {
+  const result = await withT3Api(runtime, configForWait(config, options.wait), async (api, invocation) => {
     const projectResult = await ensureProjectWithApi(
       api,
       localProjects,
       workspace,
       options.projectPolicy ?? config.projectPolicy,
       true,
-      installedDefaultModelSelection,
     );
     // A handover from a linked worktree of the project's checkout keeps working in that worktree.
     const currentWorktreePath = pathsEqual(projectResult.project.workspaceRoot, workspace.workspaceRoot)
@@ -737,18 +765,6 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
       settings,
     );
     const envMode = envModeResolution.mode;
-    if (envMode === "worktree" && !supportsWorktreeBootstrap(runtime.serverVersion)) {
-      throw new CliError(
-        "WORKTREE_HANDOVER_UNSUPPORTED",
-        `New-worktree handovers require T3 ${MINIMUM_WORKTREE_BOOTSTRAP_VERSION} or later.`,
-        {
-          details: {
-            serverVersion: runtime.serverVersion,
-            minimumServerVersion: MINIMUM_WORKTREE_BOOTSTRAP_VERSION,
-          },
-        },
-      );
-    }
     if (envMode === "worktree" && (!workspace.isGitRepository || workspace.branch === null)) {
       throw new CliError(
         "WORKTREE_REQUIRES_BRANCH",
@@ -756,115 +772,77 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
         { details: { isGitRepository: workspace.isGitRepository, currentBranch: workspace.branch } },
       );
     }
-    const createdAt = new Date().toISOString();
-    const threadId = randomUUID();
-    const modelSelection = resolveModelSelection(
-      projectResult.project.defaultModelSelection ?? installedDefaultModelSelection,
-      config,
-      options,
-    );
+    const base = projectResult.project.defaultModelSelection ?? (await catalogDefaultModel(api));
+    const modelSelection = resolveModelSelection(base, config, options);
     const title = threadTitle(prompt);
     const runtimeMode = options.runtimeMode ?? config.runtimeMode;
     const interactionMode = options.interactionMode ?? config.interactionMode;
-    const projectDispatch = projectResult.created && !options.dryRun
-      ? await api.dispatch(projectResult.command)
-      : projectResult.dispatch;
-    const createThread = {
-      type: "thread.create",
+    const workspaceStrategy: WorkspaceStrategy =
+      envMode === "worktree"
+        ? {
+            type: "worktree",
+            baseRef: workspace.branch!,
+            // Without a new branch, `git worktree add` fails when the base branch is checked out elsewhere.
+            branch: temporaryWorktreeBranch(),
+            startFromOrigin: settings.newWorktreesStartFromOrigin,
+          }
+        : currentWorktreePath
+          ? { type: "existing_worktree", worktreePath: currentWorktreePath }
+          : { type: "root" };
+    const threadId = randomUUID();
+    const messageId = randomUUID();
+    const launch = {
       commandId: randomUUID(),
       threadId,
       projectId: projectResult.project.id,
       title,
+      generateTitle: true,
       modelSelection,
       runtimeMode,
       interactionMode,
-      branch: workspace.branch,
-      worktreePath: currentWorktreePath,
-      createdAt,
+      workspaceStrategy,
+      initialMessage: { messageId, text: prompt, attachments: [] },
     };
-    const bootstrap = envMode === "worktree"
-      ? {
-          createThread: {
-            projectId: projectResult.project.id,
-            title,
-            modelSelection,
-            runtimeMode,
-            interactionMode,
-            branch: workspace.branch,
-            worktreePath: null,
-            createdAt,
-          },
-          prepareWorktree: {
-            projectCwd: projectResult.project.workspaceRoot,
-            baseBranch: workspace.branch!,
-            // Without a new branch, `git worktree add` fails when the base branch is checked out elsewhere.
-            branch: temporaryWorktreeBranch(),
-            startFromOrigin: settings.newWorktreesStartFromOrigin,
-            requireWorktree: true,
-          },
-          runSetupScript: true,
-        }
-      : undefined;
-    const command = {
-      type: "thread.turn.start",
-      commandId: randomUUID(),
-      threadId,
-      message: {
-        messageId: randomUUID(),
-        role: "user",
-        text: prompt,
-        attachments: [],
-      },
-      modelSelection,
-      titleSeed: title,
-      runtimeMode,
-      interactionMode,
-      ...(bootstrap ? { bootstrap } : {}),
-      createdAt,
-    };
-    let createDispatch: unknown = null;
-    let dispatch: unknown = null;
+    const projectDispatch =
+      projectResult.created && !options.dryRun ? await api.mutateProject(projectResult.command as { type: string }) : null;
+    let launched: { threadId: string; resumed: boolean } | null = null;
     if (!options.dryRun) {
-      if (envMode === "worktree") {
-        try {
-          dispatch = await api.dispatchOverWebSocket(command);
-        } catch (cause) {
-          const disposition =
-            cause instanceof CliError
-              ? (cause.details as { bootstrapThreadDisposition?: unknown } | undefined)?.bootstrapThreadDisposition
-              : undefined;
-          throw new CliError("THREAD_START_FAILED", "T3 could not prepare the worktree and start its handover prompt.", {
-            cause,
-            details: {
-              threadId,
-              cleanup: disposition === "deleted" || disposition === "not-created" ? disposition : "server-managed",
-            },
-          });
-        }
-      } else {
-        createDispatch = await api.dispatch(createThread);
-        try {
-          dispatch = await api.dispatch(command);
-        } catch (cause) {
-          const cleanup = await api
-            .dispatch({ type: "thread.delete", commandId: randomUUID(), threadId })
-            .then(() => "deleted" as const)
-            .catch(() => "failed" as const);
-          throw new CliError("THREAD_START_FAILED", "T3 created the thread but could not start its handover prompt.", {
-            cause,
-            details: { threadId, cleanup },
-          });
-        }
+      try {
+        const value = await api.launchThread(launch);
+        launched = { threadId: value.threadId, resumed: value.resumed };
+      } catch (cause) {
+        throw new CliError("THREAD_START_FAILED", `T3 could not launch the handover thread: ${cause instanceof Error ? cause.message : String(cause)}`, {
+          cause,
+          details: {
+            threadId,
+            // T3 records each launch step under the command id, so it either finishes or cleans up.
+            cleanup: "server-managed",
+            launchCommandId: launch.commandId,
+          },
+        });
       }
     }
+    const createdThreadId = launched?.threadId ?? threadId;
+    const waited =
+      launched && options.wait
+        ? await new T3ThreadApi(api)
+            .waitForTurn(createdThreadId, { messageId, timeoutMs: options.wait.timeoutMs })
+            .catch((cause: unknown) => {
+              if (!(cause instanceof CliError) || cause.code !== "THREAD_WAIT_TIMEOUT") throw cause;
+              throw new CliError(
+                "THREAD_WAIT_TIMEOUT",
+                `Started thread ${createdThreadId}, but its first turn did not finish within ${Math.round(options.wait!.timeoutMs / 1000)} seconds. Do not hand over again; run threads wait to keep waiting.`,
+                { exitCode: cause.exitCode, details: { ...(cause.details as object), threadId: createdThreadId, sent: true } },
+              );
+            })
+        : null;
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
       workspace,
       settings: {
         ...settings,
-        projectDefaultThreadEnvMode:
-          asEffectiveThreadEnvMode(projectResult.project.defaultThreadEnvMode),
+        projectDefaultThreadEnvMode: asEffectiveThreadEnvMode(projectResult.project.defaultThreadEnvMode),
         projectFileDefaultThreadEnvMode: projectFile.defaultThreadEnvMode,
         effectiveThreadEnvMode: envMode,
         threadEnvModeSource: envModeResolution.source,
@@ -873,7 +851,14 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
       projectCreated: projectResult.created,
       projectCommand: projectResult.command,
       projectDispatch,
-      thread: { id: threadId, title, createCommand: createThread, createDispatch, command, dispatch },
+      thread: {
+        id: createdThreadId,
+        title,
+        messageId,
+        launch,
+        resumed: launched?.resumed ?? false,
+      },
+      ...(waited && options.wait ? waitView(waited, options.wait, [messageId]) : {}),
     };
   });
 

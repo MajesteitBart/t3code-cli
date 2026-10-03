@@ -45,8 +45,7 @@
     "node": "^22.16 || ^23.11 || >=24.10"
   },
   "dependencies": {
-    "commander": "^14.0.1",
-    "t3": "0.0.28"
+    "commander": "^14.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
