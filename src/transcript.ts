@@ -725,9 +725,10 @@ export function renderTranscript(transcript: Transcript): string {
         message.role === "reasoning" || message.role === "system"
           ? message.role
           : message.id === turn.finalMessageId
-            ? turn.state === "running"
-              ? "assistant (latest)"
-              : "assistant (final)"
+            ? // Only a completed turn has a final answer; history without a recorded state counts as one.
+              turn.state === "completed" || turn.state === null
+              ? "assistant (final)"
+              : "assistant (latest)"
             : message.role;
       parts.push(`### ${label} · ${time(message.createdAt)}\n${message.text.trim()}`);
     }

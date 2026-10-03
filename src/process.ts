@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, readlink, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -89,7 +89,7 @@ export interface T3Invocation {
   argsPrefix: string[];
   /** Extra environment, such as the Electron switch that runs the desktop app as Node. */
   env?: Record<string, string>;
-  source: "configured" | "desktop" | "path" | "npx";
+  source: "configured" | "server" | "desktop" | "path" | "npx";
   version: string | null;
   /** The installed desktop app whose bundled server this invocation runs. */
   installPath?: string;
@@ -201,27 +201,37 @@ function versionCachePath(): string {
 type VersionCache = Record<string, { mtimeMs: number; version: string | null }>;
 
 /**
- * Asks an installed app's `t3` for its version. Starting it takes about half a second, so the answer
- * is cached until the executable changes, which an update does.
+ * Asks each installed app's `t3` for its version. Starting one takes about half a second, so answers
+ * are cached until the executable changes, which an update does. The probes run in parallel and the
+ * cache is written once afterwards, so no answer overwrites another.
  */
-async function desktopVersion(install: DesktopInstall): Promise<string | null> {
-  const mtimeMs = await stat(install.executable)
-    .then((info) => info.mtimeMs)
-    .catch(() => null);
+async function desktopVersions(installs: readonly DesktopInstall[]): Promise<Array<{ install: DesktopInstall; version: string | null }>> {
   const cacheFile = versionCachePath();
   const cache = (await readFile(cacheFile, "utf8")
     .then((raw) => JSON.parse(raw) as VersionCache)
     .catch(() => ({}))) as VersionCache;
-  const cached = cache[install.executable];
-  if (mtimeMs !== null && cached?.mtimeMs === mtimeMs) return cached.version;
-  const version = await probeT3Version({ command: install.executable, argsPrefix: [install.entry], env: ELECTRON_AS_NODE });
-  if (mtimeMs !== null) {
-    cache[install.executable] = { mtimeMs, version };
+  let changed = false;
+  const versions = await Promise.all(
+    installs.map(async (install) => {
+      const mtimeMs = await stat(install.executable)
+        .then((info) => info.mtimeMs)
+        .catch(() => null);
+      const cached = cache[install.executable];
+      if (mtimeMs !== null && cached?.mtimeMs === mtimeMs) return { install, version: cached.version };
+      const version = await probeT3Version({ command: install.executable, argsPrefix: [install.entry], env: ELECTRON_AS_NODE });
+      if (mtimeMs !== null) {
+        cache[install.executable] = { mtimeMs, version };
+        changed = true;
+      }
+      return { install, version };
+    }),
+  );
+  if (changed) {
     await mkdir(path.dirname(cacheFile), { recursive: true })
       .then(() => writeFile(cacheFile, `${JSON.stringify(cache, null, 2)}\n`, "utf8"))
       .catch(() => undefined);
   }
-  return version;
+  return versions;
 }
 
 function desktopInvocation(install: DesktopInstall, version: string | null): T3Invocation {
@@ -235,14 +245,54 @@ function desktopInvocation(install: DesktopInstall, version: string | null): T3I
   };
 }
 
+const SERVER_ENTRY = /(?:^|[\\/])apps[\\/]server[\\/]dist[\\/]bin\.mjs$/u;
+
+/**
+ * On Linux, the running server's own executable, read from /proc. It is the server, so its version
+ * matches by definition. This covers AppImages, which live anywhere, and a standalone `t3 serve`.
+ */
+export async function serverProcessInvocation(
+  runtimeStatePath: string | null | undefined,
+  serverVersion: string | null | undefined,
+): Promise<T3Invocation | null> {
+  if (process.platform !== "linux" || !runtimeStatePath) return null;
+  const state = await readFile(runtimeStatePath, "utf8")
+    .then((raw) => JSON.parse(raw) as { pid?: unknown })
+    .catch(() => null);
+  const pid = typeof state?.pid === "number" && Number.isSafeInteger(state.pid) ? state.pid : null;
+  if (pid === null) return null;
+  const [executable, cmdline] = await Promise.all([
+    readlink(`/proc/${pid}/exe`).catch(() => null),
+    readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => null),
+  ]);
+  if (!executable || !cmdline) return null;
+  const version = serverVersion ?? null;
+  // The desktop app runs the server as `<electron> ... apps/server/dist/bin.mjs`; Node runs it the same way.
+  const arg = cmdline.split("\0").find((value) => SERVER_ENTRY.test(value));
+  if (arg) {
+    // cmdline keeps the path as the server was given it, so a relative entry is relative to the
+    // server's working directory, not ours. Without that directory, leave it to the other routes.
+    const entry = path.isAbsolute(arg)
+      ? arg
+      : await readlink(`/proc/${pid}/cwd`).then((cwd) => path.resolve(cwd, arg)).catch(() => null);
+    if (!entry) return null;
+    return { command: executable, argsPrefix: [entry], env: ELECTRON_AS_NODE, source: "server", version };
+  }
+  // A standalone server is the self-contained `t3` executable itself.
+  if (/^t3$/u.test(path.basename(executable))) return { command: executable, argsPrefix: [], source: "server", version };
+  return null;
+}
+
 /**
  * Finds the `t3` command whose version matches the running server, because a session only works when
- * `t3` writes it to the database that server reads. Order: a configured command, the installed desktop
- * app that runs the server, `t3` on PATH, then `npx` pinned to the server's exact version.
+ * `t3` writes it to the database that server reads. Order: a configured command, the running server's
+ * own executable (Linux), the installed desktop app that matches the server, `t3` on PATH, then `npx`
+ * pinned to the server's exact version.
  */
 export async function resolveT3Invocation(
   configured?: readonly string[],
   serverVersion?: string | null,
+  runtimeStatePath?: string | null,
 ): Promise<T3Invocation> {
   if (configured && configured.length > 0) {
     const [command, ...argsPrefix] = configured;
@@ -250,9 +300,12 @@ export async function resolveT3Invocation(
     return { command, argsPrefix, source: "configured", version: null };
   }
 
+  const running = await serverProcessInvocation(runtimeStatePath, serverVersion);
+  if (running) return running;
+
   const installs = await findDesktopInstalls();
   if (installs.length > 0) {
-    const versions = await Promise.all(installs.map(async (install) => ({ install, version: await desktopVersion(install) })));
+    const versions = await desktopVersions(installs);
     const match = serverVersion ? versions.find((candidate) => candidate.version === serverVersion) : undefined;
     if (match) return desktopInvocation(match.install, match.version);
     if (!serverVersion) return desktopInvocation(versions[0]!.install, versions[0]!.version);

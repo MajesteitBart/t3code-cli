@@ -16,7 +16,9 @@ export async function doctor(config: CliConfig, configPath: string, configExists
     discoverRuntime(config, { startDesktopIfNeeded: false, allowUnsupportedProtocol: true }).catch(() => null),
   ]);
   // The `t3` command must match the server's version, because sessions live in that version's database.
-  const invocation = await resolveT3Invocation(config.t3Command, runtime?.serverVersion ?? null).catch((error: unknown) => ({ error }));
+  const invocation = await resolveT3Invocation(config.t3Command, runtime?.serverVersion ?? null, runtime?.runtimeStatePath).catch(
+    (error: unknown) => ({ error }),
+  );
 
   // A configured command is used as given, so ask it for its version here.
   const version =

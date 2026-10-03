@@ -326,7 +326,7 @@ export async function withT3Api<T>(
   config: CliConfig,
   run: (api: T3Api, invocation: T3Invocation) => Promise<T>,
 ): Promise<T> {
-  const invocation = await resolveT3Invocation(config.t3Command, runtime.serverVersion);
+  const invocation = await resolveT3Invocation(config.t3Command, runtime.serverVersion, runtime.runtimeStatePath);
   const session = await issueSession(invocation, config);
   try {
     return await run(new T3Api(runtime, session.token), invocation);

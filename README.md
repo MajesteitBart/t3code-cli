@@ -541,9 +541,10 @@ The CLI signs in through T3's own `t3 auth session issue` command, keeps the bea
 A session only works when it is written to the database the running server reads, and that database differs between T3 versions. The CLI therefore looks for a `t3` command that matches the server, in this order:
 
 1. `t3Command` from the CLI config.
-2. The installed T3 Code desktop app whose version matches the server. The app's own executable runs its bundled `t3` as Node. The CLI caches each app's version until the executable changes, because asking costs about half a second.
-3. `t3` on `PATH`.
-4. `npx --yes t3@<server version>`, pinned to the server's exact version.
+2. On Linux, the running server's own executable, found through the process id in T3's runtime file. This covers AppImages, which can live in any folder, and a standalone `t3 serve`.
+3. The installed T3 Code desktop app whose version matches the server. The app's own executable runs its bundled `t3` as Node. The CLI caches each app's version until the executable changes, because asking costs about half a second.
+4. `t3` on `PATH`, when its version matches the server.
+5. `npx --yes t3@<server version>`, pinned to the server's exact version.
 
 `doctor` reports which one it found under `checks.t3Cli` and whether its version matches the server.
 

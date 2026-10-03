@@ -1,4 +1,4 @@
-import { copyFile, link, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, link, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
@@ -424,6 +424,57 @@ describe("resolveT3Invocation", () => {
         else process.env[key] = value;
       }
     }
+  });
+
+  // A Node process that runs a file named like the server's entry stands in for the running server.
+  it.runIf(process.platform === "linux")("uses the running server's own executable on Linux", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "t3code-cli-server-"));
+    cleanup.push(() => rm(root, { recursive: true, force: true }));
+    const entry = path.join(root, "resources", "app.asar", "apps", "server", "dist", "bin.mjs");
+    await mkdir(path.dirname(entry), { recursive: true });
+    await writeFile(entry, "setInterval(() => {}, 1000);\n", "utf8");
+    const { spawn } = await import("node:child_process");
+    const server = spawn(process.execPath, [entry, "--bootstrap-fd", "3"], { stdio: "ignore" });
+    cleanup.push(async () => {
+      server.kill();
+    });
+    const runtimeStatePath = path.join(root, "server-runtime.json");
+    await writeFile(runtimeStatePath, JSON.stringify({ version: 1, pid: server.pid, port: 3773, origin: "http://127.0.0.1:3773", startedAt: new Date().toISOString() }), "utf8");
+
+    const invocation = await resolveT3Invocation(undefined, "0.0.46-nightly.20261003.2610", runtimeStatePath);
+
+    expect(invocation).toEqual({
+      command: await realpath(process.execPath),
+      argsPrefix: [entry],
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+      source: "server",
+      version: "0.0.46-nightly.20261003.2610",
+    });
+    // A runtime file whose process is gone falls through to the other ways of finding `t3`.
+    await writeFile(runtimeStatePath, JSON.stringify({ version: 1, pid: 2 ** 22 + 7 }), "utf8");
+    await expect(resolveT3Invocation(undefined, "0.0.46", runtimeStatePath)).resolves.not.toMatchObject({ source: "server" });
+  });
+
+  // `node ./apps/server/dist/bin.mjs serve`, started from the app folder while the CLI runs elsewhere.
+  it.runIf(process.platform === "linux")("resolves a relative server entry against the server's working directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "t3code-cli-server-"));
+    cleanup.push(() => rm(root, { recursive: true, force: true }));
+    const appDir = path.join(root, "opt", "t3");
+    const entry = path.join(appDir, "apps", "server", "dist", "bin.mjs");
+    await mkdir(path.dirname(entry), { recursive: true });
+    await writeFile(entry, "setInterval(() => {}, 1000);\n", "utf8");
+    const { spawn } = await import("node:child_process");
+    const server = spawn(process.execPath, ["./apps/server/dist/bin.mjs", "serve"], { cwd: appDir, stdio: "ignore" });
+    cleanup.push(async () => {
+      server.kill();
+    });
+    const runtimeStatePath = path.join(root, "server-runtime.json");
+    await writeFile(runtimeStatePath, JSON.stringify({ version: 1, pid: server.pid }), "utf8");
+    expect(process.cwd()).not.toBe(appDir);
+
+    const invocation = await resolveT3Invocation(undefined, "0.0.46", runtimeStatePath);
+
+    expect(invocation).toMatchObject({ source: "server", argsPrefix: [path.join(await realpath(appDir), "apps", "server", "dist", "bin.mjs")] });
   });
 
   // A copy of Node stands in for `t3` on PATH, and answers --version with its own version.

@@ -177,10 +177,33 @@ describe("createHandoverThread", () => {
     expect(result.thread.launch.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.6-sol" });
   });
 
-  it("applies config and flag overrides to the model, permission, and mode", async () => {
+  it("sets every known effort option when T3 does not serve its catalog", async () => {
+    const fake = await fakeT3({
+      rpcHandlers: {
+        "server.getConfig": () => {
+          throw new Error("no catalog");
+        },
+      },
+    });
+    await addRootProject(fake, { defaultModelSelection: { instanceId: "codex", model: "gpt-6-astra" } });
+
+    const result = await createHandoverThread(fake.config, { cwd: fake.root, prompt: "Handover", thinkingEffort: "high", dryRun: true });
+
+    expect(result.thread.launch.modelSelection).toEqual({
+      instanceId: "codex",
+      model: "gpt-6-astra",
+      options: [
+        { id: "reasoningEffort", value: "high" },
+        { id: "effort", value: "high" },
+        { id: "reasoning", value: "high" },
+      ],
+    });
+  });
+
+  it("applies config and flag overrides to the model, permission, and mode, using the options the model has", async () => {
     const fake = await fakeT3();
-    await addRootProject(fake, { defaultModelSelection: { instanceId: "codex", model: "gpt-6-astra", options: [{ id: "reasoningEffort", value: "low" }] } });
-    const config = { ...fake.config, model: "gpt-6-luna", thinkingEffort: "low" };
+    await addRootProject(fake, { defaultModelSelection: { instanceId: "codex", model: "gpt-6-luna", options: [{ id: "reasoningEffort", value: "low" }] } });
+    const config = { ...fake.config, model: "gpt-6-astra", thinkingEffort: "low" };
 
     const result = await createHandoverThread(config, {
       cwd: fake.root,
@@ -192,20 +215,19 @@ describe("createHandoverThread", () => {
     });
 
     expect(result.thread.launch).toMatchObject({
-      modelSelection: {
-        instanceId: "codex",
-        model: "gpt-6-luna",
-        options: [
-          { id: "serviceTier", value: "fast" },
-          { id: "fastMode", value: true },
-          { id: "reasoningEffort", value: "high" },
-          { id: "effort", value: "high" },
-          { id: "reasoning", value: "high" },
-        ],
-      },
+      modelSelection: { instanceId: "codex", model: "gpt-6-astra" },
       runtimeMode: "approval-required",
       interactionMode: "plan",
     });
+    // T3's catalog names the options gpt-6-astra uses, so only those are written.
+    const options = result.thread.launch.modelSelection.options ?? [];
+    expect(options).toEqual(
+      expect.arrayContaining([
+        { id: "reasoningEffort", value: "high" },
+        { id: "serviceTier", value: "priority" },
+      ]),
+    );
+    expect(options.map((option) => option.id).sort()).toEqual(["reasoningEffort", "serviceTier"]);
     expect(fake.projection(result.thread.id).thread).toMatchObject({ runtimeMode: "approval-required", interactionMode: "plan" });
 
     await expect(createHandoverThread(fake.config, { cwd: fake.root, prompt: "Handover", provider: "claudeAgent", dryRun: true })).rejects.toMatchObject({

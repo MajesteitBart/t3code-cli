@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { withT3Api, type T3Api } from "./api.js";
-import { fetchCatalog } from "./catalog.js";
+import { fetchCatalog, resolveModelChange } from "./catalog.js";
 import { CliError } from "./errors.js";
 import { readLocalProjects } from "./localProjects.js";
 import { applyModelOverrides } from "./modelSelection.js";
@@ -287,21 +287,22 @@ async function catalogDefaultModel(api: T3Api): Promise<ModelSelection> {
   return provider && model ? { instanceId: provider.instanceId, model: model.slug } : FALLBACK_MODEL_SELECTION;
 }
 
-function resolveModelSelection(
+async function resolveModelSelection(
+  api: T3Api,
   base: ModelSelection,
   config: CliConfig,
   options: ThreadCreateOptions,
-): ModelSelection {
-  return applyModelOverrides(
-    base,
-    {
-      provider: options.provider ?? config.provider,
-      model: options.model ?? config.model,
-      speedMode: options.speedMode ?? config.speedMode,
-      thinkingEffort: options.thinkingEffort ?? config.thinkingEffort,
-    },
-    "project default",
-  );
+): Promise<ModelSelection> {
+  const overrides = {
+    provider: options.provider ?? config.provider,
+    model: options.model ?? config.model,
+    speedMode: options.speedMode ?? config.speedMode,
+    thinkingEffort: options.thinkingEffort ?? config.thinkingEffort,
+  };
+  if (Object.values(overrides).every((value) => value === undefined)) return base;
+  // The catalog names the option each model uses for effort and speed; without it, every known id is set.
+  const catalog = await fetchCatalog(api).catch(() => null);
+  return catalog ? resolveModelChange(base, overrides, catalog) : applyModelOverrides(base, overrides, "project default");
 }
 
 async function projectsFromApi(api: T3Api): Promise<T3Project[]> {
@@ -773,7 +774,7 @@ export async function createHandoverThread(config: CliConfig, options: ThreadCre
       );
     }
     const base = projectResult.project.defaultModelSelection ?? (await catalogDefaultModel(api));
-    const modelSelection = resolveModelSelection(base, config, options);
+    const modelSelection = await resolveModelSelection(api, base, config, options);
     const title = threadTitle(prompt);
     const runtimeMode = options.runtimeMode ?? config.runtimeMode;
     const interactionMode = options.interactionMode ?? config.interactionMode;

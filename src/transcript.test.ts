@@ -320,6 +320,15 @@ describe("buildTranscript", () => {
     expect(renderTranscript(transcript)).toContain("## Turn 2 · cancelled · ");
   });
 
+  it("marks the last answer of an interrupted turn as its latest, not its final one", () => {
+    const source = projection({
+      runs: [run(1, "interrupted", 0)],
+      messages: [message("prompt-1", "user", "run-1", 0, "Long job"), message("progress-1", "assistant", "run-1", 1, "Starting")],
+    });
+
+    expect(renderTranscript(buildTranscript(source))).toContain("### assistant (latest) · 2026-10-01 10:01:00Z\nStarting");
+  });
+
   it("keeps only prompts and final answers in answers detail", () => {
     const transcript = buildTranscript(twoRunThread(), { detail: "answers" });
 
