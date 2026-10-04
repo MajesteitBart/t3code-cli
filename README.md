@@ -1,12 +1,21 @@
 # @bvdm/t3code-cli
 
+> **Orchestrator V2 only.** Version 0.3 works only with T3 Code builds that include orchestrator V2. When 0.3.0 was released, that meant T3 Code nightly `0.0.46-nightly.20261003.2610` or later. The newest stable release then, T3 Code v0.0.45, still runs orchestrator V1, and 0.3 refuses it. For any T3 build without orchestrator V2, install 0.2: `npm install --global @bvdm/t3code-cli@0.2`.
+
 `t3code` hands the current folder or Git repository to a new thread in [T3 Code](https://github.com/pingdotgg/t3code), and lets agents, scripts, and apps outside T3 discover, read, message, and steer existing threads.
 
 It connects to the running local T3 server. For a handover, it resolves the workspace against T3 projects, optionally creates the missing project, and launches a thread with its first prompt in one durable call. For existing threads, it lists, reads, sends messages, and waits for replies. It also changes models, providers, effort, and modes, interrupts turns, answers approvals and questions, manages the message queue, forks and merges threads back, runs scheduled tasks, and settles or reopens threads.
 
 ## Requirements and versions
 
-This version needs a T3 Code build with orchestrator V2, which reports orchestration protocol 2. Builds before orchestrator V2 speak protocol 1; use `@bvdm/t3code-cli@0.2` for those. The CLI checks the protocol before it signs in and stops with `T3_PROTOCOL_UNSUPPORTED` when the server speaks another one.
+Each CLI line speaks one T3 orchestrator. Pick it by the T3 Code build you run:
+
+| T3 Code build | Orchestrator | CLI | Install |
+| --- | --- | --- | --- |
+| Nightly `0.0.46-nightly.20261003.2610` or later | V2, protocol 2 | 0.3 | `npm install --global @bvdm/t3code-cli` |
+| Stable v0.0.45 or earlier, or an earlier nightly | V1, protocol 1 | 0.2 | `npm install --global @bvdm/t3code-cli@0.2` |
+
+Later stable T3 releases that include orchestrator V2 need 0.3 too. 0.3 has no fallback for V1: it checks the server's protocol before it signs in, and every command that talks to T3 stops with `T3_PROTOCOL_UNSUPPORTED` (exit code 4) when the server is not on protocol 2. `doctor` is the exception. It reports the protocol under `checks.orchestrationProtocol`, which is `ok: false` on a build without orchestrator V2.
 
 You also need Node.js 22.16+ on the 22 line, 23.11+ on the 23 line, or 24.10+.
 
@@ -15,6 +24,8 @@ You also need Node.js 22.16+ on the 22 line, 23.11+ on the 23 line, or 24.10+.
 ```bash
 npm install --global @bvdm/t3code-cli
 ```
+
+This installs the latest version, which needs orchestrator V2. On an older T3 build, install `@bvdm/t3code-cli@0.2` instead.
 
 Then verify discovery and the active T3 server:
 
@@ -499,7 +510,7 @@ Authenticated API requests use Node's native HTTP/HTTPS transport to avoid the b
 
 ## Upgrading from 0.2
 
-0.3 speaks orchestrator V2 only. Keep 0.2 installed for T3 builds before orchestrator V2. What changed for callers:
+0.3 speaks orchestrator V2 only. Upgrade once your T3 Code build has orchestrator V2, and keep 0.2 until then. Against an older build, 0.3 refuses every command that talks to T3 except `doctor`. What changed for callers:
 
 - **Sign-in.** The CLI no longer bundles the `t3` package. It runs the `t3` command that matches the server; see [Security](#security).
 - **Turns are runs.** `turnId` is a run id, and every message belongs to its run. The V1 heuristics that assigned queued messages to turns are gone. `turns[].runStatus` and `imported` are new.

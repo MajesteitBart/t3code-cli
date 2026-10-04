@@ -5,7 +5,7 @@ description: Operate the t3code CLI to hand work to T3 Code from outside T3, and
 
 # Use T3 Code CLI
 
-Use `t3code` as the supported interface. Do not read T3 credentials or construct bearer tokens directly.
+Use `t3code` as the supported interface. Do not read T3 credentials or construct bearer tokens directly. This CLI version works only with T3 Code builds that include orchestrator V2; see "Verify readiness".
 
 ## CLI or MCP tools
 

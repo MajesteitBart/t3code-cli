@@ -19,7 +19,7 @@ export const program = new Command();
 export const jsonRequested = process.argv.slice(2).includes("--json");
 program
   .name("t3code")
-  .description("Manage T3 Code projects, handover threads, and cross-thread messages.")
+  .description("Manage T3 Code projects, handover threads, and cross-thread messages. Requires a T3 Code build with orchestrator V2; for older T3 builds, install @bvdm/t3code-cli@0.2.")
   .version(packageJson.version)
   .option("--json", "Emit stable JSON envelopes.")
   .option("--config <path>", "Use a specific config file.")

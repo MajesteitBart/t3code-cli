@@ -5,7 +5,7 @@ description: Work with an existing T3 Code thread by its id. Summarize it, answe
 
 # T3 thread
 
-The user writes `$t3thread <thread-id> <instruction>`. The instruction is optional. This skill uses the `t3code` CLI; see the `use-t3code-cli` skill for setup and handovers.
+The user writes `$t3thread <thread-id> <instruction>`. The instruction is optional. This skill uses the `t3code` CLI, which needs a T3 Code build with orchestrator V2. For an older T3 build, install `npm install --global @bvdm/t3code-cli@0.2`. See the `use-t3code-cli` skill for setup and handovers.
 
 ## 1. Resolve the target
 
