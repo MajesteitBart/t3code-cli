@@ -1,9 +1,8 @@
-import { once } from "node:events";
 import { readFile, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
+import { startFakeT3 } from "../src/testing/fakeT3.ts";
 import { buildCli, runBuiltCli } from "./helpers/built-cli.mjs";
 
 let built;
@@ -85,12 +84,12 @@ describe("CLI parsing", () => {
   });
 
   it("rejects an unknown busy-thread mode", async () => {
-    const result = await run(["--json", "threads", "send", "--thread", "thread-1", "--prompt", "x", "--if-busy", "queue"]);
+    const result = await run(["--json", "threads", "send", "--thread", "thread-1", "--prompt", "x", "--if-busy", "wait"]);
 
     expect(result.code).toBe(2);
     expect(JSON.parse(result.stderr).error).toEqual({
       code: "INVALID_USAGE",
-      message: "option '--if-busy <mode>' argument 'queue' is invalid. Allowed choices are reject, inject.",
+      message: "option '--if-busy <mode>' argument 'wait' is invalid. Allowed choices are refuse, queue, steer, restart, reject, inject.",
     });
   });
 
@@ -174,46 +173,95 @@ describe("CLI parsing", () => {
   });
 });
 
-describe("thread inspection against a T3 server", () => {
-  it("describes a model whose options T3 stores as an object map", async () => {
-    const thread = {
-      id: "thread-1",
-      projectId: "project-1",
-      title: "Legacy options",
-      archivedAt: null,
-      runtimeMode: "full-access",
-      interactionMode: "default",
-      modelSelection: { instanceId: "codex", model: "gpt-x", options: { reasoningEffort: "high" } },
-      messages: [],
-      activities: [],
-    };
-    const server = createServer((request, response) => {
-      const send = (value) => response.end(JSON.stringify(value));
-      if (request.url === "/.well-known/t3/environment") return send({ environmentId: "test", serverVersion: "test" });
-      if (request.url?.startsWith("/api/orchestration/threads/thread-1")) return send({ snapshotSequence: 1, thread });
-      if (request.url === "/api/orchestration/shell") return send({ snapshotSequence: 1, projects: [], threads: [thread] });
-      response.statusCode = 404;
-      response.end("{}");
-    });
-    server.listen(0, "127.0.0.1");
-    await once(server, "listening");
-    const authScript = path.join(built.directory, "inspect-auth.mjs");
-    await writeFile(authScript, "if (process.argv.includes('issue')) console.log(JSON.stringify({ sessionId: 's', token: 't' }));\n");
-    const config = path.join(built.directory, "inspect-config.json");
-    await writeFile(config, JSON.stringify({
-      origin: `http://127.0.0.1:${server.address().port}`,
-      t3Home: built.directory,
-      t3Command: [process.execPath, authScript],
-    }));
-    try {
-      const result = await run(["--config", config, "threads", "inspect", "--thread", "thread-1"]);
+describe("built CLI against an orchestration V2 server", () => {
+  const fakes = [];
+  afterEach(async () => {
+    await Promise.all(fakes.splice(0).map((fake) => fake.close()));
+  });
 
-      expect(result.stderr).toBe("");
-      expect(result.code).toBe(0);
-      expect(result.stdout).toContain("Model: codex/gpt-x (reasoningEffort=high)");
-    } finally {
-      server.close();
-      await once(server, "close");
-    }
+  /** Starts the fake server and writes a config file that points the CLI at it. */
+  async function serve(options = {}) {
+    const fake = await startFakeT3({ gitRepo: false, ...options });
+    fakes.push(fake);
+    fake.addProject({ id: "project-1", title: "Project One" });
+    const config = path.join(fake.root, "cli-config.json");
+    await writeFile(config, JSON.stringify(fake.config));
+    return { fake, config };
+  }
+
+  // Environment overrides would point the CLI somewhere else.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("T3CODE")));
+  const runAgainst = (config, args) => runBuiltCli(built.cli, ["--config", config, ...args], { env });
+
+  it("reads a thread as a JSON envelope", async () => {
+    const { fake, config } = await serve();
+    const { thread } = fake.addThread({ turns: 2 });
+
+    const result = await runAgainst(config, ["--json", "threads", "read", "--thread", thread.id, "--detail", "answers", "--last-turn"]);
+
+    expect(result.stderr).toBe("");
+    expect(result.code).toBe(0);
+    const envelope = JSON.parse(result.stdout);
+    expect(envelope.ok).toBe(true);
+    expect(envelope.data.project).toMatchObject({ id: "project-1" });
+    expect(envelope.data.thread.view).toMatchObject({ detail: "answers", totalTurns: 2, returnedTurns: 1 });
+    expect(envelope.data.thread.messages.map((message) => message.text)).toEqual(["Prompt 2", "Reply to: Prompt 2"]);
+    expect(result.stdout).not.toContain("mock-token");
+    const orchestration = fake.httpRequests.filter((request) => request.url.startsWith("/api/orchestration/"));
+    expect(orchestration.length).toBeGreaterThan(0);
+    expect(orchestration.every((request) => request.protocolHeader === "2")).toBe(true);
+  });
+
+  it("inspects a thread for people, including a model whose options T3 stores as an object map", async () => {
+    const { fake, config } = await serve({ runBehavior: "hold" });
+    const { thread } = fake.addThread({
+      title: "Legacy options",
+      modelSelection: { instanceId: "codex", model: "gpt-x", options: { reasoningEffort: "high" } },
+    });
+    const running = fake.startRun(thread.id, "Working");
+    fake.startRun(thread.id, "Next", { status: "queued" });
+    const approval = fake.addApproval(thread.id, running.id, { prompt: "git push" });
+
+    const result = await runAgainst(config, ["threads", "inspect", "--thread", thread.id]);
+
+    expect(result.stderr).toBe("");
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("Title: Legacy options");
+    expect(result.stdout).toContain("Project: Project One");
+    expect(result.stdout).toContain("Model: codex/gpt-x (reasoningEffort=high)");
+    expect(result.stdout).toContain(`Running turn: running (${running.id})`);
+    expect(result.stdout).toContain("Queue: 1 message");
+    expect(result.stdout).toContain("Waiting for: approval");
+    expect(result.stdout).toContain(`- Approval [${approval.id}]: git push`);
+  });
+
+  it("queues a message behind a running turn", async () => {
+    const { fake, config } = await serve({ runBehavior: "hold" });
+    const { thread } = fake.addThread();
+    fake.startRun(thread.id, "Working");
+
+    const refused = await runAgainst(config, ["--json", "threads", "send", "--thread", thread.id, "--prompt", "Also this"]);
+    const queued = await runAgainst(config, ["threads", "send", "--thread", thread.id, "--prompt", "Also this", "--if-busy", "queue"]);
+
+    expect(refused.code).toBe(4);
+    expect(JSON.parse(refused.stderr).error).toMatchObject({ code: "THREAD_BUSY", details: { runRunning: true, queuedRuns: 0 } });
+    expect(queued.stderr).toBe("");
+    expect(queued.code).toBe(0);
+    expect(queued.stdout).toMatch(/^Sent message [0-9a-f-]{36} to thread \S+; it waits in the queue\.\n$/u);
+    expect(fake.commands).toEqual([
+      expect.objectContaining({ type: "message.dispatch", threadId: thread.id, text: "Also this", dispatchMode: { type: "queue_after_active" } }),
+    ]);
+    expect(fake.projection(thread.id).runs.map((run) => run.status)).toEqual(["running", "queued"]);
+  });
+
+  it("refuses an orchestrator V1 server with exit code 4", async () => {
+    const { fake, config } = await serve({ protocol: 1, serverVersion: "0.0.45" });
+
+    const result = await runAgainst(config, ["--json", "threads", "list"]);
+
+    expect(result.code).toBe(4);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr).error).toMatchObject({ code: "T3_PROTOCOL_UNSUPPORTED", details: { orchestrationProtocolVersion: 1 } });
+    expect(fake.httpRequests.map((request) => request.url)).toEqual(["/.well-known/t3/environment"]);
   });
 });

@@ -1,10 +1,18 @@
-import type { T3Message, T3Thread } from "./types.js";
+import {
+  ACTIVE_RUN_STATUSES,
+  type RunStatus,
+  type T3Message,
+  type T3Run,
+  type T3RuntimeRequest,
+  type T3ThreadProjection,
+  type T3TurnItem,
+} from "./types.js";
 
 export const READ_DETAILS = ["answers", "messages", "full"] as const;
 /**
  * `answers`: each turn's user prompts and final assistant answer.
  * `messages`: user and assistant messages, without reasoning summaries or tool calls.
- * `full`: every message, plus tool calls and changed files.
+ * `full`: every message, plus reasoning, tool calls, and changed files.
  * Proposed plans are a plan-mode turn's answer, so every level includes them.
  */
 export type ReadDetail = (typeof READ_DETAILS)[number];
@@ -19,13 +27,24 @@ export interface TranscriptOptions {
   maxChars?: number;
 }
 
-export type TurnState = "running" | "interrupted" | "completed" | "error" | "pending" | null;
+/**
+ * A turn's state. `pending` is a queued run that has not started; `rolled_back` is a run whose
+ * checkpoint was restored. Imported V1 history has no recorded state, so its turns are null.
+ */
+export type TurnState = "running" | "interrupted" | "completed" | "error" | "pending" | "rolled_back" | null;
 
 export interface TranscriptTurn {
   index: number;
-  /** Null for user messages that are still waiting for a turn. */
+  /** The run id. Null for history imported from orchestrator V1, which has no runs. */
   turnId: string | null;
   state: TurnState;
+  /** The run's own status, which `state` simplifies. */
+  runStatus: RunStatus | null;
+  imported: boolean;
+  /** True for a turn a fork inherited from its source thread; `turnId` is then that thread's run. */
+  inherited: boolean;
+  sourceThreadId: string | null;
+  queuePosition: number | null;
   startedAt: string | null;
   completedAt: string | null;
   finalMessageId: string | null;
@@ -34,7 +53,14 @@ export interface TranscriptTurn {
   changedFiles?: ChangedFile[];
 }
 
-export interface TranscriptMessage extends T3Message {
+export interface TranscriptMessage {
+  id: string;
+  role: T3Message["role"];
+  text: string;
+  turnId: string | null;
+  streaming: boolean;
+  createdAt: string;
+  updatedAt: string;
   turnIndex: number;
   textTruncated: boolean;
 }
@@ -86,30 +112,8 @@ export interface Transcript {
 }
 
 const DEFAULT_TOOL_TEXT_LIMIT = 600;
-
-interface Activity {
-  id?: unknown;
-  kind?: unknown;
-  summary?: unknown;
-  payload?: unknown;
-  turnId?: unknown;
-  createdAt?: unknown;
-}
-
-interface Checkpoint {
-  turnId?: unknown;
-  files?: unknown;
-  assistantMessageId?: unknown;
-  completedAt?: unknown;
-}
-
-interface TurnBuilder {
-  turnId: string | null;
-  startedAt: string;
-  /** Null while the turn runs. */
-  endedAt: string | null;
-  messages: T3Message[];
-}
+/** Timeline items that are messages, plans, or checkpoints rather than tool activity. */
+const NON_TOOL_ITEM_TYPES = new Set(["user_message", "assistant_message", "reasoning", "proposed_plan", "checkpoint"]);
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -146,212 +150,279 @@ export function clip(value: string, limit: number | undefined): { text: string; 
   return { text: `${value.slice(0, head)}${marker}${value.slice(value.length - (kept - head))}`, truncated: true };
 }
 
-/**
- * T3 reports provider reasoning summaries as `system` messages unless a client opts into the
- * `reasoning` role. Their ids start with `reasoning:` either way.
- */
-export function isReasoningMessage(message: T3Message): boolean {
-  return message.role === "system" || message.role === "reasoning" || message.id.startsWith("reasoning:");
+export function isActiveRun(run: T3Run): boolean {
+  return ACTIVE_RUN_STATUSES.includes(run.status);
 }
 
-function byCreatedAt<T extends { createdAt: string }>(left: T, right: T): number {
+export function turnStateOf(status: RunStatus): TurnState {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "interrupted":
+    case "cancelled":
+      return "interrupted";
+    case "failed":
+      return "error";
+    case "queued":
+      return "pending";
+    case "rolled_back":
+      return "rolled_back";
+    default:
+      return "running";
+  }
+}
+
+function sortedRuns(projection: T3ThreadProjection): T3Run[] {
+  return [...projection.runs].sort((left, right) => left.ordinal - right.ordinal);
+}
+
+/** The run that is working right now, if any. T3 runs one root run per thread at a time. */
+export function activeRun(projection: T3ThreadProjection): T3Run | null {
+  return sortedRuns(projection).findLast(isActiveRun) ?? null;
+}
+
+/** Runs waiting behind the active one, in delivery order. */
+export function queuedRuns(projection: T3ThreadProjection): T3Run[] {
+  return sortedRuns(projection)
+    .filter((run) => run.status === "queued")
+    .sort((left, right) => (left.queuePosition ?? left.ordinal) - (right.queuePosition ?? right.ordinal));
+}
+
+export interface BusyState {
+  runRunning: boolean;
+  activeRunId: string | null;
+  queuedRuns: number;
+  /** Restart recovery holds the queue until someone resumes it. */
+  queueHeld: boolean;
+}
+
+/** What keeps a thread busy: a run that works, or queued runs that wait for their turn. */
+export function busyState(projection: T3ThreadProjection): BusyState | null {
+  const active = activeRun(projection);
+  const queued = queuedRuns(projection);
+  if (!active && queued.length === 0) return null;
+  return {
+    runRunning: active !== null,
+    activeRunId: active?.id ?? null,
+    queuedRuns: queued.length,
+    queueHeld: queued.some((run) => run.queueHeld === true),
+  };
+}
+
+function messageOrder(left: { createdAt: string }, right: { createdAt: string }): number {
   return left.createdAt.localeCompare(right.createdAt);
 }
 
-/**
- * How soon after a turn ends a queued message's own turn starts. A provider either folds a message
- * sent mid-turn into the running turn or queues it and starts a new turn right after; T3 does not
- * record which happened, so a turn that starts this soon without a prompt of its own took the message.
- */
-export const QUEUED_TURN_GRACE_MS = 5_000;
+interface TurnGroup {
+  run: T3Run | null;
+  /** The source thread's run, for a turn a fork inherited. */
+  inheritedRunId: string | null;
+  inheritedFrom: string | null;
+  sortKey: string;
+  messages: T3Message[];
+}
+
+interface InheritedTimeline {
+  items: T3TurnItem[];
+  messages: T3Message[];
+  /** Source thread of each inherited run. */
+  sources: Map<string, string>;
+}
 
 /**
- * Groups messages into turns. T3 projects user messages without a turn id, so each one joins the
- * turn that handled it: a turn that started for it, or the turn it was sent into while that turn ran.
- * Messages that no turn has picked up yet form a pending turn.
+ * A fork starts with its source thread's history, which T3 lists among the fork's visible timeline
+ * items rather than its own messages and items.
  */
-function groupTurns(thread: T3Thread, checkpoints: Map<string, Checkpoint>): TurnBuilder[] {
-  const spans = new Map<string, { startedAt: string; lastSeenAt: string }>();
-  const observe = (turnId: unknown, at: unknown) => {
-    if (typeof turnId !== "string" || typeof at !== "string") return;
-    const span = spans.get(turnId);
-    if (!span) spans.set(turnId, { startedAt: at, lastSeenAt: at });
-    else {
-      if (at < span.startedAt) span.startedAt = at;
-      if (at > span.lastSeenAt) span.lastSeenAt = at;
-    }
-  };
-  if (thread.latestTurn) observe(thread.latestTurn.turnId, thread.latestTurn.requestedAt);
-  for (const message of thread.messages ?? []) observe(message.turnId, message.createdAt);
-  for (const activity of list(thread.activities) as Activity[]) observe(activity.turnId, activity.createdAt);
+function inheritedTimeline(projection: T3ThreadProjection): InheritedTimeline {
+  const items: T3TurnItem[] = [];
+  const sources = new Map<string, string>();
+  for (const entry of list(projection.visibleTurnItems)) {
+    const visible = record(entry);
+    const item = record(visible?.item);
+    if (visible?.visibility !== "inherited" || !item || typeof item.type !== "string" || typeof item.id !== "string") continue;
+    const runId = typeof item.runId === "string" ? item.runId : null;
+    if (runId && typeof visible.sourceThreadId === "string") sources.set(runId, visible.sourceThreadId);
+    items.push({ ...item, runId } as T3TurnItem);
+  }
+  const messages = items.flatMap((item): T3Message[] =>
+    (item.type === "user_message" || item.type === "assistant_message") && typeof item.text === "string"
+      ? [{
+          id: typeof item.messageId === "string" ? item.messageId : item.id,
+          runId: item.runId,
+          role: item.type === "user_message" ? "user" : "assistant",
+          text: item.text,
+          streaming: item.streaming === true,
+          createdAt: itemTime(item),
+          updatedAt: item.updatedAt ?? itemTime(item),
+        }]
+      : [],
+  );
+  return { items, messages, sources };
+}
 
-  const turns: TurnBuilder[] = [...spans]
-    .map(([turnId, span]) => {
-      const latest = thread.latestTurn?.turnId === turnId ? thread.latestTurn : null;
-      const completedAt = checkpoints.get(turnId)?.completedAt;
-      const endedAt = latest
-        ? latest.state === "running" ? null : (latest.completedAt ?? span.lastSeenAt)
-        : typeof completedAt === "string" ? completedAt : span.lastSeenAt;
-      return { turnId, startedAt: span.startedAt, endedAt, messages: [] as T3Message[] };
-    })
-    .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
-  const byId = new Map(turns.map((turn) => [turn.turnId, turn]));
-  const sorted = [...(thread.messages ?? [])].sort(byCreatedAt);
-  const claimedByQueue = new Set<TurnBuilder>();
-  let pending: TurnBuilder | null = null;
-
-  const ownerOf = (message: T3Message): TurnBuilder | undefined => {
-    if (message.turnId !== null) return byId.get(message.turnId);
-    const next = turns.find((turn) => turn.startedAt >= message.createdAt);
-    // T3 records a turn's request time as its prompt's time, so an exact match is that turn's prompt.
-    if (next?.startedAt === message.createdAt) return next;
-    const running = turns.findLast(
-      (turn) => turn.startedAt < message.createdAt && (turn.endedAt === null || turn.endedAt > message.createdAt),
-    );
-    if (!running) return next;
-    if (!next || running.endedAt === null) return running;
-    // A provider that queues messages starts one turn for each, back to back, so queued messages claim
-    // successive turns. A turn with a prompt sent after the previous turn ended belongs to that prompt.
-    let previousEnd = running.endedAt;
-    for (let index = turns.indexOf(next); index < turns.length; index += 1) {
-      const candidate = turns[index]!;
-      const end = previousEnd;
-      const startsRightAfter = Date.parse(candidate.startedAt) - Date.parse(end) <= QUEUED_TURN_GRACE_MS;
-      const ownPrompt = sorted.some(
-        (other) => other.role === "user" && other.createdAt > end && other.createdAt <= candidate.startedAt,
-      );
-      if (!startsRightAfter || ownPrompt) break;
-      if (!claimedByQueue.has(candidate)) {
-        claimedByQueue.add(candidate);
-        return candidate;
-      }
-      // The queue has not reached this message yet.
-      if (candidate.endedAt === null) return undefined;
-      previousEnd = candidate.endedAt;
-    }
-    return running;
-  };
-
-  for (const message of sorted) {
-    const owner = ownerOf(message);
+/**
+ * Groups messages into turns. A V2 message names its run, so each run is a turn, and a fork's inherited
+ * history keeps its source runs. History imported from orchestrator V1 has no runs: there, each user
+ * message opens a turn and the replies after it join it.
+ */
+function groupTurns(projection: T3ThreadProjection, messages: readonly T3Message[], sources: ReadonlyMap<string, string>): TurnGroup[] {
+  const runs = sortedRuns(projection);
+  const byRun = new Map<string, TurnGroup>(
+    runs.map((run) => [run.id, { run, inheritedRunId: null, inheritedFrom: null, sortKey: run.requestedAt, messages: [] }]),
+  );
+  const inherited = new Map<string, TurnGroup>();
+  const imported: TurnGroup[] = [];
+  for (const message of [...messages].sort(messageOrder)) {
+    const owner = message.runId === null ? undefined : byRun.get(message.runId);
     if (owner) {
       owner.messages.push(message);
       continue;
     }
-    pending ??= { turnId: null, startedAt: message.createdAt, endedAt: null, messages: [] };
-    pending.messages.push(message);
+    const source = message.runId === null ? undefined : sources.get(message.runId);
+    if (message.runId !== null && source !== undefined) {
+      const group = inherited.get(message.runId);
+      if (group) group.messages.push(message);
+      else inherited.set(message.runId, { run: null, inheritedRunId: message.runId, inheritedFrom: source, sortKey: message.createdAt, messages: [message] });
+      continue;
+    }
+    const current = imported.at(-1);
+    if (message.role === "user" || !current) {
+      imported.push({ run: null, inheritedRunId: null, inheritedFrom: null, sortKey: message.createdAt, messages: [message] });
+    }
+    else current.messages.push(message);
   }
-  return pending ? [...turns, pending] : turns;
+  const queued = (group: TurnGroup) => group.run?.status === "queued";
+  // A queued message promoted into the running turn leaves its own run cancelled, unstarted, and empty.
+  const vacated = (group: TurnGroup) =>
+    group.run?.status === "cancelled" && group.run.startedAt === null && group.messages.length === 0;
+  const started = [...imported, ...byRun.values()].filter((group) => !queued(group) && !vacated(group));
+  started.sort((left, right) => left.sortKey.localeCompare(right.sortKey) || (left.run?.ordinal ?? 0) - (right.run?.ordinal ?? 0));
+  const waiting = queuedRuns(projection).map((run) => byRun.get(run.id)!);
+  // A fork's inherited history comes before anything the fork did itself.
+  const before = [...inherited.values()].sort((left, right) => left.sortKey.localeCompare(right.sortKey));
+  return [...before, ...started, ...waiting];
 }
 
-function checkpointsByTurn(thread: T3Thread): Map<string, Checkpoint> {
-  const checkpoints = new Map<string, Checkpoint>();
-  for (const checkpoint of list(thread.checkpoints) as Checkpoint[]) {
-    if (typeof checkpoint?.turnId === "string") checkpoints.set(checkpoint.turnId, checkpoint);
-  }
-  return checkpoints;
-}
-
-function changedFiles(checkpoint: Checkpoint | undefined): ChangedFile[] {
-  return list(checkpoint?.files).flatMap((entry) => {
-    const file = record(entry);
-    if (!file || typeof file.path !== "string") return [];
+/** Reasoning summaries are timeline items in V2; the full view shows them as `reasoning` messages. */
+function reasoningMessages(items: readonly T3TurnItem[]): T3Message[] {
+  return items.flatMap((item) => {
+    if (item.type !== "reasoning" || typeof item.text !== "string" || item.text.length === 0) return [];
+    const createdAt = item.startedAt ?? item.updatedAt ?? item.completedAt ?? "";
     return [{
-      path: file.path,
-      kind: typeof file.kind === "string" ? file.kind : null,
-      additions: typeof file.additions === "number" ? file.additions : null,
-      deletions: typeof file.deletions === "number" ? file.deletions : null,
+      id: item.id,
+      runId: item.runId,
+      role: "reasoning" as const,
+      text: item.text,
+      streaming: item.streaming === true,
+      createdAt,
+      updatedAt: item.updatedAt ?? createdAt,
     }];
   });
 }
 
-function finalMessageId(turn: TurnBuilder, thread: T3Thread, checkpoint: Checkpoint | undefined): string | null {
-  const declared =
-    thread.latestTurn?.turnId === turn.turnId ? thread.latestTurn.assistantMessageId : checkpoint?.assistantMessageId;
-  if (typeof declared === "string" && turn.messages.some((message) => message.id === declared)) return declared;
-  return turn.messages.findLast((message) => message.role === "assistant")?.id ?? null;
-}
-
-/** T3 reports only the latest turn's state; an earlier turn's ending, completed or interrupted, is unknown. */
-function turnState(turn: TurnBuilder, thread: T3Thread): TurnState {
-  if (turn.turnId === null) return "pending";
-  return thread.latestTurn?.turnId === turn.turnId ? thread.latestTurn.state : null;
+function finalMessageId(group: TurnGroup): string | null {
+  const assistants = group.messages.filter((message) => message.role === "assistant");
+  return (assistants.findLast((message) => !message.streaming) ?? assistants.at(-1))?.id ?? null;
 }
 
 function keepMessage(message: T3Message, detail: ReadDetail, finalId: string | null): boolean {
   if (detail === "full") return true;
   if (message.role === "user") return true;
-  if (detail === "messages") return !isReasoningMessage(message);
+  if (detail === "messages") return message.role === "assistant";
   return message.id === finalId;
 }
 
-/** Folds T3's started/updated/completed tool activities into one entry per tool call or background task. */
-function collectToolCalls(thread: T3Thread): Array<Omit<ToolCall, "turnIndex" | "inputTruncated" | "outputTruncated">> {
-  const calls = new Map<string, Omit<ToolCall, "turnIndex" | "inputTruncated" | "outputTruncated">>();
-  for (const activity of list(thread.activities) as Activity[]) {
-    const kind = typeof activity.kind === "string" ? activity.kind : "";
-    const payload = record(activity.payload);
-    if (!payload || typeof activity.createdAt !== "string") continue;
-    const isTool = kind.startsWith("tool.") && typeof payload.toolCallId === "string";
-    const isTask = kind.startsWith("task.") && typeof payload.taskId === "string";
-    if (!isTool && !isTask) continue;
-
-    const id = isTool ? (payload.toolCallId as string) : `task:${payload.taskId as string}`;
-    const data = record(payload.data);
-    const item = record(data?.item);
-    const rawOutput = record(data?.rawOutput);
-    const result = record(data?.result);
-    const previous = calls.get(id);
-    // Later activities can omit fields an earlier one carried, such as a task's type.
-    const name =
-      (isTool ? (text(data?.toolName) ?? text(payload.title)) : text(payload.taskType)) ??
-      previous?.name ??
-      (isTool ? (text(activity.summary) ?? "tool") : "task");
-    // T3's display detail repeats the tool name ("Bash: git status"); the name is already shown.
-    const rawDetail = text(payload.detail);
-    const detail = rawDetail?.startsWith(`${name}: `) ? rawDetail.slice(name.length + 2) : rawDetail;
-    const files = list(data?.files).flatMap((file) => {
-      const filePath = record(file)?.path;
-      return typeof filePath === "string" ? [filePath] : [];
-    });
-    const input = isTool
-      ? (text(data?.command) ??
-        text(item?.command) ??
-        (files.length > 0 ? files.join(", ") : null) ??
-        (detail === "{}" ? null : detail))
-      : (text(payload.title) ?? detail);
-    const output = isTool
-      ? (text(item?.aggregatedOutput) ?? text(rawOutput?.content) ?? text(result?.content) ?? text(data?.output))
-      : null;
-    // An update can arrive after the completion with the same timestamp; keep the final status.
-    const finished = previous?.status !== undefined && previous.status !== null && previous.status !== "inProgress";
-    calls.set(id, {
-      id,
-      turnId: typeof activity.turnId === "string" ? activity.turnId : (previous?.turnId ?? null),
-      kind: isTool ? (text(payload.itemType) ?? "tool") : "task",
-      name,
-      status: finished ? previous.status : (text(payload.status) ?? previous?.status ?? null),
-      input: input ?? previous?.input ?? null,
-      output: output ?? previous?.output ?? null,
-      startedAt: previous?.startedAt ?? activity.createdAt,
-      updatedAt: activity.createdAt,
-    });
-  }
-  return [...calls.values()];
+function itemTime(item: T3TurnItem): string {
+  return item.startedAt ?? item.updatedAt ?? item.completedAt ?? "";
 }
 
-function collectPlans(thread: T3Thread): Array<Omit<ProposedPlan, "turnIndex" | "textTruncated">> {
-  return list(thread.proposedPlans).flatMap((entry) => {
-    const plan = record(entry);
-    const body = text(plan?.planMarkdown) ?? text(plan?.text) ?? text(plan?.markdown);
-    if (!plan || !body) return [];
-    return [{
-      id: typeof plan.id === "string" ? plan.id : null,
-      turnId: typeof plan.turnId === "string" ? plan.turnId : null,
-      text: body,
-      createdAt: typeof plan.createdAt === "string" ? plan.createdAt : null,
-    }];
+function joined(values: unknown, pick: (entry: Record<string, unknown>) => string | null): string | null {
+  const parts = list(values).flatMap((entry) => {
+    const value = record(entry);
+    const picked = value ? pick(value) : null;
+    return picked ? [picked] : [];
   });
+  return parts.length > 0 ? parts.join("\n") : null;
+}
+
+/** Describes a tool-like timeline item as a name, its input, and its output. */
+function describeItem(item: T3TurnItem): { name: string; input: string | null; output: string | null } {
+  switch (item.type) {
+    case "command_execution":
+      return { name: "command", input: text(item.input), output: text(item.output) };
+    case "file_change": {
+      const counts =
+        typeof item.additions === "number" ? ` (+${item.additions} -${typeof item.deletions === "number" ? item.deletions : 0})` : "";
+      return { name: "file change", input: `${text(item.fileName) ?? "file"}${counts}`, output: text(item.diffStr) };
+    }
+    case "file_search":
+      return {
+        name: "file search",
+        input: text(item.pattern),
+        output: joined(item.results, (result) => text(result.fileName)),
+      };
+    case "web_search":
+      return {
+        name: "web search",
+        input: list(item.patterns).filter((pattern) => typeof pattern === "string").join(", ") || null,
+        output: joined(item.results, (result) => text(result.url) ?? text(result.title)),
+      };
+    case "dynamic_tool":
+      return { name: text(item.toolName) ?? "tool", input: text(item.input), output: text(item.output) };
+    case "subagent":
+      return { name: "subagent", input: text(item.prompt), output: text(item.result) ?? text(item.progress) };
+    case "approval_request":
+      return { name: "approval", input: text(item.prompt) ?? text(item.requestKind), output: null };
+    case "user_input_request":
+      return {
+        name: "question",
+        input: joined(item.questions, (question) => text(question.question)),
+        output: text(record(item.questionAnswer)?.answers),
+      };
+    case "error":
+      return { name: "error", input: null, output: text(record(item.failure)?.message) };
+    case "todo_list":
+      return { name: "todo list", input: text(item.explanation), output: joined(item.steps, (step) => `[${text(step.status) ?? "?"}] ${text(step.text) ?? ""}`) };
+    case "notification":
+      return { name: "notification", input: text(item.summary), output: text(item.detail) };
+    case "thread_created":
+      return { name: "thread created", input: text(item.targetThreadId), output: text(item.targetModel) };
+    default:
+      return {
+        name: item.type.replaceAll("_", " "),
+        input: text(item.title) ?? text(item.message),
+        output: text(item.summary),
+      };
+  }
+}
+
+function changedFilesOf(allItems: readonly T3TurnItem[], runId: string): ChangedFile[] {
+  const items = allItems.filter((item) => item.runId === runId);
+  const checkpointFiles = items
+    .filter((item) => item.type === "checkpoint")
+    .flatMap((item) =>
+      list(item.files).flatMap((entry) => {
+        const file = record(entry);
+        if (!file || typeof file.path !== "string") return [];
+        return [{
+          path: file.path,
+          kind: typeof file.kind === "string" ? file.kind : null,
+          additions: typeof file.additions === "number" ? file.additions : null,
+          deletions: typeof file.deletions === "number" ? file.deletions : null,
+        }];
+      }),
+    );
+  if (checkpointFiles.length > 0) return checkpointFiles;
+  return items.flatMap((item) =>
+    item.type === "file_change" && typeof item.fileName === "string"
+      ? [{
+          path: item.fileName,
+          kind: "changed",
+          additions: typeof item.additions === "number" ? item.additions : null,
+          deletions: typeof item.deletions === "number" ? item.deletions : null,
+        }]
+      : [],
+  );
 }
 
 export interface PendingQuestion {
@@ -368,12 +439,15 @@ export interface PendingQuestion {
 
 export interface PendingRequest {
   kind: "approval" | "user-input";
-  requestId: string | null;
+  requestId: string;
+  /** The run that raised the request. */
   turnId: string | null;
-  /** `message` questions outlive their turn, and answering one starts a new turn. */
+  /** `message` questions outlive their run, and answering one starts a new run. */
   responseMode: "message" | null;
-  /** Whether the request holds up a running turn until someone answers it. */
+  /** Whether a live provider session waits on the answer, holding up its run. */
   blocking: boolean;
+  /** False when the provider session that asked is gone, so only dismissing it is left. */
+  answerable: boolean;
   /** The approval's subject, such as the command to run. */
   detail: string | null;
   requestKind: string | null;
@@ -383,102 +457,72 @@ export interface PendingRequest {
   createdAt: string;
 }
 
-function describeChoices(options: unknown): Pick<PendingQuestion, "options" | "choices"> {
-  const choices = list(options).flatMap((option) => {
-    const choice = record(option);
-    return typeof choice?.label === "string"
-      ? [{ label: choice.label, value: text(choice.value), description: text(choice.description) }]
-      : [];
-  });
-  return { options: choices.map((choice) => choice.label), choices };
-}
-
-function pendingQuestions(payload: Record<string, unknown>): PendingQuestion[] {
-  return list(payload.questions).flatMap((entry) => {
+function pendingQuestions(item: T3TurnItem | undefined): PendingQuestion[] {
+  return list(item?.questions).flatMap((entry) => {
     const question = record(entry);
     if (!question || typeof question.question !== "string") return [];
+    const choices = list(question.options).flatMap((option) => {
+      const choice = record(option);
+      return typeof choice?.label === "string"
+        ? [{ label: choice.label, value: text(choice.value), description: text(choice.description) }]
+        : [];
+    });
     return [{
       id: typeof question.id === "string" ? question.id : "",
       header: text(question.header),
       question: question.question,
-      ...describeChoices(question.options),
+      options: choices.map((choice) => choice.label),
+      choices,
       multiSelect: question.multiSelect === true,
       allowCustomAnswer: question.allowCustomAnswer !== false,
     }];
   });
 }
 
-/** T3 closes a request whose provider callback is gone after reporting it as stale. */
-function closedByStaleFailure(activity: Activity, payload: Record<string, unknown>): boolean {
-  const failed = activity.kind === "provider.approval.respond.failed" || activity.kind === "provider.user-input.respond.failed";
-  return failed && typeof payload.detail === "string" && /stale|unknown pending/iu.test(payload.detail);
+function requestItem(projection: T3ThreadProjection, request: T3RuntimeRequest): T3TurnItem | undefined {
+  return projection.turnItems.find(
+    (item) => (item.type === "approval_request" || item.type === "user_input_request") && item.requestId === request.id,
+  );
 }
 
-/**
- * Approvals and questions that wait for a person. The thread detail has no pending flags (only the
- * shell snapshot does), so requests come from the activity log, which always keeps pending ones.
- * T3 auto-closes ordinary questions when their turn ends but never cleans up approvals, so an
- * approval counts only while its turn runs. `message` questions stay open across turns.
- */
-export function pendingRequests(thread: T3Thread): PendingRequest[] {
-  const activities = list(thread.activities) as Activity[];
-  const resolved = new Set(
-    activities.flatMap((activity) => {
-      const payload = record(activity.payload);
-      const requestId = payload?.requestId;
-      if (!payload || typeof requestId !== "string") return [];
-      const done =
-        activity.kind === "approval.resolved" ||
-        activity.kind === "user-input.resolved" ||
-        closedByStaleFailure(activity, payload);
-      return done ? [requestId] : [];
-    }),
-  );
-  const runningTurn = thread.latestTurn?.state === "running" ? thread.latestTurn.turnId : null;
-  return activities.flatMap((activity) => {
-    const payload = record(activity.payload);
-    const kind =
-      activity.kind === "approval.requested" ? "approval" : activity.kind === "user-input.requested" ? "user-input" : null;
-    if (!kind || !payload || typeof activity.createdAt !== "string") return [];
-    const flag = kind === "approval" ? thread.hasPendingApprovals : thread.hasPendingUserInput;
-    const requestId = typeof payload.requestId === "string" ? payload.requestId : null;
-    if (flag === false || (requestId !== null && resolved.has(requestId))) return [];
-    const turnId = typeof activity.turnId === "string" ? activity.turnId : null;
-    const responseMode = kind === "user-input" && payload.responseMode === "message" ? "message" : null;
-    const inRunningTurn = runningTurn !== null && turnId === runningTurn;
-    // T3 closes ordinary questions when their turn ends and never cleans up approvals, so both count only
-    // while their turn runs. The thread-wide flag cannot say which request it means. Message-mode
-    // questions stay open across turns.
-    if (responseMode === null && !inRunningTurn) return [];
-    return [{
-      kind,
-      requestId,
-      turnId,
-      responseMode,
-      blocking: responseMode === null && inRunningTurn,
-      detail: text(payload.detail) ?? text(payload.requestKind) ?? text(activity.summary),
-      requestKind: text(payload.requestKind),
-      decisions: list(payload.options).flatMap((option) => {
-        const decision = record(option)?.decision;
-        return typeof decision === "string" ? [decision] : [];
-      }),
-      questions: pendingQuestions(payload),
-      createdAt: activity.createdAt,
-    }];
-  });
+/** Approvals and questions that wait for a person, from V2's runtime requests. */
+export function pendingRequests(projection: T3ThreadProjection): PendingRequest[] {
+  return projection.runtimeRequests
+    .filter((request) => request.status === "pending")
+    .map((request) => {
+      const item = requestItem(projection, request);
+      const kind = item?.type === "user_input_request" || request.kind === "user_input" ? "user-input" : "approval";
+      const capability = request.responseCapability?.type ?? "live";
+      return {
+        kind,
+        requestId: request.id,
+        turnId: item?.runId ?? null,
+        responseMode: kind === "user-input" && (capability === "message" || item?.responseMode === "message") ? "message" : null,
+        blocking: capability === "live",
+        answerable: capability !== "not_resumable",
+        detail: text(item?.prompt) ?? text(item?.title) ?? text(item?.requestKind) ?? request.kind,
+        requestKind: text(item?.requestKind) ?? request.kind,
+        decisions: list(item?.options).flatMap((option) => {
+          const decision = record(option)?.decision;
+          return typeof decision === "string" ? [decision] : [];
+        }),
+        questions: pendingQuestions(item),
+        createdAt: request.createdAt,
+      } satisfies PendingRequest;
+    });
 }
 
 export function renderPendingRequests(requests: readonly PendingRequest[]): string {
   return requests
     .map((request) => {
-      const id = request.requestId ? ` [${request.requestId}]` : "";
+      const id = ` [${request.requestId}]`;
+      const stale = request.answerable ? "" : " (its session is gone; dismiss it)";
       if (request.kind === "approval") {
-        return `- Approval${id}: ${request.detail ?? request.requestKind ?? "no detail"}`;
+        return `- Approval${id}: ${request.detail ?? request.requestKind ?? "no detail"}${stale}`;
       }
-      const lines = [`- Question${id}${request.responseMode === "message" ? " (answer starts a new turn)" : ""}:`];
+      const lines = [`- Question${id}${request.responseMode === "message" ? " (answer starts a new turn)" : ""}${stale}:`];
       request.questions.forEach((question, index) => {
-        const options =
-          question.options.length > 0 ? ` (options: ${question.options.join(" / ")})` : "";
+        const options = question.options.length > 0 ? ` (options: ${question.options.join(" / ")})` : "";
         lines.push(`  ${index + 1}. ${question.question}${options}`);
       });
       return lines.join("\n");
@@ -486,97 +530,117 @@ export function renderPendingRequests(requests: readonly PendingRequest[]): stri
     .join("\n");
 }
 
-/** User messages that wait for a turn, leaving out those the provider already refused to start. */
-export function queuedMessages(thread: T3Thread): T3Message[] {
-  const failed = new Set(
-    (list(thread.activities) as Activity[]).flatMap((activity) => {
-      const requestId = record(activity.payload)?.requestId;
-      return activity.kind === "provider.turn.start.failed" && typeof requestId === "string" ? [requestId] : [];
-    }),
-  );
-  return groupTurns(thread, checkpointsByTurn(thread))
-    .filter((turn) => turn.turnId === null)
-    .flatMap((turn) => turn.messages)
-    .filter((message) => message.role === "user" && !failed.has(message.id));
+/** The user message that started each run, so a queued run can show what it will send. */
+export function runMessage(projection: T3ThreadProjection, run: T3Run): T3Message | null {
+  return projection.messages.find((message) => message.id === run.userMessageId) ?? null;
 }
 
-export function buildTranscript(thread: T3Thread, options: TranscriptOptions = {}): Transcript {
+export function buildTranscript(projection: T3ThreadProjection, options: TranscriptOptions = {}): Transcript {
   const detail = options.detail ?? "messages";
   const maxChars = options.maxChars;
   const toolLimit = maxChars ?? DEFAULT_TOOL_TEXT_LIMIT;
-  const checkpoints = checkpointsByTurn(thread);
-  const grouped = groupTurns(thread, checkpoints);
-  const started = grouped.filter((turn) => turn.turnId !== null);
-  const pending = grouped.filter((turn) => turn.turnId === null);
-  const window = [...(options.turns === undefined ? started : started.slice(-options.turns)), ...pending];
-  const selected =
-    options.firstTurn && started[0] && !window.includes(started[0]) ? [started[0], ...window] : window;
+  const inherited = inheritedTimeline(projection);
+  const items = [...inherited.items, ...projection.turnItems];
+  const ownMessages = [...inherited.messages, ...projection.messages];
+  const messages = detail === "full" ? [...ownMessages, ...reasoningMessages(items)] : ownMessages;
+  const grouped = groupTurns(projection, messages, inherited.sources);
+  const started = grouped.filter((group) => group.run?.status !== "queued");
+  const waiting = grouped.filter((group) => group.run?.status === "queued");
+  const window = [...(options.turns === undefined ? started : started.slice(-options.turns)), ...waiting];
+  const selected = options.firstTurn && started[0] && !window.includes(started[0]) ? [started[0], ...window] : window;
   const firstTurnIncluded = started[0] !== undefined && selected.includes(started[0]);
 
   const turns: TranscriptTurn[] = [];
-  const messages: TranscriptMessage[] = [];
-  const indexByTurnId = new Map<string, number>();
-  for (const turn of selected) {
-    const index = grouped.indexOf(turn) + 1;
-    const checkpoint = turn.turnId === null ? undefined : checkpoints.get(turn.turnId);
-    const finalId = finalMessageId(turn, thread, checkpoint);
-    const kept = turn.messages.filter((message) => keepMessage(message, detail, finalId));
-    if (turn.turnId !== null) indexByTurnId.set(turn.turnId, index);
-    for (const message of kept) {
+  const kept: TranscriptMessage[] = [];
+  const indexByRunId = new Map<string, number>();
+  for (const group of selected) {
+    const index = grouped.indexOf(group) + 1;
+    const finalId = finalMessageId(group);
+    const visible = group.messages.filter((message) => keepMessage(message, detail, finalId));
+    const runId = group.run?.id ?? group.inheritedRunId;
+    if (runId) indexByRunId.set(runId, index);
+    for (const message of visible) {
       const clipped = clip(message.text, maxChars);
-      messages.push({ ...message, text: clipped.text, textTruncated: clipped.truncated, turnIndex: index });
+      kept.push({
+        id: message.id,
+        role: message.role,
+        text: clipped.text,
+        turnId: message.runId,
+        streaming: message.streaming,
+        createdAt: message.createdAt,
+        updatedAt: message.updatedAt,
+        turnIndex: index,
+        textTruncated: clipped.truncated,
+      });
     }
-    const latest = thread.latestTurn?.turnId === turn.turnId ? thread.latestTurn : null;
+    const run = group.run;
     turns.push({
       index,
-      turnId: turn.turnId,
-      state: turnState(turn, thread),
-      // Older turns have no recorded start; the prompt that started them is the best estimate.
-      startedAt:
-        turn.turnId === null
-          ? null
-          : (latest?.startedAt ??
-            (turn.messages[0] && turn.messages[0].createdAt < turn.startedAt ? turn.messages[0].createdAt : turn.startedAt)),
-      completedAt: latest ? latest.completedAt : typeof checkpoint?.completedAt === "string" ? checkpoint.completedAt : null,
+      turnId: runId,
+      state: run ? turnStateOf(run.status) : null,
+      runStatus: run?.status ?? null,
+      imported: run === null && group.inheritedFrom === null,
+      inherited: group.inheritedFrom !== null,
+      sourceThreadId: group.inheritedFrom,
+      queuePosition: run?.status === "queued" ? (run.queuePosition ?? null) : null,
+      startedAt: run ? (run.startedAt ?? (run.status === "queued" ? null : run.requestedAt)) : (group.messages[0]?.createdAt ?? null),
+      completedAt: run ? run.completedAt : null,
       finalMessageId: finalId,
-      messageCount: kept.length,
-      ...(detail === "full" ? { changedFiles: changedFiles(checkpoint) } : {}),
+      messageCount: visible.length,
+      ...(detail === "full" ? { changedFiles: runId ? changedFilesOf(items, runId) : [] } : {}),
     });
   }
+  kept.sort((left, right) => left.turnIndex - right.turnIndex || messageOrder(left, right));
 
   const transcript: Transcript = {
     view: {
       detail,
       totalTurns: started.length,
-      returnedTurns: turns.filter((turn) => turn.turnId !== null).length,
-      omittedTurns: started.length - turns.filter((turn) => turn.turnId !== null).length,
+      returnedTurns: turns.filter((turn) => turn.state !== "pending").length,
+      omittedTurns: started.length - turns.filter((turn) => turn.state !== "pending").length,
       firstTurnIncluded,
       maxChars: maxChars ?? null,
     },
     turns,
-    messages,
+    messages: kept,
   };
   // In plan mode the proposed plan is the turn's answer, so every detail level keeps it.
-  transcript.proposedPlans = collectPlans(thread).flatMap((plan) => {
-    const turnIndex = plan.turnId === null ? null : (indexByTurnId.get(plan.turnId) ?? null);
-    if (plan.turnId !== null && turnIndex === null) return [];
-    const clipped = clip(plan.text, maxChars);
-    return [{ ...plan, turnIndex, text: clipped.text, textTruncated: clipped.truncated }];
+  transcript.proposedPlans = items.flatMap((item) => {
+    if (item.type !== "proposed_plan" || typeof item.markdown !== "string" || item.markdown.length === 0) return [];
+    const turnIndex = item.runId === null ? null : (indexByRunId.get(item.runId) ?? null);
+    if (item.runId !== null && turnIndex === null) return [];
+    const clipped = clip(item.markdown, maxChars);
+    return [{
+      id: typeof item.planId === "string" ? item.planId : item.id,
+      turnId: item.runId,
+      turnIndex,
+      text: clipped.text,
+      textTruncated: clipped.truncated,
+      createdAt: item.startedAt ?? item.updatedAt ?? null,
+    }];
   });
   if (detail !== "full") return transcript;
 
-  const toolCalls: ToolCall[] = collectToolCalls(thread).flatMap((call) => {
-    const turnIndex = call.turnId === null ? undefined : indexByTurnId.get(call.turnId);
+  const toolCalls: ToolCall[] = items.flatMap((item) => {
+    if (NON_TOOL_ITEM_TYPES.has(item.type) || item.runId === null) return [];
+    const turnIndex = indexByRunId.get(item.runId);
     if (turnIndex === undefined) return [];
-    const input = call.input === null ? null : clip(call.input, toolLimit);
-    const output = call.output === null ? null : clip(call.output, toolLimit);
+    const described = describeItem(item);
+    const input = described.input === null ? null : clip(described.input, toolLimit);
+    const output = described.output === null ? null : clip(described.output, toolLimit);
     return [{
-      ...call,
+      id: item.id,
+      turnId: item.runId,
       turnIndex,
+      kind: item.type,
+      name: described.name,
+      status: item.status ?? null,
       input: input?.text ?? null,
       inputTruncated: input?.truncated ?? false,
       output: output?.text ?? null,
       outputTruncated: output?.truncated ?? false,
+      startedAt: itemTime(item),
+      updatedAt: item.updatedAt ?? itemTime(item),
     }];
   });
   for (const turn of turns) turn.toolCallCount = toolCalls.filter((call) => call.turnIndex === turn.index).length;
@@ -587,14 +651,13 @@ export function buildTranscript(thread: T3Thread, options: TranscriptOptions = {
 /** Narrows a transcript to one turn, optionally leaving out messages the caller already knows. */
 export function selectTurn(transcript: Transcript, index: number | null, omitMessageIds: readonly string[] = []): Transcript {
   const turns = transcript.turns.filter((turn) => turn.index === index);
-  const returnedTurns = turns.filter((turn) => turn.turnId !== null).length;
+  const returnedTurns = turns.filter((turn) => turn.state !== "pending").length;
   return {
     view: {
       ...transcript.view,
       returnedTurns,
       omittedTurns: transcript.view.totalTurns - returnedTurns,
-      // Pending messages always come after the started turns, so turn 1 is the first started turn.
-      firstTurnIncluded: turns.some((turn) => turn.index === 1 && turn.turnId !== null),
+      firstTurnIncluded: turns.some((turn) => turn.index === 1 && turn.state !== "pending"),
     },
     turns,
     messages: transcript.messages.filter((message) => message.turnIndex === index && !omitMessageIds.includes(message.id)),
@@ -624,14 +687,20 @@ function toolLine(call: ToolCall): string {
   return lines.join("\n");
 }
 
+function turnHeading(turn: TranscriptTurn): string {
+  if (turn.state === "pending") return `## Queued${turn.queuePosition === null ? "" : ` · position ${turn.queuePosition}`}`;
+  if (turn.imported) return `## Turn ${turn.index} · imported · ${time(turn.startedAt)}`;
+  if (turn.inherited) return `## Turn ${turn.index} · inherited from ${turn.sourceThreadId} · ${time(turn.startedAt)}`;
+  // `cancelled` is clearer than its `interrupted` state for a queued message that never ran.
+  const state = turn.runStatus === "cancelled" ? "cancelled" : turn.state;
+  return `## Turn ${turn.index}${state ? ` · ${state}` : ""} · ${time(turn.startedAt)}`;
+}
+
 /** Renders a transcript as compact Markdown that an agent can read directly. */
 export function renderTranscript(transcript: Transcript): string {
   const sections: string[] = [];
   for (const turn of transcript.turns) {
-    const state = turn.state ? ` · ${turn.state}` : "";
-    const heading =
-      turn.turnId === null ? "## Pending messages" : `## Turn ${turn.index}${state} · ${time(turn.startedAt)}`;
-    const parts = [heading];
+    const parts = [turnHeading(turn)];
     const files = turn.changedFiles ?? [];
     const entries = [
       ...transcript.messages
@@ -652,13 +721,15 @@ export function renderTranscript(transcript: Transcript): string {
       }
       toolRun = null;
       const message = entry.message!;
-      const label = isReasoningMessage(message)
-        ? "reasoning"
-        : message.id === turn.finalMessageId
-          ? turn.state === "completed" || turn.state === null
-            ? "assistant (final)"
-            : "assistant (latest)"
-          : message.role;
+      const label =
+        message.role === "reasoning" || message.role === "system"
+          ? message.role
+          : message.id === turn.finalMessageId
+            ? // Only a completed turn has a final answer; history without a recorded state counts as one.
+              turn.state === "completed" || turn.state === null
+              ? "assistant (final)"
+              : "assistant (latest)"
+            : message.role;
       parts.push(`### ${label} · ${time(message.createdAt)}\n${message.text.trim()}`);
     }
     if (files.length > 0) {

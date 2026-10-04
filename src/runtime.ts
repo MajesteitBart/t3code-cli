@@ -4,12 +4,14 @@ import path from "node:path";
 
 import { expandHome } from "./config.js";
 import { CliError } from "./errors.js";
+import { readResponseText, withHttpResponse } from "./http.js";
 import { hasProtocolHandler, openExternal } from "./platformOpen.js";
-import type { CliConfig, RuntimeState, T3Runtime } from "./types.js";
+import { ORCHESTRATION_PROTOCOL_VERSION, type CliConfig, type RuntimeState, type T3Runtime } from "./types.js";
 
 interface EnvironmentDescriptor {
   environmentId: string;
   serverVersion: string;
+  orchestrationProtocolVersion: number | null;
   capabilities: {
     threadSettlement?: boolean;
     [key: string]: unknown;
@@ -40,12 +42,15 @@ async function readRuntimeState(filePath: string): Promise<RuntimeState | null> 
 
 async function fetchDescriptor(origin: string): Promise<EnvironmentDescriptor | null> {
   try {
-    const response = await fetch(new URL("/.well-known/t3/environment", origin), {
-      headers: { connection: "close" },
-      signal: AbortSignal.timeout(2_500),
-    });
-    if (!response.ok) return null;
-    const value = (await response.json()) as Partial<EnvironmentDescriptor>;
+    // Node's own HTTP client: global fetch leaves a handle that crashes Node 26 at exit after two discoveries.
+    const { status, text } = await withHttpResponse(
+      new URL("/.well-known/t3/environment", origin),
+      { method: "GET", signal: AbortSignal.timeout(2_500) },
+      undefined,
+      async (response) => ({ status: response.statusCode ?? 0, text: await readResponseText(response) }),
+    );
+    if (status < 200 || status >= 300) return null;
+    const value = JSON.parse(text) as Partial<EnvironmentDescriptor>;
     if (typeof value.environmentId !== "string" || typeof value.serverVersion !== "string") return null;
     const capabilities =
       value.capabilities !== null &&
@@ -53,7 +58,13 @@ async function fetchDescriptor(origin: string): Promise<EnvironmentDescriptor | 
       !Array.isArray(value.capabilities)
         ? value.capabilities
         : {};
-    return { environmentId: value.environmentId, serverVersion: value.serverVersion, capabilities };
+    const protocol = (value as { orchestrationProtocolVersion?: unknown }).orchestrationProtocolVersion;
+    return {
+      environmentId: value.environmentId,
+      serverVersion: value.serverVersion,
+      orchestrationProtocolVersion: typeof protocol === "number" ? protocol : null,
+      capabilities,
+    };
   } catch {
     return null;
   }
@@ -116,15 +127,38 @@ async function startDesktopAndWait(config: CliConfig): Promise<T3Runtime | null>
   return null;
 }
 
+/**
+ * This CLI speaks orchestration protocol 2, which T3 introduced with orchestrator V2. Older servers
+ * reject every V2 request, so refuse them up front and name the CLI version that still speaks to them.
+ */
+export function requireSupportedProtocol(runtime: T3Runtime): T3Runtime {
+  if (runtime.orchestrationProtocolVersion === ORCHESTRATION_PROTOCOL_VERSION) return runtime;
+  throw new CliError(
+    "T3_PROTOCOL_UNSUPPORTED",
+    runtime.orchestrationProtocolVersion === null || runtime.orchestrationProtocolVersion < ORCHESTRATION_PROTOCOL_VERSION
+      ? `T3 ${runtime.serverVersion} runs orchestrator V1. This CLI needs orchestrator V2; use @bvdm/t3code-cli@0.2 for this T3 build.`
+      : `T3 ${runtime.serverVersion} speaks orchestration protocol ${runtime.orchestrationProtocolVersion}, which this CLI does not know yet. Update @bvdm/t3code-cli.`,
+    {
+      exitCode: 4,
+      details: {
+        serverVersion: runtime.serverVersion,
+        orchestrationProtocolVersion: runtime.orchestrationProtocolVersion,
+        supportedProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
+      },
+    },
+  );
+}
+
 export async function discoverRuntime(
   config: CliConfig,
-  options: { startDesktopIfNeeded: boolean },
+  options: { startDesktopIfNeeded: boolean; allowUnsupportedProtocol?: boolean },
 ): Promise<T3Runtime> {
+  const check = (runtime: T3Runtime) => (options.allowUnsupportedProtocol ? runtime : requireSupportedProtocol(runtime));
   const existing = await findRuntime(config);
-  if (existing) return existing;
+  if (existing) return check(existing);
 
   const started = options.startDesktopIfNeeded ? await startDesktopAndWait(config) : null;
-  if (started) return started;
+  if (started) return check(started);
 
   throw new CliError(
     "T3_SERVER_UNAVAILABLE",

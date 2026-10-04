@@ -22,8 +22,8 @@ import {
   type ThreadWaitOptions,
   type ThreadWaitView,
 } from "./threadSupport.js";
-import { pendingRequests, queuedMessages, type PendingQuestion, type PendingRequest } from "./transcript.js";
-import type { CliConfig, InteractionMode, ModelSelection, RuntimeMode, T3Thread } from "./types.js";
+import { activeRun, isActiveRun, pendingRequests, type PendingQuestion, type PendingRequest } from "./transcript.js";
+import type { CliConfig, InteractionMode, ModelSelection, RuntimeMode, T3ThreadProjection } from "./types.js";
 
 /** Settings a caller asks to change on an existing thread; anything left out stays as it is. */
 export interface ThreadSettingsChange extends ModelChange {
@@ -34,9 +34,11 @@ export interface ThreadSettingsChange extends ModelChange {
 export interface ThreadSettingsPlan {
   /** The new model selection, or null when it does not change. */
   modelSelection: ModelSelection | null;
+  /** True when the new model runs on another provider instance, which T3 reaches through a handoff. */
+  providerSwitch: boolean;
   runtimeMode: RuntimeMode | null;
   interactionMode: InteractionMode | null;
-  commands: Array<{ type: string; threadId: string; [key: string]: unknown }>;
+  commands: Array<{ type: string; commandId: string; threadId: string; [key: string]: unknown }>;
   /** False when T3 did not return its catalog, so options were set without validation. */
   catalogUsed: boolean;
 }
@@ -59,56 +61,8 @@ export function hasSettingsChange(change: ThreadSettingsChange | undefined): cha
   return change !== undefined && (hasModelChange(change) || change.runtimeMode !== undefined || change.interactionMode !== undefined);
 }
 
-/** A turn is in progress. A session that is only starting, such as after a restart, runs no turn yet. */
-/** A provider session that T3 restarts when the permission mode changes. */
-function liveSession(thread: T3Thread): boolean {
-  return thread.session != null && thread.session.status !== "stopped";
-}
-
-/** What keeps a thread busy: a running turn, or messages that still wait for their turn. */
-export function busyState(thread: T3Thread): { turnRunning: boolean; queuedMessages: number } | null {
-  const running = turnRunning(thread);
-  const queued = queuedMessages(thread).length;
-  return running || queued > 0 ? { turnRunning: running, queuedMessages: queued } : null;
-}
-
-/** T3 binds a conversation to its provider once the thread has a session or any history. */
-function conversationStarted(thread: T3Thread): boolean {
-  return thread.session != null || thread.latestTurn != null || (thread.messages?.length ?? 0) > 0;
-}
-
-function turnRunning(thread: T3Thread): boolean {
-  return (
-    thread.latestTurn?.state === "running" || thread.session?.status === "running" || thread.session?.activeTurnId != null
-  );
-}
-
-function activityIds(thread: T3Thread): Set<unknown> {
-  return new Set((Array.isArray(thread.activities) ? thread.activities : []).map((activity) => (activity as { id?: unknown }).id));
-}
-
-/** Finds an activity that T3 added after `before` was read, such as a provider's response. */
-function newActivity(
-  thread: T3Thread,
-  before: Set<unknown>,
-  match: (kind: string, payload: Record<string, unknown>) => boolean,
-): Record<string, unknown> | null {
-  const activities = Array.isArray(thread.activities) ? (thread.activities as Array<Record<string, unknown>>) : [];
-  return (
-    activities.find((activity) => {
-      const payload = activity?.payload;
-      return (
-        !before.has(activity?.id) &&
-        typeof activity?.kind === "string" &&
-        payload !== null &&
-        typeof payload === "object" &&
-        match(activity.kind, payload as Record<string, unknown>)
-      );
-    }) ?? null
-  );
-}
-
-function requireWritableThread(thread: T3Thread): void {
+function requireWritableThread(projection: T3ThreadProjection): void {
+  const thread = projection.thread;
   if (thread.archivedAt != null) {
     throw new CliError("THREAD_ARCHIVED", `Thread ${thread.id} is archived.`, {
       exitCode: 4,
@@ -120,13 +74,15 @@ function requireWritableThread(thread: T3Thread): void {
 /**
  * Plans the commands that change a thread's settings the way T3 Code's composer does: the model
  * selection first, then the permission mode, then plan or build mode. Only changed values produce a
- * command. T3 validates a model only when the next turn starts, so the plan checks it up front.
+ * command. A model on another provider instance goes through T3's provider switch, which hands the
+ * conversation over with a budgeted share of its history.
  */
 export function planThreadSettings(
-  thread: T3Thread,
+  projection: T3ThreadProjection,
   change: ThreadSettingsChange,
   catalog: ProviderCatalog | null,
 ): ThreadSettingsPlan {
+  const thread = projection.thread;
   const current = thread.modelSelection ?? null;
   let modelSelection: ModelSelection | null = null;
   if (hasModelChange(change)) {
@@ -138,44 +94,22 @@ export function planThreadSettings(
     const next = catalog
       ? resolveModelChange(current, change, catalog)
       : applyModelOverrides(current, change, "thread", THREAD_EFFORT_OPTION_IDS);
-    if (next.instanceId !== current.instanceId && conversationStarted(thread)) {
-      // T3 rejects moving a started conversation to another driver or to incompatible resume state.
-      const from = catalog ? findProvider(catalog, current.instanceId) : null;
-      const to = catalog ? findProvider(catalog, next.instanceId) : null;
-      // Without a continuation key, nothing shows the two instances can resume each other's conversation.
-      const compatible =
-        from && to && from.driver === to.driver && from.continuationKey !== null && from.continuationKey === to.continuationKey;
-      if (!compatible) {
-        throw new CliError(
-          "PROVIDER_SWITCH_UNSUPPORTED",
-          `Thread ${thread.id} already runs on ${current.instanceId}, and T3 cannot move a started conversation to ${next.instanceId}. Hand the work over to a new thread instead.`,
-          { exitCode: 4, details: { threadId: thread.id, provider: current.instanceId, requestedProvider: next.instanceId } },
-        );
-      }
-    }
     if (!sameModelSelection(next, current)) modelSelection = next;
   }
+  const providerSwitch = modelSelection !== null && modelSelection.instanceId !== current?.instanceId;
 
-  // A failed restart can leave a live session on the old mode while the thread shows the new one.
-  const runtimeMode =
-    change.runtimeMode !== undefined &&
-    (change.runtimeMode !== thread.runtimeMode || (liveSession(thread) && thread.session?.runtimeMode !== change.runtimeMode))
-      ? change.runtimeMode
-      : null;
+  const runtimeMode = change.runtimeMode !== undefined && change.runtimeMode !== thread.runtimeMode ? change.runtimeMode : null;
   const interactionMode =
-    change.interactionMode !== undefined && change.interactionMode !== thread.interactionMode
-      ? change.interactionMode
-      : null;
-  if (runtimeMode && turnRunning(thread)) {
+    change.interactionMode !== undefined && change.interactionMode !== thread.interactionMode ? change.interactionMode : null;
+  if ((runtimeMode || providerSwitch) && activeRun(projection)) {
     throw new CliError(
       "THREAD_BUSY",
-      `Changing the permission mode restarts the provider session, which would stop thread ${thread.id}'s running turn. Wait for the turn or interrupt it first.`,
-      { exitCode: 4, details: { threadId: thread.id, sessionStatus: thread.session?.status ?? null } },
+      `${providerSwitch ? "Switching the provider" : "Changing the permission mode"} restarts thread ${thread.id}'s provider session, which would stop its running turn. Wait for the turn or interrupt it first.`,
+      { exitCode: 4, details: { threadId: thread.id, activeRunId: activeRun(projection)?.id ?? null } },
     );
   }
   // A thread already in plan mode keeps it, so a new provider must support it too.
-  const keepsPlanMode =
-    thread.interactionMode === "plan" && modelSelection !== null && modelSelection.instanceId !== current?.instanceId;
+  const keepsPlanMode = thread.interactionMode === "plan" && providerSwitch;
   if ((interactionMode === "plan" || keepsPlanMode) && catalog) {
     const provider = findProvider(catalog, (modelSelection ?? current)?.instanceId ?? "");
     if (provider && !provider.supportsPlanMode) {
@@ -187,27 +121,25 @@ export function planThreadSettings(
     }
   }
 
-  const createdAt = new Date().toISOString();
   const commands: ThreadSettingsPlan["commands"] = [];
   if (modelSelection) {
-    commands.push({ type: "thread.meta.update", commandId: randomUUID(), threadId: thread.id, modelSelection });
-  }
-  if (runtimeMode) {
-    commands.push({ type: "thread.runtime-mode.set", commandId: randomUUID(), threadId: thread.id, runtimeMode, createdAt });
-  }
-  if (interactionMode) {
     commands.push({
-      type: "thread.interaction-mode.set",
+      type: providerSwitch ? "provider.switch" : "thread.model-selection.set",
       commandId: randomUUID(),
       threadId: thread.id,
-      interactionMode,
-      createdAt,
+      modelSelection,
     });
   }
-  return { modelSelection, runtimeMode, interactionMode, commands, catalogUsed: catalog !== null };
+  if (runtimeMode) {
+    commands.push({ type: "thread.runtime-mode.set", commandId: randomUUID(), threadId: thread.id, runtimeMode });
+  }
+  if (interactionMode) {
+    commands.push({ type: "thread.interaction-mode.set", commandId: randomUUID(), threadId: thread.id, interactionMode });
+  }
+  return { modelSelection, providerSwitch, runtimeMode, interactionMode, commands, catalogUsed: catalog !== null };
 }
 
-/** The catalog is only needed to check model settings. Older T3 servers do not serve it. */
+/** The catalog is only needed to check model settings. */
 async function catalogFor(api: T3Api, change: ThreadSettingsChange): Promise<ProviderCatalog | null> {
   if (!hasModelChange(change) && change.interactionMode !== "plan") return null;
   return await fetchCatalog(api).catch(() => null);
@@ -216,98 +148,62 @@ async function catalogFor(api: T3Api, change: ThreadSettingsChange): Promise<Pro
 /** Dispatches a settings plan and waits until T3's projection shows every change. */
 async function applyThreadSettings(
   adapter: T3ThreadApi,
-  thread: T3Thread,
+  projection: T3ThreadProjection,
   plan: ThreadSettingsPlan,
-): Promise<{ dispatches: unknown[]; thread: T3Thread; sessionRestarted: boolean }> {
-  if (plan.commands.length === 0) return { dispatches: [], thread, sessionRestarted: false };
-  const dispatches: unknown[] = [];
-  for (const command of plan.commands) dispatches.push(await adapter.dispatchControl(command));
-  const verified = await adapter.poll(thread.id, (candidate) =>
-    (!plan.modelSelection || sameModelSelection(candidate.modelSelection, plan.modelSelection)) &&
-    (!plan.runtimeMode || candidate.runtimeMode === plan.runtimeMode) &&
-    (!plan.interactionMode || candidate.interactionMode === plan.interactionMode)
-      ? candidate
-      : null,
-  );
-  if (!verified.value) {
-    throw new CliError("THREAD_SETTINGS_NOT_VERIFIED", `T3 did not show the new settings for thread ${thread.id}.`, {
-      exitCode: 5,
-      details: { threadId: thread.id, commands: plan.commands.map((command) => command.type) },
-    });
-  }
-  if (!plan.runtimeMode || !liveSession(thread)) return { dispatches, thread: verified.value, sessionRestarted: false };
-
-  // T3 saves the mode at once but restarts the live session afterwards, and logs a failed restart only
-  // on the server. The session's own mode shows whether the restart took effect.
-  const requested = plan.runtimeMode;
-  const errorBefore = thread.session?.lastError ?? null;
-  const restarted = await adapter.poll(
-    thread.id,
-    (candidate) => {
-      const session = candidate.session;
-      // A failed restart leaves a stopped or errored session with a new error.
-      const newError = session?.lastError != null && session.lastError !== errorBefore;
-      if (newError && (session?.status === "stopped" || session?.status === "error")) return "failed" as const;
-      // Only a usable session has restarted; an errored or still-starting one has not.
-      const usable = session?.status === "ready" || session?.status === "idle" || session?.status === "running";
-      return usable && session?.runtimeMode === requested ? ("restarted" as const) : null;
-    },
+): Promise<{ dispatches: Array<{ sequence: number }>; projection: T3ThreadProjection }> {
+  if (plan.commands.length === 0) return { dispatches: [], projection };
+  const dispatches: Array<{ sequence: number }> = [];
+  for (const command of plan.commands) dispatches.push(await adapter.dispatch(command));
+  const verified = await adapter.poll(
+    projection.thread.id,
+    (candidate) =>
+      (!plan.modelSelection || sameModelSelection(candidate.thread.modelSelection, plan.modelSelection)) &&
+      (!plan.runtimeMode || candidate.thread.runtimeMode === plan.runtimeMode) &&
+      (!plan.interactionMode || candidate.thread.interactionMode === plan.interactionMode)
+        ? candidate
+        : null,
     adapter.controlTimeoutMs,
   );
-  const after = restarted.thread;
-  if (restarted.value === "restarted" && after) return { dispatches, thread: after, sessionRestarted: true };
-  // A session that stopped without a new error starts with the saved mode next time.
-  if (restarted.value === null && after?.session?.status === "stopped" && (after.session.lastError ?? null) === errorBefore) {
-    return { dispatches, thread: after, sessionRestarted: false };
-  }
-  const lastError = after?.session?.lastError ?? null;
-  throw new CliError(
-    "THREAD_PERMISSION_NOT_APPLIED",
-    `T3 saved permission ${requested} for thread ${thread.id}, but its provider session did not restart with it.${lastError ? ` T3 reported: ${lastError}` : ""}`,
-    {
+  if (!verified.value) {
+    throw new CliError("THREAD_SETTINGS_NOT_VERIFIED", `T3 did not show the new settings for thread ${projection.thread.id}.`, {
       exitCode: 5,
-      details: {
-        threadId: thread.id,
-        runtimeMode: requested,
-        sessionRuntimeMode: after?.session?.runtimeMode ?? null,
-        sessionStatus: after?.session?.status ?? null,
-        lastError,
-      },
-    },
-  );
+      details: { threadId: projection.thread.id, commands: plan.commands.map((command) => command.type) },
+    });
+  }
+  return { dispatches, projection: verified.value };
 }
 
 /** Plans and applies a settings change inside an open T3 session; used before a message is sent. */
 export async function changeSettingsWithApi(
   api: T3Api,
   adapter: T3ThreadApi,
-  thread: T3Thread,
+  projection: T3ThreadProjection,
   change: ThreadSettingsChange,
-): Promise<{ plan: ThreadSettingsPlan; dispatches: unknown[]; thread: T3Thread; sessionRestarted: boolean }> {
-  // A message sent during a running turn may join that turn, which keeps its current model and modes.
-  if (turnRunning(thread)) {
+): Promise<{ plan: ThreadSettingsPlan; dispatches: Array<{ sequence: number }>; projection: T3ThreadProjection }> {
+  // A message that joins a running turn keeps that turn's settings.
+  if (activeRun(projection)) {
     throw new CliError(
       "THREAD_BUSY",
-      `Thread ${thread.id} is running a turn, and a message sent now may join it with the current settings. Wait for the turn, then send with the new settings.`,
-      { exitCode: 4, details: { threadId: thread.id, sessionStatus: thread.session?.status ?? null } },
+      `Thread ${projection.thread.id} is running a turn, and a message sent now would run with its current settings. Wait for the turn, then send with the new settings.`,
+      { exitCode: 4, details: { threadId: projection.thread.id, activeRunId: activeRun(projection)?.id ?? null } },
     );
   }
-  const plan = planThreadSettings(thread, change, await catalogFor(api, change));
-  return { plan, ...(await applyThreadSettings(adapter, thread, plan)) };
+  const plan = planThreadSettings(projection, change, await catalogFor(api, change));
+  return { plan, ...(await applyThreadSettings(adapter, projection, plan)) };
 }
 
-function settingsView(thread: T3Thread) {
+function settingsView(projection: T3ThreadProjection) {
   return {
-    modelSelection: thread.modelSelection ?? null,
-    runtimeMode: thread.runtimeMode ?? null,
-    interactionMode: thread.interactionMode ?? null,
-    sessionRuntimeMode: thread.session?.runtimeMode ?? null,
+    modelSelection: projection.thread.modelSelection ?? null,
+    runtimeMode: projection.thread.runtimeMode ?? null,
+    interactionMode: projection.thread.interactionMode ?? null,
   };
 }
 
 export function settingsSummary(plan: ThreadSettingsPlan) {
   return {
     modelSelection: plan.modelSelection,
+    providerSwitch: plan.providerSwitch,
     runtimeMode: plan.runtimeMode,
     interactionMode: plan.interactionMode,
     catalogUsed: plan.catalogUsed,
@@ -325,23 +221,20 @@ export async function updateThreadSettings(
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: !options.dryRun });
   return await withT3Api(runtime, config, async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
-    const { thread } = await adapter.read(threadId);
-    requireWritableThread(thread);
-    const plan = planThreadSettings(thread, options.change, await catalogFor(api, options.change));
-    const applied = options.dryRun ? null : await applyThreadSettings(adapter, thread, plan);
+    const { projection } = await adapter.inspect(threadId);
+    requireWritableThread(projection);
+    const plan = planThreadSettings(projection, options.change, await catalogFor(api, options.change));
+    const applied = options.dryRun ? null : await applyThreadSettings(adapter, projection, plan);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
-      project: await projectById(api, thread.projectId),
-      thread: { id: thread.id, projectId: thread.projectId, title: thread.title },
+      project: await projectById(api, projection.thread.projectId),
+      thread: { id: projection.thread.id, projectId: projection.thread.projectId, title: projection.thread.title },
       dryRun: options.dryRun ?? false,
       changed: plan.commands.length > 0,
-      before: settingsView(thread),
-      after: applied ? settingsView(applied.thread) : null,
+      before: settingsView(projection),
+      after: applied ? settingsView(applied.projection) : null,
       changes: settingsSummary(plan),
-      // Changing the permission mode restarts a live provider session.
-      // Set only when the live session came back with the new permission mode.
-      sessionRestart: applied?.sessionRestarted ?? false,
       commands: plan.commands,
       dispatches: applied?.dispatches ?? [],
     };
@@ -353,117 +246,76 @@ export async function interruptThread(config: CliConfig, rawThreadId: string) {
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, config, async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
-    const { thread } = await adapter.read(threadId);
+    const { projection } = await adapter.inspect(threadId);
+    const run = activeRun(projection);
     // Interrupting Claude stops its whole session, so only interrupt a turn that is running.
-    if (!turnRunning(thread)) {
+    if (!run) {
       throw new CliError("THREAD_NOT_RUNNING", `Thread ${threadId} has no running turn to interrupt.`, {
         exitCode: 4,
-        details: { threadId, sessionStatus: thread.session?.status ?? null, latestTurn: thread.latestTurn ?? null },
+        details: { threadId },
       });
     }
-    // With a turn id, T3 marks that turn interrupted at once; the web UI passes the session's active turn.
-    const turnId =
-      thread.session?.activeTurnId ?? (thread.latestTurn?.state === "running" ? thread.latestTurn.turnId : null);
-    const command = {
-      type: "thread.turn.interrupt",
-      commandId: randomUUID(),
+    const command = { type: "run.interrupt", commandId: randomUUID(), threadId, runId: run.id };
+    const dispatch = await adapter.dispatch(command);
+    const stopped = await adapter.poll(
       threadId,
-      ...(turnId ? { turnId } : {}),
-      createdAt: new Date().toISOString(),
-    };
-    const before = activityIds(thread);
-    const dispatch = await adapter.dispatchControl(command);
-    // When the provider fails to interrupt, T3 stops the session, so keep waiting for the turn to end.
-    const failureOf = (candidate: T3Thread) =>
-      newActivity(candidate, before, (kind) => kind === "provider.turn.interrupt.failed");
-    // Check the interrupted turn itself: a queued turn may start as soon as it stops.
-    const stopped = (candidate: T3Thread) =>
-      turnId
-        ? !(candidate.latestTurn?.turnId === turnId && candidate.latestTurn.state === "running") &&
-          candidate.session?.activeTurnId !== turnId
-        : !turnRunning(candidate);
-    const settled = await adapter.poll(
-      threadId,
-      (candidate) => (stopped(candidate) ? { thread: candidate, failure: failureOf(candidate) } : null),
+      (candidate) => {
+        const current = candidate.runs.find((other) => other.id === run.id);
+        return current && !isActiveRun(current) ? current : null;
+      },
       adapter.controlTimeoutMs,
     );
-    if (!settled.value) {
-      const failure = settled.thread ? failureOf(settled.thread) : null;
-      const detail = (failure?.payload as { detail?: unknown } | undefined)?.detail;
-      throw new CliError(
-        failure ? "THREAD_INTERRUPT_FAILED" : "THREAD_INTERRUPT_NOT_VERIFIED",
-        failure
-          ? `The provider could not interrupt thread ${threadId}${typeof detail === "string" ? `: ${detail}` : "."}`
-          : `Thread ${threadId} was still running after the interrupt.`,
-        {
-          exitCode: failure ? 4 : 5,
-          details: { threadId, turnId, sessionStatus: settled.thread?.session?.status ?? null, detail: detail ?? null },
-        },
-      );
+    if (!stopped.value) {
+      throw new CliError("THREAD_INTERRUPT_NOT_VERIFIED", `Thread ${threadId} was still running after the interrupt.`, {
+        exitCode: 5,
+        details: { threadId, runId: run.id },
+      });
     }
-    const after = settled.value.thread;
-    const failureDetail = (settled.value.failure?.payload as { detail?: unknown } | undefined)?.detail;
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
-      thread: { id: thread.id, projectId: thread.projectId, title: thread.title },
-      turnId,
-      latestTurn: after.latestTurn ?? null,
-      sessionStatus: after.session?.status ?? null,
-      ...(typeof failureDetail === "string" ? { providerError: failureDetail } : {}),
+      thread: { id: projection.thread.id, projectId: projection.thread.projectId, title: projection.thread.title },
+      turnId: run.id,
+      runStatus: stopped.value.status,
       command,
       dispatch,
     };
   });
 }
 
-function selectRequest(
-  thread: T3Thread,
-  kind: PendingRequest["kind"],
-  requestId: string | undefined,
-): PendingRequest {
+function selectRequest(projection: T3ThreadProjection, kind: PendingRequest["kind"], requestId: string | undefined): PendingRequest {
+  const threadId = projection.thread.id;
   const noun = kind === "approval" ? "approval" : "question";
-  const candidates = pendingRequests(thread).filter((request) => request.kind === kind);
+  const candidates = pendingRequests(projection).filter((request) => request.kind === kind);
   if (requestId !== undefined) {
     const match = candidates.find((request) => request.requestId === requestId);
     if (match) return match;
-    throw new CliError("THREAD_REQUEST_NOT_FOUND", `Thread ${thread.id} has no pending ${noun} ${requestId}.`, {
+    throw new CliError("THREAD_REQUEST_NOT_FOUND", `Thread ${threadId} has no pending ${noun} ${requestId}.`, {
       exitCode: 3,
-      details: { threadId: thread.id, requestId, pending: candidates.map((request) => request.requestId) },
+      details: { threadId, requestId, pending: candidates.map((request) => request.requestId) },
     });
   }
   if (candidates.length === 1) return candidates[0]!;
   if (candidates.length === 0) {
-    throw new CliError("THREAD_REQUEST_NOT_FOUND", `Thread ${thread.id} has no pending ${noun}.`, {
+    throw new CliError("THREAD_REQUEST_NOT_FOUND", `Thread ${threadId} has no pending ${noun}.`, {
       exitCode: 3,
-      details: { threadId: thread.id },
+      details: { threadId },
     });
   }
-  throw new CliError(
-    "THREAD_REQUEST_AMBIGUOUS",
-    `Thread ${thread.id} has ${candidates.length} pending ${noun}s; choose one with --request.`,
-    { exitCode: 2, details: { threadId: thread.id, pending: candidates.map((request) => request.requestId) } },
-  );
+  throw new CliError("THREAD_REQUEST_AMBIGUOUS", `Thread ${threadId} has ${candidates.length} pending ${noun}s; choose one with --request.`, {
+    exitCode: 2,
+    details: { threadId, pending: candidates.map((request) => request.requestId) },
+  });
 }
 
-/** Waits for the provider's resolution of a request, or for its reported failure. */
-async function awaitResolution(
-  adapter: T3ThreadApi,
-  threadId: string,
-  requestId: string,
-  before: Set<unknown>,
-  kind: PendingRequest["kind"],
-): Promise<Record<string, unknown>> {
-  const resolvedKind = kind === "approval" ? "approval.resolved" : "user-input.resolved";
-  const failedKind = kind === "approval" ? "provider.approval.respond.failed" : "provider.user-input.respond.failed";
+/** Waits until T3 records the request as resolved, or reports that it closed another way. */
+async function awaitResolution(adapter: T3ThreadApi, threadId: string, requestId: string) {
   const outcome = await adapter.poll(
     threadId,
-    (thread) =>
-      newActivity(
-        thread,
-        before,
-        (activityKind, payload) => (activityKind === resolvedKind || activityKind === failedKind) && payload.requestId === requestId,
-      ),
+    (projection) => {
+      const request = projection.runtimeRequests.find((candidate) => candidate.id === requestId);
+      return request && request.status !== "pending" ? request : null;
+    },
     RESPONSE_TIMEOUT_MS,
   );
   if (!outcome.value) {
@@ -472,13 +324,11 @@ async function awaitResolution(
       details: { threadId, requestId },
     });
   }
-  if (outcome.value.kind === failedKind) {
-    const detail = (outcome.value.payload as { detail?: unknown }).detail;
-    throw new CliError(
-      "THREAD_RESPONSE_FAILED",
-      `The provider did not accept the response to request ${requestId}: ${typeof detail === "string" ? detail : "no reason given"}`,
-      { exitCode: 4, details: { threadId, requestId, detail: detail ?? null } },
-    );
+  if (outcome.value.status !== "resolved") {
+    throw new CliError("THREAD_RESPONSE_FAILED", `T3 closed request ${requestId} as ${outcome.value.status} instead of applying the response.`, {
+      exitCode: 4,
+      details: { threadId, requestId, status: outcome.value.status },
+    });
   }
   return outcome.value;
 }
@@ -488,21 +338,27 @@ async function waitAfterResponse(
   threadId: string,
   requestId: string,
   wait: ThreadWaitOptions | undefined,
-  messageId?: string,
 ): Promise<Partial<ThreadWaitView>> {
   if (!wait) return {};
-  const waited = await adapter
-    .waitForTurn(threadId, { timeoutMs: wait.timeoutMs, ...(messageId === undefined ? {} : { messageId }) })
-    .catch((cause: unknown) => {
-      if (!(cause instanceof CliError) || cause.code !== "THREAD_WAIT_TIMEOUT") throw cause;
-      // T3 already accepted the response; a caller must not send it again.
-      throw new CliError(
-        "THREAD_WAIT_TIMEOUT",
-        `T3 accepted the response to request ${requestId}, but thread ${threadId} did not finish within ${Math.round(wait.timeoutMs / 1000)} seconds. Do not respond again; run threads wait to keep waiting.`,
-        { exitCode: cause.exitCode, details: { ...(cause.details as object), responded: true, requestId } },
-      );
-    });
+  const waited = await adapter.waitForTurn(threadId, { timeoutMs: wait.timeoutMs }).catch((cause: unknown) => {
+    if (!(cause instanceof CliError) || cause.code !== "THREAD_WAIT_TIMEOUT") throw cause;
+    // T3 already accepted the response; a caller must not send it again.
+    throw new CliError(
+      "THREAD_WAIT_TIMEOUT",
+      `T3 accepted the response to request ${requestId}, but thread ${threadId} did not finish within ${Math.round(wait.timeoutMs / 1000)} seconds. Do not respond again; run threads wait to keep waiting.`,
+      { exitCode: cause.exitCode, details: { ...(cause.details as object), responded: true, requestId } },
+    );
+  });
   return waitView(waited, wait);
+}
+
+function requireAnswerable(request: PendingRequest): void {
+  if (request.answerable) return;
+  throw new CliError(
+    "REQUEST_NOT_ANSWERABLE",
+    `The provider session that raised request ${request.requestId} is gone, so it cannot take a response.${request.kind === "user-input" ? " Dismiss it with --dismiss." : ""}`,
+    { exitCode: 4, details: { requestId: request.requestId } },
+  );
 }
 
 export async function respondToApproval(
@@ -513,8 +369,10 @@ export async function respondToApproval(
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, configForWait(config, options.wait), async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
-    const { thread } = await adapter.read(threadId);
-    const request = selectRequest(thread, "approval", options.requestId);
+    // A request's details live in its timeline item, which a bounded window can leave out.
+    const { projection } = await adapter.read(threadId);
+    const request = selectRequest(projection, "approval", options.requestId);
+    requireAnswerable(request);
     const offered = request.decisions;
     // Claude treats an "always" decision as a denial unless the request offers it.
     const unsupported =
@@ -527,28 +385,25 @@ export async function respondToApproval(
         { exitCode: 2, details: { requestId: request.requestId, decision: options.decision, offered } },
       );
     }
-    const requestId = request.requestId!;
     const command = {
-      type: "thread.approval.respond",
+      type: "runtime-request.respond",
       commandId: randomUUID(),
       threadId,
-      requestId,
+      requestId: request.requestId,
       decision: options.decision,
-      createdAt: new Date().toISOString(),
     };
-    const before = activityIds(thread);
-    const dispatch = await adapter.dispatchControl(command);
-    const resolution = await awaitResolution(adapter, threadId, requestId, before, "approval");
+    const dispatch = await adapter.dispatch(command);
+    const resolved = await awaitResolution(adapter, threadId, request.requestId);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
-      thread: { id: thread.id, projectId: thread.projectId, title: thread.title },
+      thread: { id: projection.thread.id, projectId: projection.thread.projectId, title: projection.thread.title },
       request,
       decision: options.decision,
       command,
       dispatch,
-      verification: { resolved: true, activityId: resolution.id ?? null },
-      ...(await waitAfterResponse(adapter, threadId, requestId, options.wait)),
+      verification: { resolved: true, resolvedAt: resolved.resolvedAt },
+      ...(await waitAfterResponse(adapter, threadId, request.requestId, options.wait)),
     };
   });
 }
@@ -597,11 +452,10 @@ export function resolveAnswers(request: PendingRequest, rawAnswers: readonly str
         (candidate.value !== null && candidate.value.toLowerCase() === trimmed.toLowerCase()),
     );
     if (!option && question.choices.length > 0 && !question.allowCustomAnswer) {
-      throw new CliError(
-        "INVALID_ANSWER",
-        `Question ${index + 1} takes one of: ${question.options.join(", ")}.`,
-        { exitCode: 2, details: { question: question.question, answer: value } },
-      );
+      throw new CliError("INVALID_ANSWER", `Question ${index + 1} takes one of: ${question.options.join(", ")}.`, {
+        exitCode: 2,
+        details: { question: question.question, answer: value },
+      });
     }
     if (!trimmed) {
       throw new CliError("INVALID_ANSWER", `The answer to question ${index + 1} is empty.`, { exitCode: 2 });
@@ -618,7 +472,7 @@ export function resolveAnswers(request: PendingRequest, rawAnswers: readonly str
         details: { question: question.question },
       });
     }
-    // Message-mode questions take one string each; T3 rejects arrays for them.
+    // Message-mode questions take one string each.
     if (values.length > 1 && (!question.multiSelect || request.responseMode === "message")) {
       throw new CliError("INVALID_ANSWER", `Question ${index + 1} takes a single answer.`, { exitCode: 2 });
     }
@@ -639,41 +493,54 @@ export async function answerThread(
   const runtime = await discoverRuntime(config, { startDesktopIfNeeded: false });
   return await withT3Api(runtime, configForWait(config, options.wait), async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
-    const { thread } = await adapter.read(threadId);
-    const request = selectRequest(thread, "user-input", options.requestId);
-    const requestId = request.requestId;
-    if (requestId === null) {
-      throw new CliError("THREAD_REQUEST_NOT_FOUND", "The pending question has no request id to answer.", { exitCode: 3 });
-    }
-    if (options.dismiss && request.responseMode !== "message") {
+    const { projection } = await adapter.read(threadId);
+    const request = selectRequest(projection, "user-input", options.requestId);
+    // A live session waits on its question; dismissing it would leave the turn hanging.
+    if (options.dismiss && request.blocking && request.answerable) {
       throw new CliError(
         "DISMISS_UNSUPPORTED",
-        "Only questions that outlive their turn can be dismissed. Answer this one, or interrupt the turn.",
-        { exitCode: 2, details: { requestId } },
+        "A running turn waits on this question. Answer it, or interrupt the turn.",
+        { exitCode: 2, details: { requestId: request.requestId } },
       );
     }
+    if (!options.dismiss) requireAnswerable(request);
     const answers = options.dismiss ? null : resolveAnswers(request, options.answers ?? []);
-    const createdAt = new Date().toISOString();
     const command = answers
-      ? { type: "thread.user-input.respond", commandId: randomUUID(), threadId, requestId, answers, createdAt }
-      : { type: "thread.user-input.dismiss", commandId: randomUUID(), threadId, requestId, createdAt };
-    const before = activityIds(thread);
-    const dispatch = await adapter.dispatchControl(command);
-    const resolution = await awaitResolution(adapter, threadId, requestId, before, "user-input");
-    // T3 sends an answer to a message-mode question as a new turn with this message id.
-    const answerMessageId = answers && request.responseMode === "message" ? `async-answer:${requestId}` : undefined;
+      ? { type: "runtime-request.respond", commandId: randomUUID(), threadId, requestId: request.requestId, answers }
+      : { type: "thread.user-input.dismiss", commandId: randomUUID(), threadId, requestId: request.requestId };
+    const dispatch = await adapter.dispatch(command);
+    const resolved = options.dismiss
+      ? await adapter.poll(threadId, (candidate) => {
+          const current = candidate.runtimeRequests.find((other) => other.id === request.requestId);
+          return current && current.status !== "pending" ? current : null;
+        }, RESPONSE_TIMEOUT_MS).then((outcome) => {
+          if (!outcome.value) {
+            throw new CliError("THREAD_RESPONSE_NOT_VERIFIED", `T3 did not confirm dismissing request ${request.requestId}.`, {
+              exitCode: 5,
+              details: { threadId, requestId: request.requestId },
+            });
+          }
+          return outcome.value;
+        })
+      : await awaitResolution(adapter, threadId, request.requestId);
     return {
       runtime,
       auth: { source: invocation.source, version: invocation.version },
-      thread: { id: thread.id, projectId: thread.projectId, title: thread.title, status: threadStatus(thread) },
+      thread: {
+        id: projection.thread.id,
+        projectId: projection.thread.projectId,
+        title: projection.thread.title,
+        status: threadStatus(projection.thread),
+      },
       request,
       dismissed: options.dismiss === true,
       answers,
-      ...(answerMessageId ? { answerMessageId } : {}),
+      // T3 sends an answer to a message-mode question to the thread as a new turn.
+      startsTurn: answers !== null && request.responseMode === "message",
       command,
       dispatch,
-      verification: { resolved: true, activityId: resolution.id ?? null },
-      ...(await waitAfterResponse(adapter, threadId, requestId, options.dismiss ? undefined : options.wait, answerMessageId)),
+      verification: { resolved: true, status: resolved.status, resolvedAt: resolved.resolvedAt },
+      ...(await waitAfterResponse(adapter, threadId, request.requestId, options.dismiss ? undefined : options.wait)),
     };
   });
 }

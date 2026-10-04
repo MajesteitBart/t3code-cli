@@ -2,11 +2,22 @@ import { CliError } from "./errors.js";
 import { readResponseText, withHttpResponse } from "./http.js";
 import { resolveT3Invocation, runProcess, type T3Invocation } from "./process.js";
 import { resolveT3Home } from "./runtime.js";
-import type { CliConfig, OrchestrationSnapshot, T3Runtime } from "./types.js";
+import {
+  ORCHESTRATION_PROTOCOL_HEADER,
+  ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+  ORCHESTRATION_PROTOCOL_VERSION,
+  type CliConfig,
+  type T3Project,
+  type T3Runtime,
+  type T3ShellSnapshot,
+  type ThreadDetailSnapshot,
+} from "./types.js";
 
 const DISPATCH_COMMAND_RPC = "orchestration.dispatchCommand";
-// T3 allows `git worktree add` five minutes; fetching origin and a synchronous setup script come on top.
-const RPC_TIMEOUT_MS = 10 * 60_000;
+const LAUNCH_THREAD_RPC = "orchestration.launchThread";
+const DISPATCH_TIMEOUT_MS = 60_000;
+// T3 allows `git worktree add` five minutes; fetching origin and a setup script come on top.
+const LAUNCH_TIMEOUT_MS = 10 * 60_000;
 
 interface IssuedSession {
   sessionId: string;
@@ -19,23 +30,31 @@ interface RpcCauseReason {
   defect?: unknown;
 }
 
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
 function rpcFailure(tag: string, exit: Record<string, unknown>): CliError {
   const reasons = Array.isArray(exit.cause) ? (exit.cause as RpcCauseReason[]) : [];
-  const failure = reasons.find((reason) => reason._tag === "Fail")?.error as Record<string, unknown> | undefined;
+  const failure = record(reasons.find((reason) => reason._tag === "Fail")?.error);
   const defect = reasons.find((reason) => reason._tag === "Die")?.defect;
-  const message =
-    typeof failure?.message === "string"
-      ? failure.message
-      : typeof defect === "string"
-        ? defect
-        : `T3 rejected ${tag}.`;
+  // Launch errors wrap the reason, such as a failed `git worktree add`, in their cause.
+  const cause = record(failure?.cause);
+  const causeMessage = typeof cause?.message === "string" ? cause.message : null;
+  const base =
+    typeof failure?.detail === "string"
+      ? failure.detail
+      : typeof failure?.message === "string"
+        ? failure.message
+        : typeof defect === "string"
+          ? defect
+          : `T3 rejected ${tag}.`;
+  const message = causeMessage && !base.includes(causeMessage) ? `${base}: ${causeMessage}` : base;
   return new CliError("T3_RPC_FAILED", message, {
     details: {
       rpc: tag,
       ...(typeof failure?._tag === "string" ? { errorTag: failure._tag } : {}),
-      ...(typeof failure?.bootstrapThreadDisposition === "string"
-        ? { bootstrapThreadDisposition: failure.bootstrapThreadDisposition }
-        : {}),
+      ...(typeof failure?.commandType === "string" ? { commandType: failure.commandType } : {}),
       cause: exit.cause ?? null,
     },
   });
@@ -108,7 +127,12 @@ async function rpcRequest(url: URL, tag: string, payload: unknown, timeoutMs: nu
   });
 }
 
+function invocationEnv(invocation: T3Invocation): NodeJS.ProcessEnv | undefined {
+  return invocation.env ? { ...process.env, ...invocation.env } : undefined;
+}
+
 async function issueSession(invocation: T3Invocation, config: CliConfig): Promise<IssuedSession> {
+  const env = invocationEnv(invocation);
   const result = await runProcess(
     invocation.command,
     [
@@ -126,7 +150,7 @@ async function issueSession(invocation: T3Invocation, config: CliConfig): Promis
       "--base-dir",
       resolveT3Home(config),
     ],
-    { timeoutMs: 90_000 },
+    { timeoutMs: 180_000, ...(env ? { env } : {}) },
   );
   try {
     const issued = JSON.parse(result.stdout) as Partial<IssuedSession>;
@@ -139,24 +163,39 @@ async function issueSession(invocation: T3Invocation, config: CliConfig): Promis
   }
 }
 
-async function revokeSession(
-  invocation: T3Invocation,
-  config: CliConfig,
-  sessionId: string,
-): Promise<void> {
+async function revokeSession(invocation: T3Invocation, config: CliConfig, sessionId: string): Promise<void> {
+  const env = invocationEnv(invocation);
   await runProcess(
     invocation.command,
-    [
-      ...invocation.argsPrefix,
-      "auth",
-      "session",
-      "revoke",
-      sessionId,
-      "--base-dir",
-      resolveT3Home(config),
-    ],
-    { timeoutMs: 90_000, allowFailure: true },
+    [...invocation.argsPrefix, "auth", "session", "revoke", sessionId, "--base-dir", resolveT3Home(config)],
+    { timeoutMs: 90_000, allowFailure: true, ...(env ? { env } : {}) },
   ).catch(() => undefined);
+}
+
+function asShellSnapshot(value: unknown): T3ShellSnapshot {
+  const snapshot = record(value);
+  if (!snapshot || !Array.isArray(snapshot.threads) || !Array.isArray(snapshot.projects)) {
+    throw new CliError("T3_INVALID_SNAPSHOT", "T3 returned an invalid shell snapshot.");
+  }
+  return {
+    snapshotSequence: typeof snapshot.snapshotSequence === "number" ? snapshot.snapshotSequence : 0,
+    projects: snapshot.projects as T3Project[],
+    threads: snapshot.threads as T3ShellSnapshot["threads"],
+    archivedThreads: Array.isArray(snapshot.archivedThreads)
+      ? (snapshot.archivedThreads as T3ShellSnapshot["archivedThreads"])
+      : [],
+  };
+}
+
+function asThreadDetail(value: unknown): ThreadDetailSnapshot | null {
+  const snapshot = record(value);
+  const projection = record(snapshot?.projection);
+  const thread = record(projection?.thread);
+  if (typeof snapshot?.snapshotSequence !== "number" || !projection || typeof thread?.id !== "string") return null;
+  for (const key of ["runs", "runtimeRequests", "messages", "turnItems"]) {
+    if (!Array.isArray(projection[key])) projection[key] = [];
+  }
+  return snapshot as unknown as ThreadDetailSnapshot;
 }
 
 export class T3Api {
@@ -176,6 +215,8 @@ export class T3Api {
         method,
         headers: {
           authorization: `Bearer ${this.token}`,
+          // Orchestration routes reject requests that do not name the protocol; others ignore it.
+          [ORCHESTRATION_PROTOCOL_HEADER]: String(ORCHESTRATION_PROTOCOL_VERSION),
           ...(payload === undefined ? {} : { "content-type": "application/json" }),
         },
         signal: AbortSignal.timeout(30_000),
@@ -204,28 +245,69 @@ export class T3Api {
     return body;
   }
 
-  async snapshot(): Promise<OrchestrationSnapshot> {
-    return (await this.request("GET", "/api/orchestration/snapshot")) as OrchestrationSnapshot;
-  }
-
-  async shellSnapshot(): Promise<OrchestrationSnapshot> {
-    return (await this.request("GET", "/api/orchestration/shell")) as OrchestrationSnapshot;
-  }
-
-  async dispatch(command: unknown): Promise<unknown> {
-    return await this.request("POST", "/api/orchestration/dispatch", command);
+  /** Every active and archived thread with a summary of its live work, plus the projects. */
+  async shellSnapshot(): Promise<T3ShellSnapshot> {
+    return asShellSnapshot(await this.request("GET", "/api/orchestration/shell"));
   }
 
   /**
-   * T3 only runs `thread.turn.start` bootstraps (thread creation plus worktree preparation) for
-   * WebSocket RPC clients. Its HTTP dispatch route passes the command straight to the engine,
-   * which rejects the turn because the thread does not exist yet.
+   * One thread's projection: runs, runtime requests, messages, and timeline items. `bounded` reads a
+   * recent window, which keeps polling cheap on long threads; its runs and requests stay complete.
    */
-  async dispatchOverWebSocket(command: unknown): Promise<unknown> {
-    return await this.rpc(DISPATCH_COMMAND_RPC, command, RPC_TIMEOUT_MS);
+  async threadDetail(threadId: string, options: { bounded?: boolean } = {}): Promise<ThreadDetailSnapshot> {
+    const base = `/api/orchestration/threads/${encodeURIComponent(threadId)}`;
+    let value: unknown;
+    try {
+      value = await this.request("GET", options.bounded ? `${base}/bounded` : base);
+    } catch (cause) {
+      const status = cause instanceof CliError ? (cause.details as { status?: unknown } | undefined)?.status : undefined;
+      if (status === 404) {
+        throw new CliError("THREAD_NOT_FOUND", `No T3 Code thread exists with id ${threadId}.`, {
+          exitCode: 3,
+          details: { threadId },
+        });
+      }
+      throw cause;
+    }
+    const detail = asThreadDetail(value);
+    if (!detail) throw new CliError("T3_INVALID_SNAPSHOT", `T3 returned an invalid projection for thread ${threadId}.`);
+    return detail;
   }
 
-  /** Calls a WebSocket-only T3 RPC, such as `server.getConfig`, with a short-lived ticket. */
+  async projects(): Promise<T3Project[]> {
+    const value = record(await this.request("GET", "/api/projects"));
+    if (!value || !Array.isArray(value.projects)) {
+      throw new CliError("T3_INVALID_SNAPSHOT", "T3 returned a project list without projects.");
+    }
+    return (value.projects as T3Project[]).filter((project) => project.deletedAt == null);
+  }
+
+  async mutateProject(mutation: { type: string; [key: string]: unknown }): Promise<unknown> {
+    return await this.request("POST", "/api/projects/mutate", mutation);
+  }
+
+  /** Dispatches one orchestration V2 command and returns T3's event sequence for it. */
+  async dispatchCommand(command: { type: string; commandId: string; [key: string]: unknown }): Promise<{ sequence: number }> {
+    const result = record(await this.rpc(DISPATCH_COMMAND_RPC, command, DISPATCH_TIMEOUT_MS));
+    if (typeof result?.sequence !== "number") {
+      throw new CliError("T3_INVALID_DISPATCH", `T3 did not return an event sequence for ${command.type}.`);
+    }
+    return { sequence: result.sequence };
+  }
+
+  /**
+   * Creates a thread, prepares its workspace, and starts its first message in one durable call. T3
+   * records the launch under `commandId`, so a retry with the same id resumes it instead of repeating it.
+   */
+  async launchThread(input: Record<string, unknown>): Promise<{ threadId: string; resumed: boolean; projection: unknown }> {
+    const result = record(await this.rpc(LAUNCH_THREAD_RPC, input, LAUNCH_TIMEOUT_MS));
+    if (typeof result?.threadId !== "string") {
+      throw new CliError("T3_INVALID_DISPATCH", "T3 did not return the launched thread.");
+    }
+    return { threadId: result.threadId, resumed: result.resumed === true, projection: result.projection ?? null };
+  }
+
+  /** Calls a WebSocket RPC, such as `server.getConfig`, with a short-lived ticket. */
   async rpc(tag: string, payload: unknown, timeoutMs = 30_000): Promise<unknown> {
     const issued = (await this.request("POST", "/api/auth/websocket-ticket")) as { ticket?: unknown } | null;
     if (typeof issued?.ticket !== "string" || issued.ticket.length === 0) {
@@ -234,6 +316,7 @@ export class T3Api {
     const url = new URL("/ws", this.runtime.origin);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("wsTicket", issued.ticket);
+    url.searchParams.set(ORCHESTRATION_PROTOCOL_QUERY_PARAM, String(ORCHESTRATION_PROTOCOL_VERSION));
     return await rpcRequest(url, tag, payload, timeoutMs);
   }
 }
@@ -243,7 +326,7 @@ export async function withT3Api<T>(
   config: CliConfig,
   run: (api: T3Api, invocation: T3Invocation) => Promise<T>,
 ): Promise<T> {
-  const invocation = await resolveT3Invocation(config.t3Command);
+  const invocation = await resolveT3Invocation(config.t3Command, runtime.serverVersion, runtime.runtimeStatePath);
   const session = await issueSession(invocation, config);
   try {
     return await run(new T3Api(runtime, session.token), invocation);

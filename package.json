@@ -1,10 +1,11 @@
 {
   "name": "@bvdm/t3code-cli",
-  "version": "0.2.0",
-  "description": "Manage T3 Code projects, handover threads, and cross-thread messages.",
+  "version": "0.3.0",
+  "description": "Manage T3 Code projects, handover threads, and cross-thread messages. Requires a T3 Code build with orchestrator V2; for older T3 builds, install @bvdm/t3code-cli@0.2.",
   "license": "MIT",
   "keywords": [
     "t3-code",
+    "orchestrator-v2",
     "cli",
     "handover",
     "codex",
@@ -45,8 +46,7 @@
     "node": "^22.16 || ^23.11 || >=24.10"
   },
   "dependencies": {
-    "commander": "^14.0.1",
-    "t3": "0.0.28"
+    "commander": "^14.0.1"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
