@@ -1,6 +1,6 @@
 {
   "name": "@bvdm/t3code-cli",
-  "version": "0.3.0-beta.2",
+  "version": "0.3.0",
   "description": "Manage T3 Code projects, handover threads, and cross-thread messages. Requires a T3 Code build with orchestrator V2; for older T3 builds, install @bvdm/t3code-cli@0.2.",
   "license": "MIT",
   "keywords": [
