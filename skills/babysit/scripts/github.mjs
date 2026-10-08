@@ -199,10 +199,11 @@ function normalizeReview(node) {
 
 /**
  * The priority badge a Codex review comment opens with, such as `![P2 Badge](…)`: P0 to P3, or null.
- * Only this token is kept, never the text around it.
+ * Only an opening badge counts, inside the bold and `<sub>` wrappers Codex puts around it. A badge quoted
+ * in prose, a blockquote, or code does not rate the finding. Only this token is kept, never the text around it.
  */
 export function reviewSeverity(body) {
-  const match = /!\[(P[0-3]) Badge\]/u.exec(String(body ?? "").slice(0, 300));
+  const match = /^\s*(?:(?:\*\*|__|<(?:sub|sup|b|strong)>)\s*)*!\[(P[0-3]) Badge\]\(/u.exec(String(body ?? ""));
   return match ? match[1] : null;
 }
 

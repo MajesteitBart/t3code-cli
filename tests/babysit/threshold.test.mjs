@@ -27,6 +27,14 @@ describe("reviewSeverity", () => {
     // A badge buried deep in a reply is not the finding's rating.
     expect(reviewSeverity(`${"x".repeat(400)} ![P0 Badge](x)`)).toBeNull();
   });
+
+  it("ignores a badge quoted in prose, a blockquote, or code", () => {
+    expect(reviewSeverity("Example: `![P2 Badge](x)` marks a P2 finding.")).toBeNull();
+    expect(reviewSeverity("See ![P3 Badge](x) above.")).toBeNull();
+    expect(reviewSeverity("> ![P2 Badge](x) quoted from another thread")).toBeNull();
+    expect(reviewSeverity("`![P2 Badge](x)`")).toBeNull();
+    expect(reviewSeverity("```md\n![P3 Badge](x)\n```")).toBeNull();
+  });
 });
 
 describe("classify", () => {
@@ -77,6 +85,22 @@ describe("classify", () => {
 
     expect(inspection.readiness).toBe("ready");
     expect(inspection.findings.discharged).toMatchObject([{ threadId: "thread-1", decision: "deferred", severity: "P2" }]);
+  });
+
+  it("reopens a deferral that the current reviewer policy no longer allows", () => {
+    const open = rated("thread-1", "P2");
+    const policy = { ...watchState().policy, codeReviewers: ["other-reviewer"] };
+    const deferred = (overrides) => ({ decision: "deferred", evidence: "Follow-up in #14.", threadVersion: threadVersion(open), at: "2026-10-07T09:56:00Z", ...overrides });
+
+    // The P2 is unrated once its author is no longer a configured reviewer.
+    const unapproved = classify(snapshot({ threads: [open] }), watchState({ policy, findingDecisions: { "thread-1": deferred({ severity: "P2" }) } }));
+    expect(unapproved.reasons).toContainEqual(expect.objectContaining({ code: "FINDING_REOPENED", detail: "unrated src/app.ts:12" }));
+
+    // The user's approval covers the severity they approved, not another one.
+    const p1 = rated("thread-1", "P1");
+    const approvedP1 = deferred({ severity: "P1", userApproved: true, threadVersion: threadVersion(p1) });
+    expect(classify(snapshot({ threads: [p1] }), watchState({ findingDecisions: { "thread-1": approvedP1 } })).readiness).toBe("ready");
+    expect(codes(classify(snapshot({ threads: [p1] }), watchState({ policy, findingDecisions: { "thread-1": approvedP1 } })))).toContain("FINDING_REOPENED");
   });
 
   it("counts one review round per commit the reviewer reviewed", () => {
@@ -170,6 +194,23 @@ describe("decide --decision deferred", () => {
   it("refuses to defer a badge quoted by someone other than the reviewer", async () => {
     await setup([thread({ id: "thread-1", comments: [comment({ id: "thread-1-c1", author: "some-human", severity: "P3" })] })]);
 
+    expect((await h.run(["decide", ...PR, "--finding", "thread-1", "--decision", "deferred", "--evidence", "Later."])).error.code).toBe("DEFERRAL_NEEDS_USER");
+  });
+
+  it("refuses to defer a reviewer comment that only quotes a badge", async () => {
+    await setup([rated("thread-1", reviewSeverity("Example: `![P2 Badge](x)` marks a P2 finding."))]);
+
+    expect((await h.run(["decide", ...PR, "--finding", "thread-1", "--decision", "deferred", "--evidence", "Later."])).error.code).toBe("DEFERRAL_NEEDS_USER");
+  });
+
+  it("reopens a deferral when init changes the reviewer, and then needs approval to defer", async () => {
+    await setup([rated("thread-1", "P2")]);
+    expect((await h.run(["decide", ...PR, "--finding", "thread-1", "--decision", "deferred", "--evidence", "Follow-up in #14."])).code).toBe(0);
+    expect((await h.run(["inspect", ...PR])).data.inspection.readiness).toBe("ready");
+
+    expect((await h.run(["init", ...PR, "--code-reviewer", "other-reviewer", "--thread", "thread-a", "--wake-settled"])).code).toBe(0);
+    const inspection = (await h.run(["inspect", ...PR])).data.inspection;
+    expect(inspection.reasons).toContainEqual(expect.objectContaining({ code: "FINDING_REOPENED", detail: "unrated src/app.ts:12" }));
     expect((await h.run(["decide", ...PR, "--finding", "thread-1", "--decision", "deferred", "--evidence", "Later."])).error.code).toBe("DEFERRAL_NEEDS_USER");
   });
 

@@ -44,6 +44,15 @@ export function findingSeverity(thread, policy) {
   return first && reviewers.has(loginKey(first.author)) ? (first.severity ?? null) : null;
 }
 
+/**
+ * Whether a recorded deferral would still be allowed at the finding's current severity. A policy or badge
+ * change can make a deferred P2 unrated or P1; the deferral then needs the user's approval for that severity.
+ */
+function deferralHolds(decision, severity) {
+  if (decision.decision !== "deferred" || DEFERRABLE_SEVERITIES.has(severity)) return true;
+  return decision.userApproved === true && (decision.severity ?? null) === severity;
+}
+
 /** pass, fail, skipped, pending, or unknown. Anything not finished is pending, never complete. */
 export function checkOutcome(check) {
   if (check.kind === "status") {
@@ -317,7 +326,8 @@ export function classify(snapshot, state) {
   // One round per commit the reviewer submitted a review for.
   const rounds = new Set(reviewerReviews.map((review) => review.commitSha).filter(Boolean)).size;
 
-  // Findings: every unresolved thread blocks until a decision (fixed, refuted, or deferred) matches its current content.
+  // Findings: every unresolved thread blocks until a decision (fixed, refuted, or deferred) matches its current content,
+  // and a deferral also its current severity.
   const decisions = state.findingDecisions ?? {};
   const open = [];
   const discharged = [];
@@ -338,7 +348,7 @@ export function classify(snapshot, state) {
       version,
     };
     const decision = decisions[thread.id];
-    if (decision && !decision.invalidatedAt && decision.isResolved !== true && decision.threadVersion === version) {
+    if (decision && !decision.invalidatedAt && decision.isResolved !== true && decision.threadVersion === version && deferralHolds(decision, entry.severity)) {
       discharged.push({ ...entry, decision: decision.decision, evidence: decision.evidence, commit: decision.commit ?? null });
     } else {
       open.push({ ...entry, reopened: Boolean(decision) });

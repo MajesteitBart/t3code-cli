@@ -12,7 +12,7 @@ Readiness is an aid to final verification, never merge authorization. A submitte
 
 Each open finding carries `severity`, read from the Codex priority badge (`P0` to `P3`) on the thread's first comment. It is null when there is no badge or when someone other than a configured reviewer opened the thread. The helper keeps that token and no other comment text. Reason details start with the severity, such as `P2 src/app.ts:12`.
 
-`decide --decision deferred` discharges a finding without a code change, so it stops blocking readiness. It accepts several `--finding` ids at once and records all or none. It works on its own for P2 and P3. For P0, P1, and unrated findings it also needs `--user-approved`, which is recorded as `userApproved` on those findings only. The helper cannot verify the approval; pass the flag only after the user gave it.
+`decide --decision deferred` discharges a finding without a code change, so it stops blocking readiness. It accepts several `--finding` ids at once and records all or none. It works on its own for P2 and P3. For P0, P1, and unrated findings it also needs `--user-approved`, which is recorded as `userApproved` on those findings only. The helper cannot verify the approval; pass the flag only after the user gave it. A deferral reopens when the finding's severity changes to one it was not allowed for, such as a P2 that becomes unrated after `init` changes the reviewer.
 
 `codeReview.rounds` counts the commits the configured reviewer submitted a review for. A clean pass that Codex reports only as a comment or reaction is not counted. The skill's round budget uses it. `next` lists actions for reasons agents tend to stall on, such as requesting a review of a repaired head.
 
