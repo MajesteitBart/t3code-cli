@@ -1,0 +1,4 @@
+interface:
+  display_name: "Babysit"
+  short_description: "Own PR reviews, repairs, and verified merge"
+  default_prompt: "$babysit"

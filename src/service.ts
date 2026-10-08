@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -9,7 +9,7 @@ import { readLocalProjects } from "./localProjects.js";
 import { applyModelOverrides } from "./modelSelection.js";
 import { openThread } from "./open.js";
 import { discoverRuntime } from "./runtime.js";
-import { createdBy, T3ThreadApi, type ThreadRead } from "./threadApi.js";
+import { createdBy, runForMessage, T3ThreadApi, type ThreadRead } from "./threadApi.js";
 import { changeSettingsWithApi, hasSettingsChange, settingsSummary, type ThreadSettingsChange } from "./threadControls.js";
 import {
   configForWait,
@@ -94,6 +94,10 @@ export type IfBusy = "refuse" | "reject" | "queue" | "steer" | "inject" | "resta
 export interface ThreadSendOptions {
   threadId: string;
   prompt: string;
+  /** Retry this exact thread/key/text combination without delivering another message. */
+  idempotencyKey?: string;
+  /** Background callers can refuse to launch the desktop when T3 is unavailable. */
+  startDesktop?: boolean;
   wakeSettled?: boolean;
   confirmSettled?: (thread: { id: string; title: string; settledAt?: string | null }, project: T3Project | null) => Promise<boolean>;
   /** Wait for the turn that handles the message and return its reply. */
@@ -557,17 +561,60 @@ async function confirmWake(
   }
 }
 
+/** Content-bound identifiers: T3 receipts do not compare payloads when replaying a command. */
+export function deterministicSendIds(threadId: string, key: string, text: string) {
+  const textHash = createHash("sha256").update(text, "utf8").digest("hex");
+  const uuid = (label: string) => {
+    const bytes = createHash("sha256").update(["t3code-cli/threads-send/v1", label, threadId, key, textHash].join("\0"), "utf8").digest().subarray(0, 16);
+    bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const hex = bytes.toString("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+  return { commandId: uuid("command"), messageId: uuid("message") };
+}
+
 export async function sendThreadMessage(config: CliConfig, options: ThreadSendOptions) {
   const threadId = requireThreadId(options.threadId);
-  const prompt = options.prompt.trim();
-  if (!prompt) {
+  // Idempotent sends preserve the bytes that determine their identifiers.
+  const prompt = options.idempotencyKey === undefined ? options.prompt.trim() : options.prompt;
+  if (!prompt.trim()) {
     throw new CliError("PROMPT_REQUIRED", "A non-empty thread message is required.", { exitCode: 2 });
   }
+  if (options.idempotencyKey !== undefined) {
+    if (!/^[A-Za-z0-9._:-]{1,200}$/u.test(options.idempotencyKey)) {
+      throw new CliError("IDEMPOTENCY_KEY_INVALID", "--idempotency-key must contain 1–200 letters, digits, dots, underscores, colons, or hyphens.", { exitCode: 2 });
+    }
+    if (hasSettingsChange(options.settings) || ["steer", "inject", "restart"].includes(options.ifBusy ?? "refuse")) {
+      throw new CliError("IDEMPOTENCY_KEY_UNSUPPORTED_OPTIONS", "Idempotent sends support refuse or queue without changing thread settings.", { exitCode: 2 });
+    }
+  }
+  const ids = options.idempotencyKey === undefined
+    ? { commandId: randomUUID(), messageId: randomUUID() }
+    : deterministicSendIds(threadId, options.idempotencyKey, prompt);
 
-  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: true });
+  const runtime = await discoverRuntime(config, { startDesktopIfNeeded: options.startDesktop !== false });
   return await withT3Api(runtime, configForWait(config, options.wait), async (api, invocation) => {
     const adapter = new T3ThreadApi(api);
     let read = await adapter.inspect(threadId);
+    if (options.idempotencyKey !== undefined && (
+      runForMessage(read.projection, ids.messageId) || read.projection.messages.some((message) => message.id === ids.messageId)
+    )) {
+      const run = runForMessage(read.projection, ids.messageId);
+      const waited = options.wait ? await adapter.waitForTurn(threadId, { messageId: ids.messageId, timeoutMs: options.wait.timeoutMs }) : null;
+      return {
+        runtime, auth: { source: invocation.source, version: invocation.version },
+        project: await projectById(api, read.projection.thread.projectId),
+        thread: { id: threadId, projectId: read.projection.thread.projectId, title: read.projection.thread.title, statusBeforeSend: threadStatus(read.projection.thread) },
+        message: { messageId: ids.messageId, textLength: prompt.length, delivery: "already_delivered" },
+        command: { type: "message.dispatch", commandId: ids.commandId, threadId, dispatchMode: null },
+        dispatch: null,
+        settings: undefined,
+        verification: { accepted: true as const, method: "message-id" as const, messageId: ids.messageId, dispatchSequence: read.snapshotSequence, runId: run?.id ?? null, runStatus: run?.status ?? null },
+        idempotency: { key: options.idempotencyKey, ...ids, deduplicated: "projection" as const },
+        ...(waited && options.wait ? waitView(waited, options.wait, [ids.messageId]) : {}),
+      };
+    }
     requireWritable(read, "receive a new message");
     const thread = read.projection.thread;
     const project = await projectById(api, thread.projectId);
@@ -580,10 +627,10 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
       : null;
     if (settings) read = { ...read, projection: settings.projection };
     const dispatchMode = dispatchModeFor(read.projection, options.ifBusy ?? "refuse");
-    const messageId = randomUUID();
+    const messageId = ids.messageId;
     const command = {
       type: "message.dispatch",
-      commandId: randomUUID(),
+      commandId: ids.commandId,
       threadId,
       messageId,
       text: prompt,
@@ -626,6 +673,7 @@ export async function sendThreadMessage(config: CliConfig, options: ThreadSendOp
       command: { type: command.type, commandId: command.commandId, threadId, dispatchMode },
       dispatch,
       verification,
+      ...(options.idempotencyKey !== undefined ? { idempotency: { key: options.idempotencyKey, ...ids, deduplicated: "unknown" as const } } : {}),
       ...(waited && options.wait ? waitView(waited, options.wait, [messageId]) : {}),
     };
   });

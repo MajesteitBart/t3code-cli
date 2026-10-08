@@ -156,6 +156,19 @@ t3code models list --provider codex
 
 ## Existing threads
 
+### Shared PR babysitting helper
+
+The bundled helper gathers GitHub evidence, stores resumable state, and delivers change events through the same thread-message transport:
+
+```bash
+t3code babysit init --pr <PR-URL> --code-reviewer 'chatgpt-codex-connector'
+t3code babysit inspect --pr <PR-URL>
+t3code babysit status --pr <PR-URL>
+t3code babysit --help
+```
+
+Use the [babysit skill](skills/babysit/SKILL.md) for the commit-to-merge workflow and [helper reference](skills/babysit/references/helper.md) for evidence and delivery rules. The helper does not merge, post review requests, or register OS schedules. In T3, prefer its native PR watch; fallback `tick` runs through an OS schedule and only calls an agent when there is news. `wait` is limited to the active session. Delivery and handled-work acknowledgment remain separate.
+
 T3 thread ids are UUIDs, or ids that start with `thread:` when T3 minted them itself. Always pass the exact id.
 
 List threads across projects, or restrict discovery by project id or workspace:
@@ -216,6 +229,19 @@ printf '%s' "New findings that require more work..." \
 ```
 
 The send command does not report success from the dispatch alone. It waits until T3 records the exact message. Archived threads are rejected.
+
+For background event delivery, add an idempotency key and keep the exact message text unchanged on retries:
+
+```bash
+t3code --json threads send --thread <thread-id> --stdin \
+  --if-busy queue --idempotency-key <event-id> --no-start-desktop
+```
+
+Identifiers bind the thread, key, and exact text. Retrying the same combination reuses T3's durable command receipt or finds the message in the thread projection. Changing text, including whitespace, creates a different message even with the same key. Persist the rendered message before sending. Receipt replay does not establish that an agent completed the requested work; acknowledge handled events separately.
+
+Keys accept 1–200 letters, digits, dots, underscores, colons, and hyphens. Idempotent sends support `refuse` or `queue` (including the `reject` alias), and cannot change thread settings or steer/restart a turn. The normal JSON fields remain; keyed sends add `data.idempotency`. A projection-confirmed retry returns `deduplicated: "projection"`, `data.dispatch: null`, and delivery `already_delivered`. A dispatched send reports `deduplicated: "unknown"`, because T3 does not say whether it replayed a receipt.
+
+`--no-start-desktop` prevents background senders from launching T3 Code when it is unavailable. Settled threads still require the separate `--wake-settled` opt-in. A permanently rejected command must not be retried under a new key automatically; inspect the rejection before explicitly redelivering. At-most-once delivery depends on T3 retaining its receipt or message/run projection; it is not a guarantee across deletion of that history.
 
 A thread is busy while a turn runs or while queued messages wait for their turn. By default `send` refuses a busy thread with `THREAD_BUSY` and dispatches nothing; `error.details` names the running turn and the queue length. Choose another behavior with `--if-busy`:
 

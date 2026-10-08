@@ -55,6 +55,8 @@ export interface FakeT3Options {
   onCommand?: (command: Command, fake: FakeT3) => string | void;
   /** Initialises the git repository the tests work in. */
   gitRepo?: boolean;
+  /** Commit one dispatch, then drop its reply to model an ambiguous transport failure. */
+  loseNextDispatchResponse?: boolean;
 }
 
 export interface FakeT3 {
@@ -516,9 +518,23 @@ export async function startFakeT3(options: FakeT3Options = {}): Promise<FakeT3> 
     };
   };
 
+  const receipts = new Map<string, { threadId: string | undefined; status: "accepted" | "rejected"; sequence: number; error?: string }>();
   const builtInRpc: Record<string, RpcHandler> = {
     "orchestration.dispatchCommand": (payload) => {
-      applyCommand(payload as Command);
+      const command = payload as Command;
+      const receipt = receipts.get(command.commandId);
+      if (receipt) {
+        if (receipt.threadId !== command.threadId) throw new Error("OrchestrationCommandIdConflictError");
+        if (receipt.status === "rejected") throw new Error(`OrchestrationCommandPreviouslyRejectedError: ${receipt.error}`);
+        return { sequence: receipt.sequence };
+      }
+      try {
+        applyCommand(command);
+      } catch (cause) {
+        receipts.set(command.commandId, { threadId: command.threadId, status: "rejected", sequence: fake.sequence, error: String(cause) });
+        throw cause;
+      }
+      receipts.set(command.commandId, { threadId: command.threadId, status: "accepted", sequence: fake.sequence });
       fake.commands.push(payload as Command);
       return { sequence: fake.sequence };
     },
@@ -702,6 +718,11 @@ export async function startFakeT3(options: FakeT3Options = {}): Promise<FakeT3> 
         try {
           if (!handler) throw new Error(`Unknown RPC ${message.tag}.`);
           const value = await handler(message.payload, fake);
+          if (message.tag === "orchestration.dispatchCommand" && options.loseNextDispatchResponse) {
+            options.loseNextDispatchResponse = false;
+            client.terminate();
+            return;
+          }
           client.send(JSON.stringify({ _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value } }));
         } catch (error) {
           const text = error instanceof Error ? error.message : String(error);

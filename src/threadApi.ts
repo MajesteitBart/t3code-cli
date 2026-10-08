@@ -171,7 +171,11 @@ export class T3ThreadApi {
       throw new CliError(
         "THREAD_COMMAND_REJECTED",
         `T3 rejected ${command.type}${command.threadId ? ` for thread ${command.threadId}` : ""}: ${cause.message}`,
-        { exitCode: 4, cause, details: { type: command.type, ...(command.threadId ? { threadId: command.threadId } : {}) } },
+        { exitCode: 4, cause, details: {
+          type: command.type,
+          ...(command.threadId ? { threadId: command.threadId } : {}),
+          ...(cause.details !== null && typeof cause.details === "object" ? cause.details : {}),
+        } },
       );
     }
   }

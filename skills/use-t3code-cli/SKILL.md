@@ -19,6 +19,8 @@ If you run inside a T3 thread, you have T3's own `t3-code` MCP tools. Prefer the
 
 Outside T3, as in a terminal agent, a script, or an app backend, the CLI is the way in.
 
+For retryable event delivery to an existing thread, use `threads send --stdin --thread <id> --if-busy queue --idempotency-key <event-id> --no-start-desktop`. Save the exact message before sending and reuse its bytes and key on ambiguous failures. IDs bind the thread, key, and text; changed text creates a new delivery. Keyed sends cannot change settings or steer/restart. Acceptance is delivery evidence, not acknowledgment that the agent handled the event. Permanently rejected sends require explicit recovery. Do not wake a settled thread unless continuing that thread is authorized (`--wake-settled`).
+
 Approving or declining another thread's requests and changing its permission or plan mode act with the user's authority. Run them only on the user's explicit instruction, never on your own judgment.
 
 ## Verify readiness
