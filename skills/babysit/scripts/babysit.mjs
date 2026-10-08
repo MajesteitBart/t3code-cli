@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { fetchPullRequestSnapshot, ghRunner } from "./github.mjs";
-import { classify, invalidateResolvedDecisions, reviewerReactions, threadVersion } from "./inspect.mjs";
+import { classify, DEFERRABLE_SEVERITIES, findingSeverity, invalidateResolvedDecisions, reviewerReactions, threadVersion } from "./inspect.mjs";
 import { quotePowerShell, quoteShell, scheduleCommands } from "./schedule.mjs";
 import {
   describeLock,
@@ -38,6 +38,7 @@ const RATE_LIMIT_FLOOR = 100;
 const RATE_LIMIT_FALLBACK_MS = 15 * 60_000;
 const WATCHERS = new Set(["t3-native", "os-schedule", "session-wait", "none"]);
 const STOP_REASONS = new Set(["merged", "closed", "cancelled"]);
+const DECISIONS = new Set(["fixed", "refuted", "deferred"]);
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/u;
 
 const OPTIONS = {
@@ -64,8 +65,9 @@ const OPTIONS = {
   watcher: { type: "string" },
   "watcher-id": { type: "string" },
   "cancel-command": { type: "string" },
-  finding: { type: "string" },
+  finding: { type: "string", multiple: true },
   decision: { type: "string" },
+  "user-approved": { type: "boolean" },
   evidence: { type: "string" },
   commit: { type: "string" },
   event: { type: "string", multiple: true },
@@ -82,7 +84,7 @@ const ALLOWED = {
   init: [...COMMON, ...POLICY, "thread", "wake-settled", "t3code-cli", "gh", "task", "cwd", "branch"],
   inspect: [...COMMON, ...POLICY, "gh"],
   record: [...COMMON, "tested", "result", "command", "review-request", "review-evidence", "head", "url", "note", "watcher", "watcher-id", "cancel-command"],
-  decide: [...COMMON, "finding", "decision", "evidence", "commit"],
+  decide: [...COMMON, "finding", "decision", "evidence", "commit", "user-approved"],
   tick: COMMON,
   wait: [...COMMON, "timeout", "interval"],
   ack: [...COMMON, "event", "note"],
@@ -569,8 +571,10 @@ async function record(values, deps, context) {
 }
 
 async function decide(values, deps, context) {
-  const findingId = text(values.finding, "--finding", 300);
-  if (values.decision !== "fixed" && values.decision !== "refuted") throw usage("DECISION_REQUIRED", "--decision must be fixed or refuted.");
+  const findingIds = [...new Set((values.finding ?? []).map((finding) => text(finding, "--finding", 300)))];
+  if (findingIds.length === 0) throw usage("VALUE_REQUIRED", "--finding needs a review thread id.");
+  if (!DECISIONS.has(values.decision)) throw usage("DECISION_REQUIRED", "--decision must be fixed, refuted, or deferred.");
+  if (values["user-approved"] && values.decision !== "deferred") throw usage("INVALID_USAGE", "--user-approved applies only to --decision deferred.");
   const evidence = text(values.evidence, "--evidence", 2000);
   const commit = values.commit === undefined ? null : requireFullSha(values.commit, "--commit");
 
@@ -583,30 +587,49 @@ async function decide(values, deps, context) {
         details: { error: snapshot.error ?? null },
       });
     }
-    const thread = snapshot.pr.threads.find((candidate) => candidate.id === findingId);
-    if (!thread) {
-      throw new BabysitError("FINDING_NOT_FOUND", `${displayRef(context.ref)} has no review thread ${findingId}.`, { exitCode: 3, details: { finding: findingId } });
-    }
+    // Check every thread before recording any, so a batch is all or nothing.
+    const threads = findingIds.map((findingId) => {
+      const thread = snapshot.pr.threads.find((candidate) => candidate.id === findingId);
+      if (!thread) {
+        throw new BabysitError("FINDING_NOT_FOUND", `${displayRef(context.ref)} has no review thread ${findingId}.`, { exitCode: 3, details: { finding: findingId } });
+      }
+      const severity = findingSeverity(thread, state.policy);
+      if (values.decision === "deferred" && !DEFERRABLE_SEVERITIES.has(severity) && !values["user-approved"]) {
+        throw new BabysitError(
+          "DEFERRAL_NEEDS_USER",
+          `Review thread ${findingId} is ${severity ?? "unrated"}. Fix it, refute it, or defer it only after the user approves, with --user-approved.`,
+          { exitCode: 4, details: { finding: findingId, severity } },
+        );
+      }
+      return thread;
+    });
     // The decision covers the thread exactly as it reads now; a later or edited comment reopens it.
     invalidateResolvedDecisions(snapshot, state, iso(deps.now()));
-    const decision = {
-      decision: values.decision,
-      evidence,
-      commit,
-      at: iso(deps.now()),
-      threadVersion: threadVersion(thread),
-      isResolved: thread.isResolved,
-      comments: thread.comments.length,
-      headSha: snapshot.pr.headSha,
-      url: thread.comments[0]?.url ?? null,
-    };
     state.findingDecisions ??= {};
-    state.findingDecisions[findingId] = decision;
+    const findings = threads.map((thread) => {
+      const decision = {
+        decision: values.decision,
+        evidence,
+        commit,
+        severity: findingSeverity(thread, state.policy),
+        // Only findings that needed approval carry it, so the report never claims an approval nobody gave.
+        ...(values["user-approved"] && !DEFERRABLE_SEVERITIES.has(findingSeverity(thread, state.policy)) ? { userApproved: true } : {}),
+        at: iso(deps.now()),
+        threadVersion: threadVersion(thread),
+        isResolved: thread.isResolved,
+        comments: thread.comments.length,
+        headSha: snapshot.pr.headSha,
+        url: thread.comments[0]?.url ?? null,
+      };
+      state.findingDecisions[thread.id] = decision;
+      return { threadId: thread.id, ...decision };
+    });
     await save(context, state, lock, deps);
     return {
       data: {
         statePath: context.statePath,
-        finding: { threadId: findingId, isResolved: thread.isResolved, ...decision },
+        ...(findings.length === 1 ? { finding: findings[0] } : {}),
+        findings,
         note: "Reply in the thread before deciding: any later comment or edit on the thread reopens this finding.",
       },
     };
@@ -899,6 +922,7 @@ export async function main(argv, overrides = {}) {
           "record requires one of --tested, --review-request, --review-evidence, or --watcher. Tests need --result and --command; review evidence needs --head, --url and --note.",
           "wait has a finite timeout. tick sends only changed news and retries ambiguous delivery with the original key and text.",
           "schedule-command prints registration/cancellation commands; it does not start a schedule.",
+          "decide takes one or more --finding ids. --decision deferred works on its own for P2/P3 findings; P0, P1, and unrated findings also need --user-approved.",
           "Delivered events require explicit ack --event. Readiness never authorizes a merge."] };
       const envelope = { ok: true, data };
       deps.stdout(`${JSON.stringify(envelope, null, 2)}\n`);

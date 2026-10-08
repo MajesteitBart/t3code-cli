@@ -16,7 +16,7 @@ node babysit.mjs <command> --pr owner/repo#N [--state-dir DIR] [options]
 | `record --review-request --head SHA --url COMMENT_URL` | Records an `@codex review` request. The URL must point into this PR. |
 | `record --review-evidence --head SHA --url SOURCE --note TEXT` | Records corroborating evidence that the review of that exact head is complete. |
 | `record --watcher t3-native\|os-schedule\|session-wait\|none [--watcher-id ID] [--cancel-command CMD]` | Records how the watch wakes the agent. |
-| `decide --finding THREAD_ID --decision fixed\|refuted --evidence TEXT [--commit SHA]` | Discharges a review thread as it reads now. A later comment or an edit reopens it. |
+| `decide --finding THREAD_ID… --decision fixed\|refuted\|deferred --evidence TEXT [--commit SHA] [--user-approved]` | Discharges review threads as they read now, all or none. A later comment or an edit reopens one. Deferring a P0, P1, or unrated finding also needs `--user-approved`. |
 | `tick` | One scheduled poll. Reads GitHub, creates an event when there is news, and delivers any due event. It never acknowledges an event. |
 | `wait [--timeout 30m] [--interval 60s]` | In-session polling. Prints the next event; printing it counts as delivery. |
 | `ack --event ID… [--note TEXT]` | Marks events handled once the agent has finished the work they called for. |
@@ -33,8 +33,10 @@ node babysit.mjs <command> --pr owner/repo#N [--state-dir DIR] [options]
 - No required check is missing, and none was skipped.
 - The tested SHA is the head.
 - Recorded review evidence names the exact head, and the reviewer has not been active since it was recorded.
-- No unresolved thread lacks a matching decision.
+- No unresolved thread lacks a matching decision. A deferred finding counts as decided.
 - GitHub's merge state is clean.
+
+Open findings report their Codex priority (`P0` to `P3`) as `severity`, null when the thread has no badge or a non-reviewer opened it; only that token is read from comment bodies. `codeReview.rounds` counts the commits the reviewer reviewed, and `next` lists the actions the current reasons call for.
 
 Anything not finished is `pending`. Anything unexplained is `unknown`. A review submitted at the head proves only that a review was submitted. Comments and reactions carry no commit, so they are reported as unbound signals and are never assigned to a head. Readiness is news, not merge approval; skill section 6 still applies.
 

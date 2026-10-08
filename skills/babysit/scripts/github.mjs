@@ -183,6 +183,7 @@ function normalizeContext(node) {
 }
 
 // Bodies are hashed, not kept: edits stay detectable, and no comment text reaches state or wake messages.
+// The one exception is a review comment's priority badge, reduced to P0-P3.
 function normalizeReview(node) {
   return {
     id: node.id,
@@ -196,6 +197,15 @@ function normalizeReview(node) {
   };
 }
 
+/**
+ * The priority badge a Codex review comment opens with, such as `![P2 Badge](…)`: P0 to P3, or null.
+ * Only this token is kept, never the text around it.
+ */
+export function reviewSeverity(body) {
+  const match = /!\[(P[0-3]) Badge\]/u.exec(String(body ?? "").slice(0, 300));
+  return match ? match[1] : null;
+}
+
 function normalizeComment(node) {
   return {
     id: node.id,
@@ -203,6 +213,7 @@ function normalizeComment(node) {
     createdAt: node.createdAt ?? null,
     lastEditedAt: node.lastEditedAt ?? null,
     bodySha256: sha256(node.body ?? ""),
+    severity: reviewSeverity(node.body),
     url: node.url ?? null,
   };
 }

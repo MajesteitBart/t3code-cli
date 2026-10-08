@@ -56,7 +56,7 @@ function lists() {
     contexts: [checkRun("build"), checkRun("test"), { __typename: "StatusContext", id: "status:deploy", context: "deploy", state: "SUCCESS", isRequired: false, targetUrl: null }],
     reviews: [reviewNode("review-1"), reviewNode("review-2"), reviewNode("review-3")],
     threads: [
-      { id: "thread-1", isResolved: false, isOutdated: false, path: "a.ts", line: 3, originalLine: 3, comments: [commentNode("t1-c1"), commentNode("t1-c2"), commentNode("t1-c3")] },
+      { id: "thread-1", isResolved: false, isOutdated: false, path: "a.ts", line: 3, originalLine: 3, comments: [commentNode("t1-c1", { body: "![P1 Badge](https://img.shields.io/badge/P1-orange) body of t1-c1" }), commentNode("t1-c2"), commentNode("t1-c3")] },
       { id: "thread-2", isResolved: true, isOutdated: false, path: "b.ts", line: null, originalLine: 9, comments: [commentNode("t2-c1")] },
       { id: "thread-3", isResolved: true, isOutdated: true, path: "c.ts", line: 1, originalLine: 1, comments: [commentNode("t3-c1")] },
     ],
@@ -142,6 +142,8 @@ describe("fetchPullRequestSnapshot", () => {
     // Bodies are hashed, never kept.
     expect(JSON.stringify(snapshot)).not.toContain("body of");
     expect(snapshot.pr.comments[0].bodySha256).toMatch(/^[0-9a-f]{64}$/u);
+    // Only the priority badge survives from a body.
+    expect(snapshot.pr.threads[0].comments.map((comment) => comment.severity)).toEqual(["P1", null, null]);
     expect(github.calls.map((call) => call.query)).toEqual([
       QUERIES.main,
       QUERIES.contexts,

@@ -5,15 +5,17 @@ description: Commit intended changes, open or update a GitHub PR, and babysit re
 
 # Babysit
 
-Own the requested PR workflow through verified merge. Opening the PR or enabling auto-merge is not completion.
+Own the requested PR workflow through verified merge. Opening the PR or enabling auto-merge is not completion. The goal is a merged PR with no open P0/P1 findings. A review with nothing left to say is not the goal.
 
 ## Scope and authorization
 
 Invoking this skill alone requests the full workflow through verified merge. Infer the target repository, branch or existing PR, and intended changes from the active task, conversation, and working tree. Begin at the first incomplete step. Do not require the user to restate the workflow or add instructions. Ask only when the target or intended scope cannot be determined safely from available context.
 
-This invocation, or a request to commit, create a PR, and babysit until merge, authorizes committing and pushing the intended changes, opening or updating the PR, posting task-related PR comments and review requests, fixing in-scope issues, and merging after all gates pass. Apply the same workflow to an existing PR when asked to babysit it until merge. Respect any narrower scope or explicit stop-before-merge instruction.
+This invocation, or a request to commit, create a PR, and babysit until merge, authorizes committing and pushing the intended changes, opening or updating the PR, posting task-related PR comments and review requests, fixing in-scope issues, deferring non-blocking findings, and merging after all gates pass. When the gates in section 7 pass, merge. Do not ask for merge permission again. Apply the same workflow to an existing PR when asked to babysit it until merge. Respect any narrower scope or explicit stop-before-merge instruction.
 
 Handle routine in-scope repairs without asking for permission again. Escalate missing permissions, required human approvals, legal agreements, paid usage, material scope changes, and decisions that require the user. Never sign a CLA, enable paid review credits, change branch protection, or use administrator bypass. Use another reviewer only if the user authorizes it. Do not spawn subagents unless the user explicitly requests them.
+
+One agent owns the PR branch. Do not let two agents edit it at once. If you delegated work and the delegate stopped without a result, check its state, take the work back, and continue. Do not wait on a delegate that is no longer running.
 
 ## 1. Verify and commit
 
@@ -44,29 +46,42 @@ Use these user-provided settings unless the user updates them:
 
 These settings are expected behavior, not proof that the current repository is connected or that a review has started.
 
-Let the automatic opening review run before requesting another review. Verify actual startup through live GitHub review activity or the review service's task state. If the opening review does not start, check access, configuration, and failure messages. After confirming no review is running or queued, request `@codex review` once if appropriate; repeated comments do not repair missing access or quota.
+Let the automatic opening review run before requesting another review. Verify actual startup through live GitHub review activity or the review service's task state. If the opening review does not start, check access, configuration, and failure messages. After confirming no review is running or queued, request `@codex review` once; repeated comments do not repair missing access or quota.
 
-Wait for the full exhaustive review, including review summaries, inline comments, and review threads. An early summary, completed check, or thumbs-up alone is insufficient while further findings may still arrive. Re-read comments and threads after completion. If the available evidence cannot establish full completion, keep the review gate pending and report the uncertainty; silence or an arbitrary quiet period is not proof.
+Wait for the review to finish, including its summary, inline comments, and threads, then re-read them. An early summary or a thumbs-up without commit metadata is not completion. Bind review evidence to the exact PR head SHA: a clean review of an older commit does not cover a newer head. If the evidence cannot establish completion, keep the review gate pending and say so; silence is not proof.
 
-Associate all review evidence with the exact PR head SHA. Prefer review or task metadata that identifies the reviewed commit. Record the review/task identifiers, URLs, and completion evidence. When a comment or reaction lacks commit metadata, seek corroborating task evidence instead of assigning it to the current head from its timestamp alone. A clean review of an older commit does not approve a newer head.
+`t3code babysit inspect --pr <URL>` gathers the evidence. A submitted review at the head proves submission, not completion, so readiness stays unknown until you record completion: `t3code babysit record --pr <URL> --review-evidence --head <full-SHA> --url <task-URL> --note <completion-evidence>`.
 
-Use `t3code babysit inspect --pr <URL>` for deterministic evidence gathering. A submitted review on the current commit proves submission, not exhaustive completion. The helper deliberately leaves readiness unknown until corroborated completion evidence is recorded. After checking the review service's completed task and reviewed commit, run `t3code babysit record --pr <URL> --review-evidence --head <full-SHA> --url <task-URL> --note <completion-evidence>`. Never record that evidence from silence, an early summary, or an unbound thumbs-up.
+## 4. Triage findings
 
-## 4. Repair and re-review
+Every finding gets one decision: fixed, refuted, or deferred. Whether it blocks the merge depends on its severity. Codex marks each inline finding P0 to P3; `inspect` reports it as `severity`, and only for threads the configured reviewer opened.
+
+| Severity | Blocks merge | What to do |
+| --- | --- | --- |
+| P0, P1 | Yes | Fix it, or refute it with concrete evidence. Defer only with the user's approval. |
+| P2, P3 | No, once deferred | Fix it only when you already push a commit for another reason and the fix is small, in scope, and covered by tests. Otherwise defer it. |
+| Unrated (humans, other bots) | Yes | Fix it, or refute it with evidence the commenter accepts. Defer only with the user's approval. |
+
+Raise a P2/P3 finding to blocking when it is actually a security hole, data loss, or a broken main user journey. Never lower a severity without the user, and never edit a reviewer's comment. Assess each finding against the code before acting; refute false positives instead of changing code blindly.
+
+To defer, post one PR comment that lists the deferred findings with their links, the reason, and where the follow-up lives, such as an issue. Do not reply in each thread. Then run `decide --pr <URL> --finding <thread-ID> [--finding <thread-ID>…] --decision deferred --evidence <reason and follow-up>`. The helper refuses to defer P0, P1, or unrated findings without `--user-approved`. Pass that flag only after the user actually approved the deferral; the helper cannot check it. Record fixes and refutations with `--decision fixed|refuted`. A new or edited comment reopens the finding. Do not resolve a thread only to clear a gate; respect repository rules about who may resolve it.
+
+Never push a commit, and so start another review round, only to fix P2/P3 findings.
+
+## 5. Repair and re-review
 
 - Inspect CI logs, review summaries, inline comments, and unresolved threads. Do not rely on the check rollup alone. Fetch all pages when listing review evidence and discussions.
-- Assess each finding against the code. Fix confirmed issues. Refute false positives with concrete evidence instead of changing code blindly.
-- Address actionable in-scope findings. Block merge on unresolved correctness, security, data-integrity, or required-review issues. Explain deferred non-blocking suggestions and why they do not block this PR. Escalate blocking issues outside the authorized scope.
-- Batch related repairs, add focused regression tests, rerun relevant checks, commit, and push to the same branch. Record the new head SHA and invalidate review evidence for the previous head.
-- Automatic review is configured for PR opening. Do not assume a repair push triggers another review. If no review of the new head is already running or queued, comment `@codex review` once. Record the request comment and head SHA so retries or resumed sessions do not duplicate it.
-- Wait for review and CI on the new head. Repeat until the final head has a completed review and no actionable blocking findings.
-- Do not resolve a thread merely to clear a gate. Record how the finding was fixed or refuted, including the relevant commit or evidence, and respect repository rules about who may resolve it.
+- Batch the round's repairs, add focused regression tests, rerun relevant checks, commit, and push to the same branch. Record `t3code babysit record --pr <URL> --tested <full-SHA> --result pass --command <verification-command>` for the new head.
+- In the same step as the push, request re-review. A repair push does not trigger Codex automatically. If no review of the new head is running or queued, comment `@codex review` once and record it with `record --pr <URL> --review-request --head <full-SHA> --url <request-comment-URL>`. Check saved requests first so resumed sessions do not duplicate it.
+- Run `inspect` after every push and before every yield, and do its `next` actions before you wait.
+- Wait for review and CI on the new head and triage again. The new review of the final head is required; its P2/P3 findings are deferred like any other.
+- Verify repairs with targeted tests. Local reviews, delegated reviews, and second opinions are optional. They never gate a merge, and a repair never needs one before the Codex re-review.
 
-If Codex is rate-limited or unavailable, keep the PR unmerged and report the blocker. Rate limits are not approval. Do not enable paid credits, bypass review, or silently substitute another reviewer. If a reset or recovery time is known, retain the pending gate and resume at that time without repeatedly requesting reviews. A retry after an explicit failure is distinct from duplicating a running or queued review.
+**Round budget.** `inspect` reports `codeReview.rounds`, the number of commits Codex submitted a review for. Repairing the findings of the first three reviews is routine. If the fourth review still raises new P0/P1 findings, do not push again on your own. Send the user the open blocking findings, what the repairs keep breaking, and a recommendation: keep fixing, defer with approval, or split the PR. Continue once they answer.
 
-Record successful local verification with `t3code babysit record --pr <URL> --tested <full-SHA> --result pass --command <verification-command>`. Bind every review request to its commit with `record --pr <URL> --review-request --head <full-SHA> --url <request-comment-URL>`. Check saved requests before posting another one. Use `decide --pr <URL> --finding <thread-ID> --decision fixed|refuted --evidence <explanation>` for assessed findings; a new or edited comment reopens the finding. These records support resumption and do not replace live GitHub verification.
+If Codex is rate-limited or unavailable, keep the PR unmerged and report the blocker. Rate limits are not approval. Do not enable paid credits, bypass review, or silently substitute another reviewer. If a reset time is known, keep the gate pending and resume then without repeating requests. A retry after an explicit failure is distinct from duplicating a running or queued review.
 
-## 5. Babysit actively, with low noise
+## 6. Babysit actively, with low noise
 
 Continue through verified merge or the user's narrower stopping point. A genuine blocker must name the missing gate and preserve resumable state. Do not write custom pollers or create a new conversation to deliver a wakeup.
 
@@ -85,34 +100,36 @@ Add `--thread <exact-T3-thread-ID>` when fallback delivery to the original conve
 
 **Without durable delivery:** use `wait --pr <URL> --timeout <duration>` within the active session. It makes no model call while sleeping. Disclose that this wait ends with the session; it is not durable monitoring.
 
-**On helper-delivered wakes:** run `inspect`, handle the event or record a concrete blocker, then `ack --pr <URL> --event <event-ID> --note <outcome>`. Delivery acceptance is not acknowledgment of handled work. Interrupted work stays unacknowledged in `status` and later wakes; deliberate recovery uses `wake --pr <URL> --redeliver <event-ID>`. Ambiguous delivery retries reuse the persisted text and event key. Rejected sends require diagnosis and explicit redelivery. Never start a second repair loop for the same PR.
+**On helper-delivered wakes:** run `inspect`, handle the event or record a concrete blocker, then `ack --pr <URL> --event <event-ID> --note <outcome>`. Delivery acceptance is not acknowledgment of handled work. Interrupted work stays unacknowledged in `status` and later wakes; deliberate recovery uses `wake --pr <URL> --redeliver <event-ID>`. Never start a second repair loop for the same PR.
 
 Keep unchanged observations silent and send brief updates for material changes. Unknown or incomplete evidence keeps the relevant gate pending. If the helper cannot express a gate, report the missing evidence rather than substituting an ad hoc parser.
 
-## 6. Merge only after final verification
+## 7. Merge only after final verification
 
-Immediately before merging, re-read the live PR state and verify every gate:
+These are the only merge gates. Immediately before merging, re-read the live PR and verify each one:
 
 - The head is the exact commit tested and reviewed.
-- Required checks have passed for the applicable commit or merge candidate. Missing, skipped, or cancelled checks are not automatically passing evidence; establish whether repository policy requires them and whether the applicable checks actually ran.
-- Codex has completed the full review of the final head, and comments and threads have been rechecked after completion.
-- No actionable blocking findings remain.
+- Required checks passed for the applicable commit. Missing, skipped, or cancelled checks are not passing evidence; establish whether repository policy requires them.
+- Codex finished reviewing the final head, and comments and threads were rechecked after it finished.
+- No P0/P1 finding is open, and every finding has a decision.
 - Required human approvals and repository rules are satisfied.
 - The PR is mergeable, and no new commits, comments, or review activity invalidate readiness.
 
-If the head changes, rerun affected checks and obtain Codex review of the new head. If the base changes, reassess integration and refresh checks as required by repository policy. Resolve in-scope conflicts, then verify and review the resulting head. Re-read the state after any readiness-changing event.
+Optional CI checks, security reviews that repository policy does not require, extra reviewers, and local reviews are not gates. Do not wait for them and do not invent new ones. Pass `--security-check` to `init` only for a security check that branch protection requires; the helper keeps readiness unknown until a configured security check passes.
+
+If the head changes, rerun affected checks and obtain Codex review of the new head. If the base changes, reassess integration and refresh checks as required by repository policy. Resolve in-scope conflicts, then verify and review the resulting head.
 
 Use the repository's merge method, defaulting to squash when no convention exists. Bind the merge to the verified head SHA where supported. Never use administrator bypass. Do not enable auto-merge before review gates are satisfied when branch protection does not enforce those gates. Continue monitoring while auto-merge or a merge queue is pending; enabling either is not completion.
 
-## 7. Prove completion
+## 8. Prove completion
 
 Verify through GitHub that the PR is actually merged. Report:
 
 - PR URL.
 - Verified pre-merge head SHA and resulting merge commit SHA.
 - Local test results and final CI results, including material checks not run.
-- Final Codex review outcome and any required human approval outcome.
-- Remaining non-blocking limitations, if any.
+- Final Codex review outcome, the number of review rounds, and any required human approval outcome.
+- Deferred findings, each with its severity, link, and follow-up.
 
 If GitHub shows the PR closed without merge, report that outcome accurately. A blocked handoff must name the unsatisfied gate, relevant evidence, the decision or external change needed, and the actual monitoring status.
 

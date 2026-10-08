@@ -119,6 +119,14 @@ export function describeChanges(previous, current) {
   return lines;
 }
 
+/** ` (1 P1, 3 P2)` for open findings, or nothing when there are none. */
+function severityBreakdown(findings) {
+  if (findings.length === 0) return "";
+  const counts = new Map();
+  for (const finding of findings) counts.set(finding.severity ?? "unrated", (counts.get(finding.severity ?? "unrated") ?? 0) + 1);
+  return ` (${[...counts].sort(([a], [b]) => a.localeCompare(b)).map(([severity, count]) => `${count} ${severity}`).join(", ")})`;
+}
+
 function clipped(lines) {
   return lines.length <= MAX_LIST_LINES ? lines : [...lines.slice(0, MAX_LIST_LINES), `(${lines.length - MAX_LIST_LINES} more; run inspect)`];
 }
@@ -144,9 +152,12 @@ export function renderWakeText({ state, eventId, previousId, kind, inspection, c
     lines.push(`Head: ${inspection.pr.headSha}`);
     lines.push(`Tested: ${tested.sha ?? "none"}${tested.sha ? ` (${tested.result}${tested.matchesHead ? ", matches head" : ", not the head"})` : ""}`);
     lines.push(
-      `Code review at head: ${review.reviewsAtHead.length} submitted, ${review.evidenceAtHead.length} recorded evidence, ${review.unboundSignals.length} unbound signal${review.unboundSignals.length === 1 ? "" : "s"}.`,
+      `Code review at head: ${review.reviewsAtHead.length} submitted, ${review.evidenceAtHead.length} recorded evidence, ${review.unboundSignals.length} unbound signal${review.unboundSignals.length === 1 ? "" : "s"}. Review rounds so far: ${review.rounds ?? "unknown"}.`,
     );
-    lines.push(`Open findings: ${inspection.findings.open.length}; CI: ${inspection.ci.state}; security review: ${inspection.securityReview.state}.`);
+    const deferred = inspection.findings.discharged.filter((finding) => finding.decision === "deferred").length;
+    lines.push(
+      `Open findings: ${inspection.findings.open.length}${severityBreakdown(inspection.findings.open)}; deferred: ${deferred}; CI: ${inspection.ci.state}; security review: ${inspection.securityReview.state}.`,
+    );
   }
   lines.push("Changes since the last delivered wake:");
   lines.push(...clipped(changes.length > 0 ? changes : ["None beyond the state above."]).map((line) => `- ${line}`));
@@ -159,6 +170,10 @@ export function renderWakeText({ state, eventId, previousId, kind, inspection, c
           : ["none; ready still needs a live re-check before merging."],
       ).map((line) => `- ${line}`),
     );
+  }
+  if (kind === "observation" && (inspection.next ?? []).length > 0) {
+    lines.push("Next:");
+    lines.push(...inspection.next.map((action) => `- ${action}`));
   }
   lines.push(`Unacknowledged earlier wakes: ${earlier.length > 0 ? earlier.map((event) => event.id).join(", ") : "none"}.`);
   lines.push("This is news, not merge approval. Re-read the live pull request and verify every gate before merging (babysit skill, section 6).");

@@ -10,6 +10,39 @@ const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION
 const SKIPPED_CONCLUSIONS = new Set(["SKIPPED", "NEUTRAL"]);
 const SUBMITTED_REVIEW_STATES = new Set(["COMMENTED", "APPROVED", "CHANGES_REQUESTED"]);
 const MERGEABLE_STATES = new Set(["CLEAN", "HAS_HOOKS"]);
+/** Reviewer priorities an agent may defer on its own. P0, P1, and unrated findings need the user. */
+export const DEFERRABLE_SEVERITIES = new Set(["P2", "P3"]);
+
+/** What the agent should do about a reason, for the reasons agents have stalled on. */
+const TRIAGE =
+  "Triage open findings by severity: fix P0/P1; fix a P2/P3 only when you already push a commit for another reason and the fix is small and safe, otherwise decide --decision deferred.";
+const NEXT_ACTIONS = {
+  REVIEW_NOT_REQUESTED:
+    "No review of this head is submitted or requested. Unless the automatic review on PR open is still running, comment `@codex review` once now and record it with record --review-request.",
+  REVIEW_NOT_REQUESTED_REPAIRED:
+    "This repaired head has no review and none is requested, and a push does not trigger one. Comment `@codex review` once now and record it with record --review-request.",
+  REVIEW_COMPLETION_UNCORROBORATED: "A review of this head was submitted. Confirm the review task finished, then record --review-evidence.",
+  FINDING_UNRESOLVED: TRIAGE,
+  FINDING_REOPENED: TRIAGE,
+  TESTED_HEAD_MISSING: "Run the verification commands at this head and record --tested.",
+  TESTED_HEAD_MISMATCH: "Run the verification commands at this head and record --tested.",
+  BRANCH_BEHIND: "Update the branch from its base, verify, and push.",
+  CONFLICTS: "Resolve the conflicts with the base, verify, and push.",
+};
+
+function nextActions(reasons, repairedHead) {
+  return [...new Set(reasons.map((reason) => NEXT_ACTIONS[reason.code === "REVIEW_NOT_REQUESTED" && repairedHead ? "REVIEW_NOT_REQUESTED_REPAIRED" : reason.code]).filter(Boolean))];
+}
+
+/**
+ * A finding's priority: the badge on its first comment, and only when a configured reviewer wrote it.
+ * A badge quoted by anyone else does not rate the finding.
+ */
+export function findingSeverity(thread, policy) {
+  const first = thread.comments[0];
+  const reviewers = new Set((policy?.codeReviewers ?? []).map(loginKey));
+  return first && reviewers.has(loginKey(first.author)) ? (first.severity ?? null) : null;
+}
 
 /** pass, fail, skipped, pending, or unknown. Anything not finished is pending, never complete. */
 export function checkOutcome(check) {
@@ -87,6 +120,7 @@ function emptySections(state, headSha) {
       completeness: null,
       caveat: REVIEW_CAVEAT,
       reviewers: [...(state.policy?.codeReviewers ?? [])],
+      rounds: null,
       reviewsAtHead: [],
       staleReviews: [],
       requestsAtHead: [],
@@ -96,6 +130,7 @@ function emptySections(state, headSha) {
     securityReview: { state: "unknown", checks: [] },
     findings: { open: [], discharged: [] },
     tested: testedView(state, headSha),
+    next: [],
   };
 }
 
@@ -279,8 +314,10 @@ export function classify(snapshot, state) {
     )) add("unknown", "REVIEW_REACTIONS_AFTER_EVIDENCE");
   }
   const reviewState = reviewsAtHead.length > 0 ? "submitted" : requestsAtHead.length > 0 ? "requested" : unboundSignals.length > 0 ? "unbound_signal" : "none";
+  // One round per commit the reviewer submitted a review for.
+  const rounds = new Set(reviewerReviews.map((review) => review.commitSha).filter(Boolean)).size;
 
-  // Findings: every unresolved thread blocks until a decision matches its current content.
+  // Findings: every unresolved thread blocks until a decision (fixed, refuted, or deferred) matches its current content.
   const decisions = state.findingDecisions ?? {};
   const open = [];
   const discharged = [];
@@ -291,6 +328,7 @@ export function classify(snapshot, state) {
     const entry = {
       threadId: thread.id,
       author: first?.author ?? null,
+      severity: findingSeverity(thread, policy),
       path: thread.path,
       line: thread.line,
       isOutdated: thread.isOutdated,
@@ -305,7 +343,7 @@ export function classify(snapshot, state) {
     } else {
       open.push({ ...entry, reopened: Boolean(decision) });
       const where = thread.path ? `${thread.path}${thread.line ? `:${thread.line}` : ""}${thread.isOutdated ? " (outdated)" : ""}` : null;
-      add("blocked", decision ? "FINDING_REOPENED" : "FINDING_UNRESOLVED", thread.id, where);
+      add("blocked", decision ? "FINDING_REOPENED" : "FINDING_UNRESOLVED", thread.id, [entry.severity ?? "unrated", where].filter(Boolean).join(" "));
     }
   }
 
@@ -383,6 +421,7 @@ export function classify(snapshot, state) {
       completeness: evidenceAtHead.length > 0 ? "agent_recorded_evidence" : reviewsAtHead.length > 0 ? "submitted_review_at_head" : null,
       caveat: REVIEW_CAVEAT,
       reviewers: [...(policy.codeReviewers ?? [])],
+      rounds,
       reviewsAtHead: reviewsAtHead.map(reviewView),
       staleReviews: staleReviews.map(reviewView),
       requestsAtHead,
@@ -396,6 +435,7 @@ export function classify(snapshot, state) {
     },
     findings: { open, discharged },
     tested: testedView(state, head),
+    next: nextActions(reasons, staleReviews.length > 0),
     summary,
     newsKey: hashSummary(summary),
     fingerprint: sha256(
