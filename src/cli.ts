@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { stdin as input, stderr as errorOutput } from "node:process";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
 
 import { Command, CommanderError, Option } from "commander";
@@ -154,6 +156,8 @@ interface ThreadSendCommandOptions extends ThreadWaitCommandOptions, SettingsCom
   wakeSettled?: boolean;
   wait?: boolean;
   ifBusy: IfBusy;
+  idempotencyKey?: string;
+  startDesktop?: boolean;
 }
 
 interface ThreadRequestCommandOptions extends ThreadWaitCommandOptions {
@@ -466,6 +470,8 @@ addReplyOptions(
     )
       .option("--wake-settled", "Explicitly allow this message to wake a settled thread.")
       .option("--wait", "Wait for the turn that handles the message and print its reply.")
+      .option("--idempotency-key <key>", "Retry this exact message safely; changing its text creates a different message.")
+      .option("--no-start-desktop", "Fail instead of launching T3 Code when it is not running.")
       .addOption(
         new Option(
           "--if-busy <mode>",
@@ -487,8 +493,10 @@ addReplyOptions(
       ...(options.wait ? { wait: waitOptions(options) } : {}),
       settings: settingsChange(options),
       ifBusy: options.ifBusy,
+      ...(options.idempotencyKey !== undefined ? { idempotencyKey: options.idempotencyKey } : {}),
+      ...(options.startDesktop !== undefined ? { startDesktop: options.startDesktop } : {}),
     });
-    const changed = result.settings ? describeChanges(result.settings) : "";
+    const changed = "settings" in result && result.settings ? describeChanges(result.settings) : "";
     const delivery =
       result.message.delivery === "start_immediately"
         ? "it starts a new turn"
@@ -497,7 +505,9 @@ addReplyOptions(
           : result.message.delivery === "steer_active"
             ? "it joins the running turn"
             : "it restarts the running turn";
-    const sent = `${changed ? `Changed ${changed}. ` : ""}Sent message ${result.message.messageId} to thread ${result.thread.id}; ${delivery}.`;
+    const sent = result.message.delivery === "already_delivered"
+      ? `Message ${result.message.messageId} was already delivered to thread ${result.thread.id}; nothing sent.`
+      : `${changed ? `Changed ${changed}. ` : ""}Sent message ${result.message.messageId} to thread ${result.thread.id}; ${delivery}.`;
     writeSuccess(result, context, withReply(sent, result));
   }),
 );
@@ -714,6 +724,29 @@ program
   );
 
 registerV2Commands(program, threads);
+
+program.command("babysit")
+  .description("Inspect PR state and manage durable babysitting events without an idle agent turn.")
+  .helpOption(false)
+  .allowUnknownOption()
+  .argument("[arguments...]", "Arguments for the bundled babysit helper; use --help for its commands.")
+  .action(async (args: string[]) => {
+    const global = program.opts<{ config?: string; origin?: string; t3Home?: string }>();
+    const env = { ...process.env,
+      ...(global.config ? { T3CODE_CLI_CONFIG: global.config } : {}),
+      ...(global.origin ? { T3CODE_CLI_ORIGIN: global.origin } : {}),
+      ...(global.t3Home ? { T3CODE_HOME: global.t3Home } : {}),
+    };
+    const helper = fileURLToPath(new URL("../skills/babysit/scripts/babysit.mjs", import.meta.url));
+    process.exitCode = await new Promise<number>((resolve) => {
+      const child = spawn(process.execPath, [helper, ...args], { stdio: "inherit", windowsHide: true, env });
+      child.on("error", (cause) => {
+        writeError(new CliError("BABYSIT_HELPER_START_FAILED", "Could not start the bundled babysit helper.", { cause }), { json: jsonRequested });
+        resolve(1);
+      });
+      child.on("close", (code) => resolve(code ?? 1));
+    });
+  });
 
 try {
   await program.parseAsync(process.argv);

@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { startFakeT3 } from "../src/testing/fakeT3.ts";
+import { runProcess } from "../src/process.ts";
 import { buildCli, runBuiltCli } from "./helpers/built-cli.mjs";
 
 let built;
@@ -14,6 +15,12 @@ afterAll(async () => { await built?.remove(); });
 const run = (args) => runBuiltCli(built.cli, args);
 
 describe("CLI parsing", () => {
+  it("routes babysit help to the packaged helper without connecting to T3", async () => {
+    const result = await run(["babysit", "--help"]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).data.commands).toHaveProperty("tick");
+    expect(result.stderr).toBe("");
+  });
   it("writes a JSON usage envelope for a missing required option", async () => {
     const result = await run(["--json", "threads", "inspect"]);
 
@@ -263,5 +270,22 @@ describe("built CLI against an orchestration V2 server", () => {
     expect(result.stdout).toBe("");
     expect(JSON.parse(result.stderr).error).toMatchObject({ code: "T3_PROTOCOL_UNSUPPORTED", details: { orchestrationProtocolVersion: 1 } });
     expect(fake.httpRequests.map((request) => request.url)).toEqual(["/.well-known/t3/environment"]);
+  });
+
+  it("delivers stdin once with a retry key and refuses conflicting options", async () => {
+    const { fake, config } = await serve();
+    const { thread } = fake.addThread();
+    const args = [built.cli, "--config", config, "--json", "threads", "send", "--thread", thread.id,
+      "--stdin", "--if-busy", "queue", "--idempotency-key", "evt_cli", "--no-start-desktop"];
+    const first = await runProcess(process.execPath, args, { input: "Exact wake message\n", env });
+    const retry = await runProcess(process.execPath, args, { input: "Exact wake message\n", env });
+    expect(JSON.parse(first.stdout).data.verification.accepted).toBe(true);
+    expect(JSON.parse(retry.stdout).data.idempotency.deduplicated).toBe("projection");
+    expect(fake.commands.filter((command) => command.type === "message.dispatch")).toHaveLength(1);
+    expect(fake.commands.find((command) => command.type === "message.dispatch").text).toBe("Exact wake message\n");
+    const refused = await runAgainst(config, ["--json", "threads", "send", "--thread", thread.id,
+      "--prompt", "Wake", "--idempotency-key", "evt_bad", "--if-busy", "restart"]);
+    expect(refused.code).toBe(2);
+    expect(JSON.parse(refused.stderr).error.code).toBe("IDEMPOTENCY_KEY_UNSUPPORTED_OPTIONS");
   });
 });

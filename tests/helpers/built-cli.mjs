@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, cp, mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -18,6 +18,7 @@ export async function buildCli(prefix) {
   await exec(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "tsconfig.json", "--outDir", build]);
   // The CLI reads its version from ../package.json relative to the build output.
   await copyFile("package.json", path.join(directory, "package.json"));
+  await cp("skills", path.join(directory, "skills"), { recursive: true });
   return {
     directory,
     build,
