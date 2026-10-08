@@ -138,6 +138,21 @@ describe("checks", () => {
     expect(inspection.reasons).toContainEqual({ level: "pending", code: "REQUIRED_CHECK_MISSING", subject: "ci / e2e" });
   });
 
+  it.each([
+    ["SKIPPED", "unknown", "REQUIRED_CHECK_SKIPPED"],
+    ["NEUTRAL", "unknown", "REQUIRED_CHECK_SKIPPED"],
+    ["FAILURE", "blocked", "REQUIRED_CHECK_FAILED"],
+  ])("enforces policy-required %s checks even when GitHub reports them as optional", (conclusion, readiness, reason) => {
+    const inspection = classify(
+      snapshot({ contexts: [check("ci / test", { required: false, conclusion })] }),
+      watchState({ policy: { codeReviewers: [REVIEWER], requiredChecks: ["ci / test"] } }),
+    );
+
+    expect(inspection.readiness).toBe(readiness);
+    expect(codes(inspection)).toContain(reason);
+    expect(inspection.ci.checks[0].required).toBe(true);
+  });
+
   it("is unknown when GitHub's rollup disagrees with the checks it listed", () => {
     const inspection = classify(snapshot({ finalRollupState: "FAILURE" }), watchState());
 
@@ -176,6 +191,23 @@ describe("findings", () => {
 });
 
 describe("tested head and pull request state", () => {
+  it.each([
+    [{ mergeStateStatus: "BLOCKED" }, "unknown", "MERGE_STATE_UNEXPLAINED"],
+    [{ reviewDecision: "REVIEW_REQUIRED" }, "blocked", "HUMAN_APPROVAL_REQUIRED"],
+    [{ isDraft: true }, "blocked", "DRAFT"],
+    [{ mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" }, "blocked", "CONFLICTS"],
+  ])("uses the final merge gates when the head, base, state, and updatedAt stay unchanged: %j", (gates, readiness, reason) => {
+    const initial = snapshot();
+    const { contexts, reviews, threads, comments, reactions, rollupState, finalRollupState, ...core } = initial.pr;
+    const inspection = classify({ ...initial, finalCore: { ...core, ...gates } }, watchState());
+
+    expect(inspection.readiness).toBe(readiness);
+    expect(codes(inspection)).toContain(reason);
+    expect(inspection.pr).toMatchObject(gates);
+    expect(inspection.ci.checks).toHaveLength(contexts.length);
+    expect(inspection.codeReview.reviewsAtHead).toHaveLength(reviews.length);
+  });
+
   it("is not ready when the tested commit is not the head, and blocks when tests failed at the head", () => {
     const mismatch = classify(snapshot(), watchState({ tested: { sha: OLD_HEAD, result: "pass", commands: ["pnpm check"] } }));
     expect(mismatch.readiness).toBe("unknown");

@@ -145,7 +145,7 @@ export function classify(snapshot, state) {
     };
   }
 
-  const pr = snapshot.pr;
+  const pr = { ...snapshot.pr, ...(snapshot.finalCore ?? {}) };
   const head = pr.headSha;
   const reasons = [];
   const add = (level, code, subject, detail) =>
@@ -160,8 +160,10 @@ export function classify(snapshot, state) {
   if (pr.reviewDecision === "REVIEW_REQUIRED") add("blocked", "HUMAN_APPROVAL_REQUIRED");
 
   // Checks
+  const requiredChecks = new Set(policy.requiredChecks ?? []);
   const checks = pr.contexts.map((context) => ({
     ...context,
+    required: requiredChecks.has(context.name) ? true : context.required,
     outcome: checkOutcome(context),
     security: securityPatterns.some((pattern) => pattern.test(context.name) || (context.app ? pattern.test(context.app) : false)),
     reviewer: context.app != null && reviewers.has(loginKey(context.app)),
@@ -187,7 +189,7 @@ export function classify(snapshot, state) {
         if (check.required !== true && check.required !== false) add("unknown", "CHECK_REQUIREMENT_UNKNOWN", check.name);
     }
   }
-  for (const name of policy.requiredChecks ?? []) {
+  for (const name of requiredChecks) {
     if (!checks.some((check) => check.name === name)) add("pending", "REQUIRED_CHECK_MISSING", name);
   }
   if (checks.length === 0) add("unknown", "CI_NONE");
