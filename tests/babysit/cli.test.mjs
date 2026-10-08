@@ -1,9 +1,10 @@
 import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { quotePowerShell, quoteShell } from "../../skills/babysit/scripts/schedule.mjs";
 import { lockPathFor, statePathFor } from "../../skills/babysit/scripts/state.mjs";
-import { check, cliError, failedSnapshot, harness, HEAD, snapshot, thread } from "./fixtures.mjs";
+import { check, cliError, comment, failedSnapshot, harness, HEAD, REVIEWER, snapshot, thread } from "./fixtures.mjs";
 
 const PR = ["--pr", "acme/widgets#5"];
 const REVIEWER_LOGIN = "chatgpt-codex-connector[bot]";
@@ -42,6 +43,21 @@ async function recordReadyEvidence() {
 }
 
 describe("init", () => {
+  it.each(["./tools/gh", "tools\\gh.exe", "gh", "gh-custom"])("persists a stable GitHub executable for %s across working directories", async (executable) => {
+    script(snapshot());
+    const originalCwd = h.deps.cwd;
+    await init(["--thread", "thread-a", "--gh", executable]);
+    const expected = /[\\/]/u.test(executable) ? path.resolve(originalCwd, executable) : executable;
+    expect((await readStateFile()).github.ghPath).toBe(expected);
+    const fetchSnapshot = h.deps.fetchSnapshot;
+    h.deps.cwd = path.join(h.directory, "scheduler");
+    h.deps.fetchSnapshot = async (ref, state) => {
+      expect(state.github.ghPath).toBe(expected);
+      return fetchSnapshot(ref, state);
+    };
+    expect((await h.run(["tick", ...PR])).code).toBe(0);
+  });
+
   it("requires an explicit code reviewer and writes nothing without one", async () => {
     const result = await h.run(["init", ...PR, "--thread", "thread-a"]);
 
@@ -245,6 +261,22 @@ describe("wait", () => {
 });
 
 describe("decide", () => {
+  it("requires a fresh decision after an observed resolution and reopening without comment changes", async () => {
+    script(snapshot({ threads: [thread()] }));
+    await init();
+    await recordReadyEvidence();
+    const args = ["decide", ...PR, "--finding", "thread-1", "--decision", "fixed", "--evidence", "Fixed in the code."];
+    expect((await h.run(args)).code).toBe(0);
+    script(snapshot({ threads: [thread({ isResolved: true })] }));
+    expect((await h.run(["tick", ...PR])).code).toBe(0);
+    script(snapshot({ threads: [thread()] }));
+    expect((await h.run(["tick", ...PR])).data.newEvent.readiness).toBe("blocked");
+    expect((await h.run(["inspect", ...PR])).data.inspection.findings.open[0].reopened).toBe(true);
+    expect((await h.run(["tick", ...PR])).data.newEvent).toBeNull();
+    expect((await h.run(args)).code).toBe(0);
+    expect((await h.run(["inspect", ...PR])).data.inspection.readiness).toBe("ready");
+  });
+
   it("binds a decision to the thread's current content", async () => {
     script(snapshot({ threads: [thread()] }));
     await init();
@@ -261,6 +293,42 @@ describe("decide", () => {
 });
 
 describe("record", () => {
+  it("keeps the first timestamp and reaction set for repeated head/source evidence, even if the note changes", async () => {
+    script(snapshot());
+    await init();
+    await recordReadyEvidence();
+    const original = (await readStateFile()).reviewEvidence[0];
+    h.advance(60_000);
+    script(snapshot({ comments: [comment({ author: REVIEWER, createdAt: new Date(h.now()).toISOString() })],
+      reactions: [{ content: "EYES", logins: [REVIEWER], truncated: false }] }));
+    h.advance(60_000);
+    const repeated = await h.run(["record", ...PR, "--review-evidence", "--head", HEAD,
+      "--url", original.url, "--note", "Changed note for the same task"]);
+    expect(repeated.data.recorded.entry).toEqual(original);
+    expect((await readStateFile()).reviewEvidence).toEqual([original]);
+    const inspection = (await h.run(["inspect", ...PR])).data.inspection;
+    expect(inspection.readiness).toBe("unknown");
+    expect(inspection.reasons.map((reason) => reason.code)).toEqual(expect.arrayContaining([
+      "REVIEW_ACTIVITY_AFTER_EVIDENCE", "REVIEW_REACTIONS_AFTER_EVIDENCE",
+    ]));
+    const fresh = await h.run(["record", ...PR, "--review-evidence", "--head", HEAD,
+      "--url", "https://chatgpt.com/codex/tasks/task_2", "--note", "New completed task at this head"]);
+    expect(fresh.data.recorded.entry.reactions).toEqual([`EYES:${REVIEWER}`]);
+    expect((await h.run(["inspect", ...PR])).data.inspection.readiness).toBe("ready");
+  });
+
+  it("does not record new evidence when the live snapshot fails or refers to a different head", async () => {
+    script(snapshot());
+    await init();
+    for (const current of [failedSnapshot("GITHUB_FETCH_FAILED"), snapshot({ headSha: "b".repeat(40) })]) {
+      script(current);
+      const result = await h.run(["record", ...PR, "--review-evidence", "--head", HEAD,
+        "--url", "https://chatgpt.com/codex/tasks/task_1", "--note", "Completed"]);
+      expect(result.error.code).toBe("REVIEW_EVIDENCE_SNAPSHOT_INVALID");
+      expect((await readStateFile()).reviewEvidence).toEqual([]);
+    }
+  });
+
   it("binds evidence to an exact full head SHA and a source", async () => {
     script(snapshot());
     await init();

@@ -38,6 +38,10 @@ node babysit.mjs <command> --pr owner/repo#N [--state-dir DIR] [options]
 
 Anything not finished is `pending`. Anything unexplained is `unknown`. A review submitted at the head proves only that a review was submitted. Comments and reactions carry no commit, so they are reported as unbound signals and are never assigned to a head. Readiness is news, not merge approval; skill section 6 still applies.
 
+Recording new review evidence reads a complete live snapshot of the same head and captures its reviewer reactions. A later reaction outside that set withdraws readiness. Repeating a head/source URL keeps its original timestamp, note, and reaction set; a new completed review needs a new source URL.
+
+An observed resolution invalidates the prior finding decision, so reopening with unchanged comments needs a fresh decision. Observation happens during `tick`, `wait`, `decide`, or a new review-evidence record; `inspect` remains read-only. A resolution/reopening cycle that occurs entirely between observations cannot be detected from GitHub's current thread state. Re-read live threads before merging.
+
 ## Delivery
 
 Each event stores its rendered text and SHA-256. Each send uses the event's idempotency key and that exact text, queued behind any running turn and without starting T3 Code.

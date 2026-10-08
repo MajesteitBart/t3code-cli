@@ -35,6 +35,23 @@ function commentVersion(comment) {
   return `${comment.bodySha256}|${comment.lastEditedAt ?? ""}`;
 }
 
+/** Reactions have no commit or timestamp; evidence must cover their observed set explicitly. */
+export function reviewerReactions(pr, policy) {
+  const reviewers = new Set((policy.codeReviewers ?? []).map(loginKey));
+  return [...new Set((pr.reactions ?? []).flatMap((group) =>
+    group.logins.filter((login) => reviewers.has(loginKey(login))).map((login) => `${group.content}:${loginKey(login)}`),
+  ))].sort();
+}
+
+/** A decision made before an observed resolution cannot discharge a later reopening. */
+export function invalidateResolvedDecisions(snapshot, state, at) {
+  if (!snapshot.complete || !snapshot.pr) return;
+  for (const thread of snapshot.pr.threads) {
+    const decision = state.findingDecisions?.[thread.id];
+    if (thread.isResolved && decision && !decision.invalidatedAt) decision.invalidatedAt = at;
+  }
+}
+
 function latest(...times) {
   return times.filter(Boolean).sort().at(-1) ?? null;
 }
@@ -255,6 +272,11 @@ export function classify(snapshot, state) {
       ...pr.threads.flatMap((thread) => thread.comments.filter((comment) => isReviewer(comment.author)).map((comment) => latest(comment.createdAt, comment.lastEditedAt))),
     ];
     if (!Number.isFinite(recordedAt) || activity.some((time) => time && Date.parse(time) > recordedAt)) add("unknown", "REVIEW_ACTIVITY_AFTER_EVIDENCE");
+    const reactions = reviewerReactions(pr, policy);
+    const newestEvidence = evidenceAtHead.filter((evidence) => Date.parse(evidence.at) === recordedAt);
+    if (pr.reactions.some((group) => group.truncated) || !newestEvidence.some((evidence) =>
+      reactions.every((reaction) => (evidence.reactions ?? []).includes(reaction)),
+    )) add("unknown", "REVIEW_REACTIONS_AFTER_EVIDENCE");
   }
   const reviewState = reviewsAtHead.length > 0 ? "submitted" : requestsAtHead.length > 0 ? "requested" : unboundSignals.length > 0 ? "unbound_signal" : "none";
 
@@ -278,7 +300,7 @@ export function classify(snapshot, state) {
       version,
     };
     const decision = decisions[thread.id];
-    if (decision && decision.threadVersion === version) {
+    if (decision && !decision.invalidatedAt && decision.isResolved !== true && decision.threadVersion === version) {
       discharged.push({ ...entry, decision: decision.decision, evidence: decision.evidence, commit: decision.commit ?? null });
     } else {
       open.push({ ...entry, reopened: Boolean(decision) });

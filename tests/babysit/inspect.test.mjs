@@ -79,6 +79,19 @@ describe("readiness", () => {
     expect(codes(inspection)).toContain("REVIEW_ACTIVITY_AFTER_EVIDENCE");
   });
 
+  it("withdraws evidence for a new reviewer reaction and accepts reactions captured with the evidence", () => {
+    const reaction = { content: "THUMBS_DOWN", logins: [REVIEWER], truncated: false };
+    const current = snapshot({ reactions: [reaction] });
+    const state = watchState();
+    state.reviewEvidence[0].reactions = [];
+    expect(codes(classify(current, state))).toContain("REVIEW_REACTIONS_AFTER_EVIDENCE");
+    expect(classify(current, state).readiness).toBe("unknown");
+
+    state.reviewEvidence[0].reactions = [`THUMBS_DOWN:${REVIEWER}`];
+    expect(classify(current, state).readiness).toBe("ready");
+    expect(classify(snapshot({ reactions: [{ ...reaction, truncated: true }] }), state).readiness).toBe("unknown");
+  });
+
   it("matches reviewer logins without case or the [bot] suffix", () => {
     const inspection = classify(snapshot({ reviews: [review({ author: "ChatGPT-Codex-Connector" })] }), watchState({ policy: { codeReviewers: [`${REVIEWER}[bot]`] } }));
 
@@ -162,6 +175,18 @@ describe("checks", () => {
 });
 
 describe("findings", () => {
+  it("does not reuse decisions invalidated by resolution or made while resolved", () => {
+    const open = thread();
+    for (const lifecycle of [{ invalidatedAt: "2026-10-07T09:57:00Z" }, { isResolved: true }]) {
+      const state = watchState({ findingDecisions: { "thread-1": {
+        decision: "fixed", evidence: "Fixed", threadVersion: threadVersion(open), ...lifecycle,
+      } } });
+      const inspection = classify(snapshot({ threads: [open] }), state);
+      expect(inspection.readiness).toBe("blocked");
+      expect(codes(inspection)).toContain("FINDING_REOPENED");
+    }
+  });
+
   it("blocks on unresolved threads, including outdated ones", () => {
     const inspection = classify(snapshot({ threads: [thread(), thread({ id: "thread-2", isOutdated: true }), thread({ id: "thread-3", isResolved: true })] }), watchState());
 

@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 import { fetchPullRequestSnapshot, ghRunner } from "./github.mjs";
-import { classify, threadVersion } from "./inspect.mjs";
+import { classify, invalidateResolvedDecisions, reviewerReactions, threadVersion } from "./inspect.mjs";
 import { quotePowerShell, quoteShell, scheduleCommands } from "./schedule.mjs";
 import {
   describeLock,
@@ -157,6 +157,11 @@ function text(value, flag, limit) {
   return result;
 }
 
+function githubExecutable(value, cwd) {
+  const executable = text(value, "--gh", 1000);
+  return /[\\/]/u.test(executable) ? path.resolve(cwd, executable) : executable;
+}
+
 function httpsUrl(value, flag) {
   const raw = text(value, flag, 2000);
   let url;
@@ -291,6 +296,7 @@ function applyRateLimit(state, snapshot, now) {
 /** Reads GitHub, classifies, and records the observation; may create a wake event. */
 async function observe(state, context, deps, options = {}) {
   const snapshot = await deps.fetchSnapshot(context.ref, state);
+  invalidateResolvedDecisions(snapshot, state, iso(deps.now()));
   const inspection = classify(snapshot, state);
   applyRateLimit(state, snapshot, deps.now());
   if (inspection.pr?.url) state.pr.url = inspection.pr.url;
@@ -380,7 +386,7 @@ async function init(values, deps, context) {
   if (!threadId && (values["wake-settled"] || values["t3code-cli"] !== undefined)) {
     throw usage("THREAD_REQUIRED", "--wake-settled and --t3code-cli need --thread.");
   }
-  const ghPath = values.gh === undefined ? null : text(values.gh, "--gh", 1000);
+  const ghPath = values.gh === undefined ? null : githubExecutable(values.gh, deps.cwd);
   const cliPath = path.resolve(deps.cwd, values["t3code-cli"] ?? deps.env.T3CODE_CLI ?? deps.bundledCli);
   const delivery = threadId ? { type: "t3-thread", threadId, wakeSettled: values["wake-settled"] === true, cliPath } : { type: "none" };
   if (threadId) {
@@ -479,7 +485,7 @@ async function inspect(values, deps, context) {
     if (policyGiven || values.gh !== undefined) throw usage("POLICY_FROM_STATE", "This pull request has a babysit state; its policy applies. Change it with init.");
   } else {
     if (!policyGiven) await loadRequired(context);
-    state = { prKey: prKey(context.ref), pr: { ...context.ref, url: null }, policy: policyFrom(values), github: { ghPath: values.gh ?? "gh" } };
+    state = { prKey: prKey(context.ref), pr: { ...context.ref, url: null }, policy: policyFrom(values), github: { ghPath: values.gh === undefined ? "gh" : githubExecutable(values.gh, deps.cwd) } };
   }
   const snapshot = await deps.fetchSnapshot(context.ref, state);
   const inspection = classify(snapshot, state);
@@ -520,9 +526,17 @@ async function record(values, deps, context) {
       const head = requireFullSha(values.head, "--head");
       const url = httpsUrl(values.url, "--url").href;
       const note = text(values.note, "--note", 2000);
-      entry = { head, url, note, at };
       state.reviewEvidence ??= [];
-      state.reviewEvidence.push(entry);
+      entry = state.reviewEvidence.find((evidence) => evidence.head === head && evidence.url === url);
+      if (!entry) {
+        const snapshot = await deps.fetchSnapshot(context.ref, state);
+        if (!snapshot.complete || !snapshot.pr || snapshot.pr.headSha !== head) {
+          throw new BabysitError("REVIEW_EVIDENCE_SNAPSHOT_INVALID", "Review evidence needs a complete live snapshot of the recorded head.", { exitCode: 5 });
+        }
+        invalidateResolvedDecisions(snapshot, state, at);
+        entry = { head, url, note, at, reactions: reviewerReactions(snapshot.pr, state.policy) };
+        state.reviewEvidence.push(entry);
+      }
     } else {
       const mechanism = values.watcher;
       if (!WATCHERS.has(mechanism)) throw usage("INVALID_WATCHER", `--watcher must be one of ${[...WATCHERS].join(", ")}.`);
@@ -574,12 +588,14 @@ async function decide(values, deps, context) {
       throw new BabysitError("FINDING_NOT_FOUND", `${displayRef(context.ref)} has no review thread ${findingId}.`, { exitCode: 3, details: { finding: findingId } });
     }
     // The decision covers the thread exactly as it reads now; a later or edited comment reopens it.
+    invalidateResolvedDecisions(snapshot, state, iso(deps.now()));
     const decision = {
       decision: values.decision,
       evidence,
       commit,
       at: iso(deps.now()),
       threadVersion: threadVersion(thread),
+      isResolved: thread.isResolved,
       comments: thread.comments.length,
       headSha: snapshot.pr.headSha,
       url: thread.comments[0]?.url ?? null,
